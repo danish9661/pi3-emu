@@ -1,0 +1,17 @@
+{
+  "name": "pi-emu-spike",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "bash build.sh && vite build",
+    "preview": "vite preview",
+    "smoke": "node test/smoke.mjs"
+  },
+  "dependencies": {
+    "@alexaltea/unicorn-js": "^2.1.4"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}

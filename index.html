@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RPi 3 emulator spike — unicorn.js + Rust board</title>
+  </head>
+  <body>
+    <main>
+      <h1>RPi 3 (BCM2837) emulator spike</h1>
+      <p class="sub">CPU: unicorn.js (QEMU TCG, ARM32 core — aarch64 broken in this port) · Board: Rust → wasm · UART PL011 @ 0x3F201000</p>
+      <pre id="term"></pre>
+      <div class="bar">
+        <button id="run">Run</button>
+        <span id="status">loading...</span>
+      </div>
+    </main>
+    <script src="/unicorn.js"></script>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
