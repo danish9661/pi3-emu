@@ -11,8 +11,9 @@ const UART_WINDOW = 0x1000;
 const TX_SLOT_STRIDE = 4;
 const TX_SLOTS = 8;
 const RAM_SIZE = 0x400000;
-const KERNEL_ADDR = 0x80000;
-const INSTRUCTIONS_PER_CHUNK = 16;
+const INIT_ADDR = 0x80000;
+const ECHO_ADDR = 0x80100;
+const ECHO_SLICES = 4;
 
 async function main() {
   const ucMod = await MUnicorn();
@@ -24,30 +25,23 @@ async function main() {
   ).instance.exports;
 
   const uart = Number(board.pi_uart_base());
-  const uc = new ucMod.Unicorn(ucMod.ARCH_ARM, ucMod.MODE_ARM);
+  const rx = uart + Number(board.pi_rx_offset());
+  const uc = new ucMod.Unicorn(ucMod.ARCH_ARM64, ucMod.MODE_LITTLE_ENDIAN);
   uc.mem_map(0, RAM_SIZE, ucMod.PROT_ALL);
   uc.mem_map(uart, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
 
-  const kptr = Number(board.pi_kernel());
-  const klen = Number(board.pi_kernel_len());
-  const kernel = new Uint8Array(board.memory.buffer, kptr, klen);
-  for (let i = 0; i < klen; i++) uc.mem_write(KERNEL_ADDR + i, [kernel[i]]);
+  const loadKernel = (addr, ptr, len) => {
+    const bytes = new Uint8Array(board.memory.buffer, Number(ptr), Number(len));
+    for (let i = 0; i < bytes.length; i++) uc.mem_write(addr + i, [bytes[i]]);
+  };
+  loadKernel(INIT_ADDR, board.pi_kernel_init(), board.pi_kernel_init_len());
+  loadKernel(ECHO_ADDR, board.pi_kernel_echo(), board.pi_kernel_echo_len());
 
-  uc.reg_write_i32(ucMod.ARM_REG_PC, KERNEL_ADDR);
-  uc.reg_write_i32(ucMod.ARM_REG_SP, RAM_SIZE - 16);
+  uc.reg_write_i32(ucMod.ARM64_REG_PC, INIT_ADDR);
+  uc.reg_write_i32(ucMod.ARM64_REG_SP, RAM_SIZE - 16);
 
-  const t0 = Date.now();
-  let total = 0;
-  let quiet = 0;
   let chars = '';
-  let pc = KERNEL_ADDR;
-
-  while (quiet < 4) {
-    uc.emu_start(pc, 0, 0, INSTRUCTIONS_PER_CHUNK);
-    pc = Number(uc.reg_read_i32(ucMod.ARM_REG_PC));
-    total += INSTRUCTIONS_PER_CHUNK;
-
-    // drain TX slots: each slot is a word-aligned byte; consume + clear.
+  const drain = () => {
     const window = uc.mem_read(uart, TX_SLOTS * TX_SLOT_STRIDE);
     let found = 0;
     for (let i = 0; i < TX_SLOTS; i++) {
@@ -65,21 +59,30 @@ async function main() {
       if (c === -1 || c === 0xffffffff) break;
       chars += String.fromCharCode(c);
     }
-    quiet = found > 0 ? 0 : quiet + 1;
+    return found;
+  };
+
+  const t0 = Date.now();
+  // 1. boot greeting
+  uc.emu_start(INIT_ADDR, 0, 0, 64);
+  drain();
+
+  // 2. typed characters, each echoed via a host-scheduled slice
+  for (const ch of ['x', 'y', 'z', '\n']) {
+    uc.mem_write(rx, [ch.charCodeAt(0)]);
+    uc.emu_start(ECHO_ADDR, 0, 0, ECHO_SLICES);
+    drain();
   }
   const elapsed = Date.now() - t0;
 
   const got = JSON.stringify(chars);
   console.log('console output:', got);
-  console.log('console OK:', got === '"Hi\\n"');
-  console.log(
-    'instructions:', total,
-    'in', elapsed, 'ms', '≈', Math.round((total / elapsed) * 1000), 'ips'
-  );
+  console.log('console OK:', got === '"Hi\\n> xyz\\n"');
+  console.log('slice latency:', elapsed, 'ms for', 4, 'keystrokes');
   uc.close();
 }
 
 main().then(() => process.exit(0)).catch((e) => {
-  console.error('FATAL', String(e).slice(0, 300));
+  console.error('FATAL', String(e && e.message || e).slice(0, 300));
   process.exit(1);
 });
