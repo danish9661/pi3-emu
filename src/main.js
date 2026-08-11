@@ -11,11 +11,14 @@ const KERNEL_SLICES = 512;
 const term = document.getElementById('term');
 const status = document.getElementById('status');
 const runBtn = document.getElementById('run');
+const statsEl = document.getElementById('stats');
 
 let ucMod = null;
 let uc = null;
 let board = null;
 let rxSlot = 0;
+
+let stats = { steps: 0, insns: 0, emuMs: 0, chars: 0, wallStart: 0 };
 
 function setStatus(text) {
   status.textContent = text;
@@ -66,6 +69,7 @@ function pumpUart(ucMod, uc, board) {
     const c = window[i * TX_SLOT_STRIDE];
     if (c !== 0) {
       found++;
+      stats.chars++;
       board.pi_cons_push(c);
       for (let k = 0; k < TX_SLOT_STRIDE; k++) {
         uc.mem_write(base + i * TX_SLOT_STRIDE + k, [0]);
@@ -86,16 +90,39 @@ function drain(board) {
 }
 
 function runSlice(addr, count) {
+  const t0 = performance.now();
   uc.emu_start(addr, 0, 0, count);
+  stats.emuMs += performance.now() - t0;
+  stats.steps += 1;
+  stats.insns += count;
   pumpUart(ucMod, uc, board);
   return drain(board);
+}
+
+function updateStats() {
+  const pc = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC));
+  const sp = Number(uc.reg_read_i32(ucMod.ARM64_REG_SP));
+  const wall = (performance.now() - stats.wallStart) / 1000;
+  const mips = stats.emuMs > 0 ? (stats.insns / stats.emuMs / 1000).toFixed(2) : '—';
+  const pcs = (pc - KERNEL_ADDR).toString(16).padStart(6, '0');
+  statsEl.innerHTML =
+    `<span><span class="k">pc</span> 0x80000+0x${pcs}</span>` +
+    `<span><span class="k">sp</span> 0x${sp.toString(16)}</span>` +
+    `<span><span class="k">mips</span> ${mips}</span>` +
+    `<span><span class="k">steps</span> ${stats.steps}</span>` +
+    `<span><span class="k">insns</span> ${stats.insns}</span>` +
+    `<span><span class="k">emu</span> ${stats.emuMs.toFixed(2)}ms</span>` +
+    `<span><span class="k">wall</span> ${wall.toFixed(2)}s</span>` +
+    `<span><span class="k">chars</span> ${stats.chars}</span>`;
 }
 
 // The guest kernel is a live process: it parks in its RX poll loop between
 // host slices, so every keystroke slice resumes from the current PC.
 function guestSlice() {
   const pc = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC));
-  return runSlice(pc, KERNEL_SLICES);
+  const out = runSlice(pc, KERNEL_SLICES);
+  updateStats();
+  return out;
 }
 
 // Deliver one keystroke to the guest kernel, let it do all the work.
@@ -122,6 +149,8 @@ function handleKey(e) {
 async function run() {
   runBtn.disabled = true;
   term.textContent = '';
+  stats = { steps: 0, insns: 0, emuMs: 0, chars: 0, wallStart: performance.now() };
+  statsEl.textContent = '';
   try {
     const MUnicorn = window.MUnicorn;
     if (!MUnicorn) throw new Error('unicorn.js failed to load (check public/unicorn.js)');

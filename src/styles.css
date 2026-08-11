@@ -65,3 +65,17 @@ button:disabled {
   color: #9fb0bf;
   font-size: 13px;
 }
+
+#stats {
+  margin-top: 8px;
+  color: #7f8c99;
+  font-size: 12px;
+  line-height: 1.6;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+}
+
+#stats .k {
+  color: #4a5a68;
+}
