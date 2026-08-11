@@ -27,7 +27,7 @@ function draw(text) {
 }
 
 async function loadBoard() {
-  const resp = await fetch('/pi_board.wasm');
+  const resp = await fetch('./pi_board.wasm');
   const { instance } = await WebAssembly.instantiate(await resp.arrayBuffer(), {});
   return instance.exports;
 }
