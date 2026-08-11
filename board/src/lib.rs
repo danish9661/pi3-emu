@@ -63,56 +63,56 @@ pub extern "C" fn pi_cons_poll() -> u32 {
 // CPU note: this unicorn.js build has a broken ARM32 decoder (every guest
 // *load* raises a trap, and several ALU/load forms mis-decode).  The
 // AArch64 core works for loads, stores, ALU and unconditional branches, but
-// immediate encodings of movk/movz for >=14-bit immediates and all
-// conditional branches are unreliable.  The kernels below therefore use only
-// verified opcodes (ldr-literal, ldr/str unsigned-offset, movz small imm,
-// add imm, unconditional b), and the *host* schedules short slices of the
-// echo procedure whenever a key arrives (guest-side polling is impossible).
+// immediate encodings of movk/movz for >=14-bit immediates, all conditional
+// branches (b.eq never takes, b.ne always takes, cbnz/tbz/tbnz never take,
+// backward branches crash) and every flag-setting op (cmp/subs) are
+// unreliable.  The kernels below therefore use only verified opcodes
+// (ldr-literal, ldr/str unsigned-offset, movz small imm, unconditional b),
+// and the *host* schedules short slices of them: the guest owns all output,
+// the host owns all decisions.
 //
 // Device window (0x3F201000, 4 KiB):
 //   +0x00..  TX slots, one char per word (guest stores, host drains)
 //   +0x40    RX slot  (host writes a byte, guest echo procedure consumes)
 // ---------------------------------------------------------------------------
 
-const KERNEL_INIT: &[u8] = &[
-    // Boot greeting: prints "Hi\n> " through the TX window, then parks on `b .`.
-    // (r0 walks the TX cursor, chars are the low byte of word-aligned slots.)
-    // ldr  x0, [pc, #64]            -> 0x58000200   (literal at 0x80040)
-    0x00, 0x02, 0x00, 0x58,
-    // mov  w1, #'H' (0x48)          -> 0x52800901
-    0x01, 0x09, 0x80, 0x52,
-    // str  w1, [x0]                 -> 0xB9000001
-    0x01, 0x00, 0x00, 0xB9,
-    // add  x0, x0, #4               -> 0x91001000
-    0x00, 0x10, 0x00, 0x91,
-    // mov  w1, #'i' (0x69)          -> 0x52800D21
-    0x21, 0x0D, 0x80, 0x52,
-    // str  w1, [x0]                 -> 0xB9000001
-    0x01, 0x00, 0x00, 0xB9,
-    // add  x0, x0, #4               -> 0x91001000
-    0x00, 0x10, 0x00, 0x91,
-    // mov  w1, #'\n' (0x0A)         -> 0x52800141
-    0x41, 0x01, 0x80, 0x52,
-    // str  w1, [x0]                 -> 0xB9000001
-    0x01, 0x00, 0x00, 0xB9,
-    // add  x0, x0, #4               -> 0x91001000
-    0x00, 0x10, 0x00, 0x91,
-    // mov  w1, #'>' (0x3E)          -> 0x528007C1
-    0xC1, 0x07, 0x80, 0x52,
-    // str  w1, [x0]                 -> 0xB9000001
-    0x01, 0x00, 0x00, 0xB9,
-    // add  x0, x0, #4               -> 0x91001000
-    0x00, 0x10, 0x00, 0x91,
-    // mov  w1, #' ' (0x20)          -> 0x52800401
-    0x01, 0x04, 0x80, 0x52,
-    // str  w1, [x0]                 -> 0xB9000001
-    0x01, 0x00, 0x00, 0xB9,
-    // b .                           -> 0x14000000
-    0x00, 0x00, 0x00, 0x14,
-    // .dword 0x3F201000             (UART base literal)
-    0x00, 0x10, 0x20, 0x3F, 0x00, 0x00, 0x00, 0x00,
-];
+/// Assemble a straight-line print procedure for `text`:
+///   ldr  x0, [pc, #(2+2N)*4]   literal at word 2+2N
+///   (mov  w1, #c; str w1, [x0, #4k]) x N
+///   b .                         park
+///   .dword 0x3F201000           UART base literal
+/// Only verified opcodes are used.  N <= 16 (16 TX slots before the RX slot).
+const fn put(out: &mut [u8], at: usize, v: u32) {
+    out[at] = v as u8;
+    out[at + 1] = (v >> 8) as u8;
+    out[at + 2] = (v >> 16) as u8;
+    out[at + 3] = (v >> 24) as u8;
+}
 
+const fn print_proc<const N: usize>(text: &[u8; N]) -> [u8; 144] {
+    let mut out = [0u8; 144];
+    put(&mut out, 0, 0x5800_0000 | (((2 + 2 * N) as u32) << 5));
+    let mut w = 1usize;
+    let mut i = 0usize;
+    while i < N {
+        put(&mut out, w * 4, 0x5280_0000 | ((text[i] as u32) << 5) | 1);
+        w += 1;
+        put(&mut out, w * 4, 0xB900_0000 | ((i as u32) << 10) | 1);
+        w += 1;
+        i += 1;
+    }
+    put(&mut out, w * 4, 0x1400_0000);
+    w += 1;
+    put(&mut out, w * 4, 0x3F20_1000);
+    put(&mut out, w * 4 + 4, 0);
+    out
+}
+
+const fn proc_len(chars: usize) -> u32 {
+    (4 * (3 + 2 * chars)) as u32
+}
+
+const KERNEL_INIT: [u8; 144] = print_proc(b"Hi\n> ");
 const KERNEL_ECHO: &[u8] = &[
     // Host-scheduled echo procedure (4 instructions, run on each key):
     //   w1 = [x0 + 0x40]   (RX slot)
@@ -130,6 +130,16 @@ const KERNEL_ECHO: &[u8] = &[
     0x00, 0x10, 0x20, 0x3F, 0x00, 0x00, 0x00, 0x00,
 ];
 
+const SHELL_PROMPT: [u8; 144] = print_proc(b"> ");
+const SHELL_CMD_HI: [u8; 144] = print_proc(b"HELLO\r\n");
+const SHELL_CMD_RPI: [u8; 144] = print_proc(b"Raspberry Pi 3\r\n");
+const SHELL_CMD_HELP: [u8; 144] = print_proc(b"hi or rpi\r\n");
+const SHELL_UNKNOWN: [u8; 144] = print_proc(b"?\r\n");
+
+const SHELL_ADDRS: [u32; 5] = [0x80300, 0x80400, 0x80500, 0x80600, 0x80700];
+const SHELL_PROCS: [&[u8]; 5] = [&SHELL_CMD_HI, &SHELL_CMD_RPI, &SHELL_CMD_HELP, &SHELL_UNKNOWN, &SHELL_PROMPT];
+const SHELL_CHARS: [usize; 5] = [7, 16, 11, 3, 2];
+
 #[no_mangle]
 pub extern "C" fn pi_kernel_init() -> u32 {
     KERNEL_INIT.as_ptr() as u32
@@ -137,7 +147,7 @@ pub extern "C" fn pi_kernel_init() -> u32 {
 
 #[no_mangle]
 pub extern "C" fn pi_kernel_init_len() -> u32 {
-    KERNEL_INIT.len() as u32
+    proc_len(5)
 }
 
 #[no_mangle]
@@ -148,6 +158,21 @@ pub extern "C" fn pi_kernel_echo() -> u32 {
 #[no_mangle]
 pub extern "C" fn pi_kernel_echo_len() -> u32 {
     KERNEL_ECHO.len() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn pi_shell_proc(idx: u32) -> u32 {
+    SHELL_PROCS[idx as usize].as_ptr() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn pi_shell_addr(idx: u32) -> u32 {
+    SHELL_ADDRS[idx as usize]
+}
+
+#[no_mangle]
+pub extern "C" fn pi_shell_len(idx: u32) -> u32 {
+    proc_len(SHELL_CHARS[idx as usize])
 }
 
 #[no_mangle]

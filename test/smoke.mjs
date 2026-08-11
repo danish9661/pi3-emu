@@ -9,11 +9,12 @@ const MUnicorn = require(join(__dirname, '..', 'public', 'unicorn.js'));
 
 const UART_WINDOW = 0x1000;
 const TX_SLOT_STRIDE = 4;
-const TX_SLOTS = 8;
+const TX_SLOTS = 16;
 const RAM_SIZE = 0x400000;
 const INIT_ADDR = 0x80000;
 const ECHO_ADDR = 0x80100;
 const ECHO_SLICES = 4;
+const SHELL_RUN_SLICES = 256;
 
 async function main() {
   const ucMod = await MUnicorn();
@@ -36,6 +37,9 @@ async function main() {
   };
   loadKernel(INIT_ADDR, board.pi_kernel_init(), board.pi_kernel_init_len());
   loadKernel(ECHO_ADDR, board.pi_kernel_echo(), board.pi_kernel_echo_len());
+  for (let i = 0; i < 5; i++) {
+    loadKernel(board.pi_shell_addr(i), board.pi_shell_proc(i), board.pi_shell_len(i));
+  }
 
   uc.reg_write_i32(ucMod.ARM64_REG_PC, INIT_ADDR);
   uc.reg_write_i32(ucMod.ARM64_REG_SP, RAM_SIZE - 16);
@@ -62,23 +66,44 @@ async function main() {
     return found;
   };
 
+  const type = (str) => {
+    for (const ch of str) {
+      uc.mem_write(rx, [ch.charCodeAt(0)]);
+      uc.emu_start(ECHO_ADDR, 0, 0, ECHO_SLICES);
+      drain();
+    }
+  };
+  const runShell = (idx) => {
+    uc.emu_start(board.pi_shell_addr(idx), 0, 0, SHELL_RUN_SLICES);
+    drain();
+  };
+
   const t0 = Date.now();
   // 1. boot greeting
   uc.emu_start(INIT_ADDR, 0, 0, 64);
   drain();
 
-  // 2. typed characters, each echoed via a host-scheduled slice
-  for (const ch of ['x', 'y', 'z', '\n']) {
-    uc.mem_write(rx, [ch.charCodeAt(0)]);
-    uc.emu_start(ECHO_ADDR, 0, 0, ECHO_SLICES);
-    drain();
-  }
+  // 2. shell session
+  type('HI');
+  type('\r');
+  runShell(0); // HELLO
+  runShell(4); // prompt
+  type('RPI');
+  type('\r');
+  runShell(1); // Raspberry Pi 3
+  runShell(4); // prompt
+  type('ZZ');
+  type('\r');
+  runShell(3); // ?
+  runShell(4); // prompt
   const elapsed = Date.now() - t0;
 
+  const want = 'Hi\n> HI\rHELLO\r\n> RPI\rRaspberry Pi 3\r\n> ZZ\r?\r\n> ';
   const got = JSON.stringify(chars);
   console.log('console output:', got);
-  console.log('console OK:', got === '"Hi\\n> xyz\\n"');
-  console.log('slice latency:', elapsed, 'ms for', 4, 'keystrokes');
+  console.log('console OK:', chars === want);
+  if (chars !== want) console.log('want          :', JSON.stringify(want));
+  console.log('session time:', elapsed, 'ms');
   uc.close();
 }
 
