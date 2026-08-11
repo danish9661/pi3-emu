@@ -12,6 +12,7 @@ const term = document.getElementById('term');
 const status = document.getElementById('status');
 const runBtn = document.getElementById('run');
 const statsEl = document.getElementById('stats');
+const hint = document.getElementById('hint');
 
 let ucMod = null;
 let uc = null;
@@ -146,6 +147,20 @@ function handleKey(e) {
   draw(guestKey(c));
 }
 
+// On-screen keyboard: feed the same guestKey path as physical keys.
+function tapKeys(keys) {
+  if (!uc || runBtn.disabled) return;
+  for (const ch of keys) {
+    if (ch === '\b') {
+      if (term.textContent.length > 0) term.textContent = term.textContent.slice(0, -1);
+      draw(guestKey(0x7f));
+    } else {
+      draw(guestKey(ch.charCodeAt(0)));
+    }
+  }
+  term.focus();
+}
+
 async function run() {
   runBtn.disabled = true;
   term.textContent = '';
@@ -164,6 +179,8 @@ async function run() {
     setStatus('booted (AArch64 guest kernel) — type a command: HI, RPI, HELP');
     runBtn.textContent = 'Reboot';
     runBtn.disabled = false;
+    term.focus();
+    hint.textContent = '';
   } catch (err) {
     setStatus('ERROR: ' + err.message);
     console.error(err);
@@ -172,5 +189,12 @@ async function run() {
 }
 
 window.addEventListener('keydown', handleKey);
+term.addEventListener('click', () => term.focus());
+document.querySelectorAll('.osk button').forEach((btn) =>
+  btn.addEventListener('click', () => tapKeys(btn.dataset.keys))
+);
+window.addEventListener('error', (e) => {
+  setStatus('ERROR: ' + (e.message || e.type));
+});
 runBtn.addEventListener('click', run);
 run();

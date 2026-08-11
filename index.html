@@ -9,7 +9,15 @@
     <main>
       <h1>RPi 3 (BCM2837) emulator spike</h1>
       <p class="sub">CPU: unicorn.js (QEMU TCG, AArch64 core) · Board: Rust → wasm · UART @ 0x3F201000 — type HI, RPI or HELP</p>
-      <pre id="term"></pre>
+      <pre id="term" tabindex="0"></pre>
+      <div class="hint" id="hint">click the terminal, then type (or use the keys below)</div>
+      <div class="osk" id="osk">
+        <button class="k" data-keys="HI">HI</button>
+        <button class="k" data-keys="RPI">RPI</button>
+        <button class="k" data-keys="HELP">HELP</button>
+        <button class="k" data-keys="\b">⌫</button>
+        <button class="k" data-keys="\r">⏎</button>
+      </div>
       <div class="bar">
         <button id="run">Run</button>
         <span id="status">loading...</span>

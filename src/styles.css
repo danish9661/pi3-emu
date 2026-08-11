@@ -79,3 +79,34 @@ button:disabled {
 #stats .k {
   color: #4a5a68;
 }
+
+.hint {
+  color: #6a7a88;
+  font-size: 12px;
+  margin: -4px 0 10px;
+}
+
+#term:focus {
+  outline: 1px solid #1d6f42;
+  cursor: text;
+}
+
+.osk {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.osk button.k {
+  background: #1c2731;
+  border: 1px solid #2d3d4c;
+  color: #d8e0e8;
+  font-size: 14px;
+  padding: 8px 14px;
+  min-width: 48px;
+}
+
+.osk button.k:active {
+  background: #1d6f42;
+}
