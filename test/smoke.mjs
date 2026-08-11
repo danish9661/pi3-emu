@@ -9,12 +9,10 @@ const MUnicorn = require(join(__dirname, '..', 'public', 'unicorn.js'));
 
 const UART_WINDOW = 0x1000;
 const TX_SLOT_STRIDE = 4;
-const TX_SLOTS = 16;
+const TX_SLOTS = 32;
 const RAM_SIZE = 0x400000;
-const INIT_ADDR = 0x80000;
-const ECHO_ADDR = 0x80100;
-const ECHO_SLICES = 4;
-const SHELL_RUN_SLICES = 256;
+const KERNEL_ADDR = 0x80000;
+const KERNEL_SLICES = 512;
 
 async function main() {
   const ucMod = await MUnicorn();
@@ -35,13 +33,9 @@ async function main() {
     const bytes = new Uint8Array(board.memory.buffer, Number(ptr), Number(len));
     for (let i = 0; i < bytes.length; i++) uc.mem_write(addr + i, [bytes[i]]);
   };
-  loadKernel(INIT_ADDR, board.pi_kernel_init(), board.pi_kernel_init_len());
-  loadKernel(ECHO_ADDR, board.pi_kernel_echo(), board.pi_kernel_echo_len());
-  for (let i = 0; i < 5; i++) {
-    loadKernel(board.pi_shell_addr(i), board.pi_shell_proc(i), board.pi_shell_len(i));
-  }
+  loadKernel(KERNEL_ADDR, board.pi_kernel(), board.pi_kernel_len());
 
-  uc.reg_write_i32(ucMod.ARM64_REG_PC, INIT_ADDR);
+  uc.reg_write_i32(ucMod.ARM64_REG_PC, KERNEL_ADDR);
   uc.reg_write_i32(ucMod.ARM64_REG_SP, RAM_SIZE - 16);
 
   let chars = '';
@@ -66,39 +60,35 @@ async function main() {
     return found;
   };
 
-  const type = (str) => {
-    for (const ch of str) {
-      uc.mem_write(rx, [ch.charCodeAt(0)]);
-      uc.emu_start(ECHO_ADDR, 0, 0, ECHO_SLICES);
-      drain();
-    }
-  };
-  const runShell = (idx) => {
-    uc.emu_start(board.pi_shell_addr(idx), 0, 0, SHELL_RUN_SLICES);
+  const slice = () => {
+    const pc = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC));
+    uc.emu_start(pc, 0, 0, KERNEL_SLICES);
     drain();
   };
 
-  const t0 = Date.now();
-  // 1. boot greeting
-  uc.emu_start(INIT_ADDR, 0, 0, 64);
-  drain();
+  const type = (str) => {
+    for (const ch of str) {
+      uc.mem_write(rx, [typeof ch === 'number' ? ch : ch.charCodeAt(0)]);
+      slice();
+    }
+  };
 
-  // 2. shell session
-  type('HI');
-  type('\r');
-  runShell(0); // HELLO
-  runShell(4); // prompt
-  type('RPI');
-  type('\r');
-  runShell(1); // Raspberry Pi 3
-  runShell(4); // prompt
-  type('ZZ');
-  type('\r');
-  runShell(3); // ?
-  runShell(4); // prompt
+  const t0 = Date.now();
+  // 1. boot greeting (starts at KERNEL_ADDR; afterwards slices resume from PC)
+  uc.reg_write_i32(ucMod.ARM64_REG_PC, KERNEL_ADDR);
+  slice();
+
+  // 2. session 1: HI
+  type('HI\r');
+  // 3. session 2: RPI
+  type('RPI\r');
+  // 4. session 3: unknown ZZ
+  type('ZZ\r');
+  // 5. backspace editing: H X <bs> I \r -> buffer "HI" -> HELLO
+  type(['H', 'X', 0x7f, 'I', '\r']);
   const elapsed = Date.now() - t0;
 
-  const want = 'Hi\n> HI\rHELLO\r\n> RPI\rRaspberry Pi 3\r\n> ZZ\r?\r\n> ';
+  const want = 'Hi\n> HI\rHELLO\r\n> RPI\rRaspberry Pi 3\r\n> ZZ\r?\r\n> HXI\rHELLO\r\n> ';
   const got = JSON.stringify(chars);
   console.log('console output:', got);
   console.log('console OK:', chars === want);
