@@ -92,16 +92,19 @@ const POLL: u32 = 1;
 const H_CR: u32 = 2;
 const CHK_RPI: u32 = 3;
 const CHK_HELP: u32 = 4;
-const P_UNK: u32 = 5;
-const P_HI: u32 = 6;
-const P_RPI: u32 = 7;
-const P_HELP: u32 = 8;
-const DONE: u32 = 9;
-const H_BS: u32 = 10;
+const CHK_VER: u32 = 5;
+const P_UNK: u32 = 6;
+const P_HI: u32 = 7;
+const P_RPI: u32 = 8;
+const P_HELP: u32 = 9;
+const P_VER: u32 = 10;
+const DONE: u32 = 11;
+const H_BS: u32 = 12;
 
 const X0: u32 = 0;
 const X1: u32 = 1;
 const X2: u32 = 2;
+const X3: u32 = 3;
 const X24: u32 = 24;
 const X26: u32 = 26;
 const X27: u32 = 27;
@@ -165,6 +168,10 @@ impl Asm {
 
     fn cmp(&mut self, rn: u32, imm: u32) {
         self.subs(XZR, rn, imm);
+    }
+
+    fn orr(&mut self, rd: u32, rn: u32, rm: u32) {
+        self.emit(0xAA00_0000 | (rm << 16) | (rn << 5) | rd);
     }
 
     fn csel(&mut self, rd: u32, rn: u32, rm: u32, cond: u32) {
@@ -234,6 +241,7 @@ fn build_kernel(a: &mut Asm) {
     a.movz(X26, 0x1000);
     a.movk(X26, 0x3F20, 1); // x26 = 0x3F20_1000
     a.movz(X24, LINEBUF_ADDR);
+    a.movz(X3, 0x20); // X3 = 0x20, used to lowercase chars
     a.add(X27, X24, 0);
     a.movz(X28, 0);
     a.emit_text_at(0, b"Hi\n");
@@ -258,14 +266,16 @@ fn build_kernel(a: &mut Asm) {
     a.add(X27, X24, 0); // reset write pointer
     a.cmp(X28, 0); // empty line: just reprompt, no "?"
     a.beq(DONE);
-    // command: HI (len 2)
+    // command: HI (len 2) — case-insensitive: chars are OR'd with 0x20 (lowercase)
     a.cmp(X28, 2);
     a.bne(CHK_RPI);
     a.ldrw(X2, X24, 0);
-    a.cmp(X2, 0x48); // 'H'
+    a.orr(X2, X2, X3);
+    a.cmp(X2, 0x68); // 'h'
     a.bne(CHK_RPI);
     a.ldrw(X2, X24, 4);
-    a.cmp(X2, 0x49); // 'I'
+    a.orr(X2, X2, X3);
+    a.cmp(X2, 0x69); // 'i'
     a.bne(CHK_RPI);
     a.b(P_HI);
 
@@ -273,32 +283,56 @@ fn build_kernel(a: &mut Asm) {
     a.cmp(X28, 3);
     a.bne(CHK_HELP);
     a.ldrw(X2, X24, 0);
-    a.cmp(X2, 0x52); // 'R'
+    a.orr(X2, X2, X3);
+    a.cmp(X2, 0x72); // 'r'
     a.bne(CHK_HELP);
     a.ldrw(X2, X24, 4);
-    a.cmp(X2, 0x50); // 'P'
+    a.orr(X2, X2, X3);
+    a.cmp(X2, 0x70); // 'p'
     a.bne(CHK_HELP);
     a.ldrw(X2, X24, 8);
-    a.cmp(X2, 0x49); // 'I'
+    a.orr(X2, X2, X3);
+    a.cmp(X2, 0x69); // 'i'
     a.bne(CHK_HELP);
     a.b(P_RPI);
 
     a.label(); // CHK_HELP
     a.cmp(X28, 4);
+    a.bne(CHK_VER);
+    a.ldrw(X2, X24, 0);
+    a.orr(X2, X2, X3);
+    a.cmp(X2, 0x68); // 'h'
+    a.bne(CHK_VER);
+    a.ldrw(X2, X24, 4);
+    a.orr(X2, X2, X3);
+    a.cmp(X2, 0x65); // 'e'
+    a.bne(CHK_VER);
+    a.ldrw(X2, X24, 8);
+    a.orr(X2, X2, X3);
+    a.cmp(X2, 0x6C); // 'l'
+    a.bne(CHK_VER);
+    a.ldrw(X2, X24, 12);
+    a.orr(X2, X2, X3);
+    a.cmp(X2, 0x70); // 'p'
+    a.bne(CHK_VER);
+    a.b(P_HELP);
+
+    a.label(); // CHK_VER
+    a.cmp(X28, 3);
     a.bne(P_UNK);
     a.ldrw(X2, X24, 0);
-    a.cmp(X2, 0x48); // 'H'
+    a.orr(X2, X2, X3);
+    a.cmp(X2, 0x76); // 'v'
     a.bne(P_UNK);
     a.ldrw(X2, X24, 4);
-    a.cmp(X2, 0x45); // 'E'
+    a.orr(X2, X2, X3);
+    a.cmp(X2, 0x65); // 'e'
     a.bne(P_UNK);
     a.ldrw(X2, X24, 8);
-    a.cmp(X2, 0x4C); // 'L'
+    a.orr(X2, X2, X3);
+    a.cmp(X2, 0x72); // 'r'
     a.bne(P_UNK);
-    a.ldrw(X2, X24, 12);
-    a.cmp(X2, 0x50); // 'P'
-    a.bne(P_UNK);
-    a.b(P_HELP);
+    a.b(P_VER);
 
     a.label(); // P_UNK
     a.emit_text_at(1, b"?\r\n");
@@ -313,7 +347,11 @@ fn build_kernel(a: &mut Asm) {
     a.b(DONE);
 
     a.label(); // P_HELP
-    a.emit_text_at(1, b"hi or rpi\r\n");
+    a.emit_text_at(1, b"hi, rpi, help, ver\r\n");
+    a.b(DONE);
+
+    a.label(); // P_VER
+    a.emit_text_at(1, b"pi3-emu v1.0\r\n");
     a.b(DONE);
 
     a.label(); // DONE

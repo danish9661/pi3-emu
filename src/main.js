@@ -178,7 +178,7 @@ async function run() {
 
     draw(guestSlice()); // boot greeting + prompt
 
-    setStatus('booted (AArch64 guest kernel) — type a command: HI, RPI, HELP');
+    setStatus('booted (AArch64 guest kernel) — type a command: HI, RPI, HELP, VER');
     runBtn.textContent = 'Reboot';
     runBtn.disabled = false;
     term.focus();

@@ -39,11 +39,13 @@ inside the guest — the host only moves bytes.
 |---------|------------------|
 | `HI`    | `HELLO`          |
 | `RPI`   | `Raspberry Pi 3` |
-| `HELP`  | `help`           |
+| `HELP`  | `hi, rpi, help, ver` |
+| `VER`   | `pi3-emu v1.0`   |
 | other   | `?`              |
 
-Backspace (`⌫`) sends 0x7F; the guest unwrites its line buffer and the
-host trims the display.
+Commands are case-insensitive. Backspace (`⌫`) sends 0x7F; the guest
+unwrites its line buffer and the host trims the display. The terminal
+auto-focuses on boot; an on-screen keyboard is available for mouse/touch.
 
 ## Run
 
