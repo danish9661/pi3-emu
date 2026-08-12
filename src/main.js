@@ -135,6 +135,7 @@ function guestKey(code) {
 function handleKey(e) {
   if (!uc || runBtn.disabled) return;
   if (e.key === 'Backspace') {
+    e.preventDefault();
     if (term.textContent.length > 0) {
       term.textContent = term.textContent.slice(0, -1);
     }
@@ -143,7 +144,7 @@ function handleKey(e) {
   }
   const c = e.key.length === 1 ? e.key.charCodeAt(0) : e.key === 'Enter' ? 13 : 0;
   if (!c) return;
-  e.preventDefault();
+  e.preventDefault(); // also stops the browser re-clicking a focused button on Enter
   draw(guestKey(c));
 }
 

@@ -256,6 +256,8 @@ fn build_kernel(a: &mut Asm) {
     a.label(); // H_CR
     a.strw(X0, X26, 0); // echo CR to TX slot 0 (response starts at slot 1)
     a.add(X27, X24, 0); // reset write pointer
+    a.cmp(X28, 0); // empty line: just reprompt, no "?"
+    a.beq(DONE);
     // command: HI (len 2)
     a.cmp(X28, 2);
     a.bne(CHK_RPI);
