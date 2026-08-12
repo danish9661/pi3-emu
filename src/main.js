@@ -148,15 +148,16 @@ function handleKey(e) {
 }
 
 // On-screen keyboard: feed the same guestKey path as physical keys.
-function tapKeys(keys) {
+function tapKeys(btn) {
   if (!uc || runBtn.disabled) return;
-  for (const ch of keys) {
-    if (ch === '\b') {
-      if (term.textContent.length > 0) term.textContent = term.textContent.slice(0, -1);
-      draw(guestKey(0x7f));
-    } else {
-      draw(guestKey(ch.charCodeAt(0)));
-    }
+  const action = btn.dataset.action;
+  if (action === 'enter') {
+    draw(guestKey(13));
+  } else if (action === 'bs') {
+    if (term.textContent.length > 0) term.textContent = term.textContent.slice(0, -1);
+    draw(guestKey(0x7f));
+  } else {
+    for (const ch of btn.dataset.keys) draw(guestKey(ch.charCodeAt(0)));
   }
   term.focus();
 }
@@ -191,7 +192,7 @@ async function run() {
 window.addEventListener('keydown', handleKey);
 term.addEventListener('click', () => term.focus());
 document.querySelectorAll('.osk button').forEach((btn) =>
-  btn.addEventListener('click', () => tapKeys(btn.dataset.keys))
+  btn.addEventListener('click', () => tapKeys(btn))
 );
 window.addEventListener('error', (e) => {
   setStatus('ERROR: ' + (e.message || e.type));
