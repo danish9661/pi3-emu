@@ -1,0 +1,14 @@
+[package]
+name = "i2c"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pi-runtime = { path = "../runtime" }
+
+[[bin]]
+name = "i2c"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
