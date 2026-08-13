@@ -7,13 +7,12 @@ const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MUnicorn = require(join(__dirname, '..', 'public', 'unicorn.js'));
 const { parseElf, loadElf } = await import(join(__dirname, '..', 'src', 'elf.js'));
+const { createUart0 } = await import(join(__dirname, '..', 'src', 'uart0.js'));
 const { createUart1 } = await import(join(__dirname, '..', 'src', 'uart1.js'));
 
 const RAM_SIZE = 0x400000;
 const SLICE_INSNS = 512;
 const UART_WINDOW = 0x1000;
-const TX_SLOT_STRIDE = 4;
-const TX_SLOTS = 32;
 const PROG = join(__dirname, '..', 'public', 'programs', 'uart1.elf');
 
 const AUX_BASE = 0x3f215000;
@@ -38,17 +37,14 @@ let chars = '';
 let u1 = ''; // UART1 stream, tagged like the browser console
 let lineStart = true;
 const PREFIX = '[u1] ';
-function pump() {
+const uart0 = createUart0(uc, ucMod, uart, (b) => board.pi_cons_push(b));
+
+function drain() {
   let out = '';
-  const win = uc.mem_read(uart, TX_SLOTS * TX_SLOT_STRIDE);
-  for (let i = 0; i < TX_SLOTS; i++) {
-    for (let k = 0; k < TX_SLOT_STRIDE; k++) {
-      const c = win[i * TX_SLOT_STRIDE + k];
-      if (c) {
-        out += String.fromCharCode(c);
-        uc.mem_write(uart + i * TX_SLOT_STRIDE + k, [0]);
-      }
-    }
+  for (;;) {
+    const c = Number(board.pi_cons_poll());
+    if (c === -1 || c === 0xffffffff) break;
+    out += String.fromCharCode(c);
   }
   return out;
 }
@@ -68,8 +64,10 @@ const { state, syncOut, syncIn } = uart1;
 function slice() {
   const pc = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry;
   syncOut(uc);
+  uart0.syncOut(uc);
   uc.emu_start(pc, 0, 0, SLICE_INSNS);
-  chars += pump();
+  uart0.syncIn(uc);
+  chars += drain();
   syncIn(uc);
 }
 

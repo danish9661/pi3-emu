@@ -9,22 +9,16 @@ const MUnicorn = require(join(__dirname, '..', 'public', 'unicorn.js'));
 const { parseElf, loadElf } = await import(join(__dirname, '..', 'src', 'elf.js'));
 const { createUart0 } = await import(join(__dirname, '..', 'src', 'uart0.js'));
 
-const UART_WINDOW = 0x1000;
 const RAM_SIZE = 0x400000;
 const SLICE_INSNS = 512;
-const PROG = join(__dirname, '..', 'public', 'programs', 'irq.elf');
-
-const TMR_BASE = 0x3f003000;
-const TMR_CS = TMR_BASE + 0x00;
-const TMR_CLO = TMR_BASE + 0x04;
-const TMR_CMP = TMR_BASE + 0x0c;
+const UART_WINDOW = 0x1000;
+const PROG = join(__dirname, '..', 'public', 'programs', 'uart0.elf');
 
 const IC_BASE = 0x3f00b200;
 const IC_PENDING1 = IC_BASE + 0x04;
 const IC_ENABLE_IRQS1 = IC_BASE + 0x10;
 const IC_IRQ_RET = IC_BASE + 0x2c;
 
-const IRQ_TIMER1 = 1 << 29;
 const IRQ_UART = 1 << 25; // PL011 UART0 = IRQ 57 (bank 1, bit 25)
 
 function writeU32(uc, addr, v) {
@@ -49,17 +43,12 @@ async function main() {
   const uc = new ucMod.Unicorn(ucMod.ARCH_ARM64, ucMod.MODE_LITTLE_ENDIAN);
   uc.mem_map(0, RAM_SIZE, ucMod.PROT_ALL);
   uc.mem_map(uart, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
-  uc.mem_map(TMR_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(0x3f00b000, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
-  uc.devUart = { base: uart };
-  const uart0 = createUart0(uc, ucMod, uart, (b) => board.pi_cons_push(b));
-  loadElf(uc, elf);
+  uc.entry = loadElf(uc, elf);
 
-  const wall0 = Date.now();
-  let tmrPending = 0;
-  let tmrCompares = [0, 0, 0, 0];
-  let tmrCrossed = [false, false, false, false];
-  let tmrLastCS = 0;
+  const uart0 = createUart0(uc, ucMod, uart, (b) => board.pi_cons_push(b));
+  const { state, syncOut, syncIn, push, irqActive } = uart0;
+
   let icEnabled1 = 0;
   let chars = '';
   let delivered = 0;
@@ -68,34 +57,9 @@ async function main() {
   let irqVector = 0;
   let irqResume = 0;
 
-  const syncTmrOut = () => {
-    const us = ((Date.now() - wall0) * 1000) & 0xffffffff;
-    writeU32(uc, TMR_CLO, us);
-    writeU32(uc, TMR_CLO + 4, 0);
-    for (let i = 0; i < 4; i++) {
-      const c = tmrCompares[i];
-      if (!tmrCrossed[i] && c !== 0 && ((us - c) & 0x80000000) === 0) {
-        tmrCrossed[i] = true;
-        tmrPending |= 1 << i;
-      }
-    }
-    writeU32(uc, TMR_CS, tmrPending);
-    tmrLastCS = tmrPending;
-  };
-  const syncTmrIn = () => {
-    for (let i = 0; i < 4; i++) {
-      const c = readU32(uc, TMR_CMP + i * 4);
-      if (c !== tmrCompares[i]) tmrCrossed[i] = false;
-      tmrCompares[i] = c;
-    }
-    const cs = readU32(uc, TMR_CS);
-    if (cs !== tmrLastCS) tmrPending &= cs & 0xf;
-  };
+
   const syncIcOut = () => {
-    let p1 = 0;
-    if (tmrPending & 4) p1 |= IRQ_TIMER1;
-    if (uart0.irqActive()) p1 |= IRQ_UART;
-    writeU32(uc, IC_PENDING1, p1);
+    writeU32(uc, IC_PENDING1, irqActive() ? IRQ_UART : 0);
   };
   const syncIcIn = () => {
     const en = readU32(uc, IC_ENABLE_IRQS1);
@@ -113,16 +77,14 @@ async function main() {
   };
   const irqDeliver = () => {
     let pending = readU32(uc, IC_PENDING1) & icEnabled1;
-    if (!uart0.irqActive()) pending &= ~IRQ_UART; // stale PENDING1 window
+    if (!irqActive()) pending &= ~IRQ_UART; // stale PENDING1 window
     if (!pending || irqInFlight) return;
-    const pcNow = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC));
-    irqElr = pcNow || elf.entry;
+    irqElr = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || elf.entry;
     irqInFlight = true;
     const vbar = Number(uc.reg_read_i32(ucMod.ARM64_REG_VBAR_EL1)) || 0x100000;
     irqVector = vbar + 0x280;
     delivered++;
   };
-  let keySlices2 = 0;
   const drain = () => {
     let out = '';
     for (;;) {
@@ -132,47 +94,41 @@ async function main() {
     }
     return out;
   };
-  let keySlices = 0;
   const slice = () => {
     const pc = irqResume || irqVector || Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || elf.entry;
     if (irqResume) irqInFlight = false;
     irqResume = 0;
     irqVector = 0;
-    syncTmrOut();
     syncIcOut();
-    uart0.syncOut(uc);
+    syncOut(uc);
     uc.emu_start(pc, 0, 0, SLICE_INSNS);
-    syncTmrIn();
     syncIcIn();
     syncIrqRet();
-    uart0.syncIn(uc);
+    syncIn(uc);
     const out = drain();
     irqDeliver();
     return out;
   };
 
-  // Phase 1: boot + arm. The timer IRQ should fire at ~1s wall time.
+  // Phase 1: boot + configure + arm RXINTR (IRQ 57).
   const t0 = Date.now();
-  for (let i = 0; i < 30000 && !chars.includes('[irq #1 '); i++) chars += slice();
+  for (let i = 0; i < 30000 && !chars.includes('type a key'); i++) chars += slice();
 
-  // Phase 2: send a key -> UART RX IRQ.
-  uart0.push(0x48); // 'H' into the PL011 RX FIFO
-  for (let i = 0; i < 30000 && !chars.includes("[irq key: 'H']"); i++) {
-    chars += slice();
-  }
+  // Phase 2: send a key -> RXINTR -> the handler pops DR and reports MIS.
+  push(0x48); // 'H' into the PL011 RX FIFO
+  for (let i = 0; i < 30000 && !chars.includes("[rx 'H']"); i++) chars += slice();
 
-  const irqCount = (chars.match(/\[irq #(\d+)/g) || []).length;
-  const ticks = (chars.match(/\[irq #(\d+) t\+1s\]/g) || []).length;
-  const keySeen = chars.includes("[irq key: 'H']");
   const checks = [
-    ['interrupt controller banner:', chars.includes('irq: BCM2835 interrupt controller')],
-    ['timer + UART armed:', chars.includes('irq: timer C1 + UART RX armed')],
-    ['timer IRQ delivered:', ticks >= 1],
-    ['UART RX IRQ delivered:', keySeen],
-    ['deliveries happened:', delivered >= 1],
+    ['PL011 banner:', chars.includes('uart0: BCM2837 PL011 @ 0x3F201000')],
+    ['config latched (IBRD 1, FBRD 40, LCRH 0x70, CR 0x301):', chars.includes('IBRD 1 FBRD 28 (115200 @ 3 MHz), LCRH 0x70, CR 0x301')],
+    ['FR TX-ready verified:', chars.includes('FR shows TXFE set, TXFF clear')],
+    ['RXINTR armed:', chars.includes('RXINTR armed (IMSC bit 4) -> IRQ 57')],
+    ['RXINTR fired with MIS 0x10:', chars.includes('RXINTR fired (MIS 0x10)')],
+    ['key echoed via DR read:', chars.includes("[rx 'H']")],
+    ['IRQ delivered through the IC:', delivered >= 1],
   ];
   for (const [name, ok] of checks) console.log(ok ? 'PASS' : 'FAIL', '-', name);
-  console.log('irq ticks seen:', ticks, '| irq lines:', irqCount, '| deliveries:', delivered);
+  console.log('deliveries:', delivered, '| config:', JSON.stringify(state));
   console.log('console output:', JSON.stringify(chars));
   console.log('session time:', Date.now() - t0, 'ms');
   uc.close();

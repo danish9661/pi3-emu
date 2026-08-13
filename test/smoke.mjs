@@ -7,10 +7,9 @@ const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MUnicorn = require(join(__dirname, '..', 'public', 'unicorn.js'));
 const { parseElf, loadElf } = await import(join(__dirname, '..', 'src', 'elf.js'));
+const { createUart0 } = await import(join(__dirname, '..', 'src', 'uart0.js'));
 
 const UART_WINDOW = 0x1000;
-const TX_SLOT_STRIDE = 4;
-const TX_SLOTS = 32;
 const RAM_SIZE = 0x400000;
 const SLICE_INSNS = 512;
 const MAX_SLICES = 5000;
@@ -26,10 +25,10 @@ async function main() {
   ).instance.exports;
 
   const uart = Number(board.pi_uart_base());
-  const rx = uart + Number(board.pi_rx_offset());
   const uc = new ucMod.Unicorn(ucMod.ARCH_ARM64, ucMod.MODE_LITTLE_ENDIAN);
   uc.mem_map(0, RAM_SIZE, ucMod.PROT_ALL);
   uc.mem_map(uart, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  const uart0 = createUart0(uc, ucMod, uart, (b) => board.pi_cons_push(b));
 
   const elf = parseElf(new Uint8Array(readFileSync(PROG)));
   loadElf(uc, elf);
@@ -39,29 +38,21 @@ async function main() {
 
   let chars = '';
   const drain = () => {
-    const window = uc.mem_read(uart, TX_SLOTS * TX_SLOT_STRIDE);
     let found = 0;
-    for (let i = 0; i < TX_SLOTS; i++) {
-      const c = window[i * TX_SLOT_STRIDE];
-      if (c !== 0) {
-        found++;
-        board.pi_cons_push(c);
-        for (let k = 0; k < TX_SLOT_STRIDE; k++) {
-          uc.mem_write(uart + i * TX_SLOT_STRIDE + k, [0]);
-        }
-      }
-    }
     for (;;) {
       const c = Number(board.pi_cons_poll());
       if (c === -1 || c === 0xffffffff) break;
       chars += String.fromCharCode(c);
+      found++;
     }
     return found;
   };
 
   const slice = () => {
     const pc = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || elf.entry;
+    uart0.syncOut(uc);
     uc.emu_start(pc, 0, 0, SLICE_INSNS);
+    uart0.syncIn(uc);
     return drain();
   };
 
@@ -75,7 +66,7 @@ async function main() {
 
   const type = (str) => {
     for (const ch of str) {
-      uc.mem_write(rx, [typeof ch === 'number' ? ch : ch.charCodeAt(0)]);
+      uart0.push(typeof ch === 'number' ? ch : ch.charCodeAt(0));
       runUntilIdle();
     }
   };

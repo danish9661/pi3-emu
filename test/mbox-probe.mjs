@@ -7,10 +7,9 @@ const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MUnicorn = require(join(__dirname, '..', 'public', 'unicorn.js'));
 const { parseElf, loadElf } = await import(join(__dirname, '..', 'src', 'elf.js'));
+const { createUart0 } = await import(join(__dirname, '..', 'src', 'uart0.js'));
 
 const UART_WINDOW = 0x1000;
-const TX_SLOT_STRIDE = 4;
-const TX_SLOTS = 32;
 const RAM_SIZE = 0x400000;
 const SLICE_INSNS = 512;
 const MAX_SLICES = 5000;
@@ -81,13 +80,13 @@ async function main() {
   ).instance.exports;
 
   const uart = Number(board.pi_uart_base());
-  const rx = uart + Number(board.pi_rx_offset());
   const uc = new ucMod.Unicorn(ucMod.ARCH_ARM64, ucMod.MODE_LITTLE_ENDIAN);
   uc.mem_map(0, RAM_SIZE, ucMod.PROT_ALL);
   uc.mem_map(uart, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(TMR_CLO & ~0xfff, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(0x3f00b000, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.devUart = { base: uart };
+  const uart0 = createUart0(uc, ucMod, uart, (b) => board.pi_cons_push(b));
 
   const elf = parseElf(new Uint8Array(readFileSync(PROG)));
   loadElf(uc, elf);
@@ -129,16 +128,10 @@ async function main() {
   const slice = () => {
     const pc = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || elf.entry;
     syncOut();
+    uart0.syncOut(uc);
     uc.emu_start(pc, 0, 0, SLICE_INSNS);
     syncIn();
-    const win = uc.mem_read(uart, TX_SLOTS * TX_SLOT_STRIDE);
-    for (let i = 0; i < TX_SLOTS; i++) {
-      const c = win[i * TX_SLOT_STRIDE];
-      if (c !== 0) {
-        board.pi_cons_push(c);
-        for (let k = 0; k < TX_SLOT_STRIDE; k++) uc.mem_write(uart + i * TX_SLOT_STRIDE + k, [0]);
-      }
-    }
+    uart0.syncIn(uc);
     return drain();
   };
 
@@ -156,7 +149,7 @@ async function main() {
   const type = (str) => {
     let acc = '';
     for (const ch of str) {
-      uc.mem_write(rx, [typeof ch === 'number' ? ch : ch.charCodeAt(0)]);
+      uart0.push(typeof ch === 'number' ? ch : ch.charCodeAt(0));
       acc += runUntilIdle();
     }
     return acc;

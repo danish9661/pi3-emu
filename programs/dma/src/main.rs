@@ -18,13 +18,9 @@
 
 use pi_runtime::puts;
 
-const UART: *mut u32 = 0x3F20_1000 as *mut u32;
-const RX_SLOT: *mut u32 = (0x3F20_1000 + 0x80) as *mut u32;
-
 const IC_BASE: u32 = 0x3F00_B200;
 const IC_PENDING1: u32 = IC_BASE + 0x04;
 const IC_ENABLE_IRQS1: u32 = IC_BASE + 0x10;
-const IC_IRQ_RET: u32 = IC_BASE + 0x2C; // host-assisted return (M11)
 
 const DMA_BASE: u32 = 0x3F00_7000;
 const DMA_CS: u32 = DMA_BASE + 0x00;

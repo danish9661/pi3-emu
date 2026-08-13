@@ -100,14 +100,12 @@ pub extern "C" fn rust_main() -> ! {
 
     // COUNTER: read it 3 times; each read must return 1, 2, 3.
     let mut ok = true;
-    let mut counter = 0;
     for i in 1..=3u32 {
         transfer(SENSOR, 1, false, REG_COUNTER);
         let c = (transfer(SENSOR, 1, true, 0)) & 0xff;
         if c != i {
             ok = false;
         }
-        counter = c;
     }
 
     puts(if who == 0x68 {

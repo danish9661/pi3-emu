@@ -3,16 +3,23 @@
 
 //! Interrupt demo: the BCM2835 legacy interrupt controller (0x3F00B200).
 //! The guest arms the system timer compare register C1 (IRQ 29) and the
-//! PL011 UART RX line (IRQ 31), then spins with interrupts unmasked; the
-//! host delivers the IRQ at a slice boundary (ELR/SPSR saved, PC jumped to
+//! PL011 UART0 RX line (IRQ 57, bank 1 bit 25 — RXINTR from the real
+//! register model), then spins with interrupts unmasked; the host
+//! delivers the IRQ at a slice boundary (ELR/SPSR saved, PC jumped to
 //! VBAR+0x280, DAIF.I set) and the handler clears the source and re-arms.
 //!
 //! Vector table lives in the `.vectors` section at 0x100000 (linker.ld).
 
 use pi_runtime::{putc, puts, putu};
 
-const UART: *mut u32 = 0x3F20_1000 as *mut u32;
-const RX_SLOT: *mut u32 = (0x3F20_1000 + 0x80) as *mut u32;
+const UART0: u32 = 0x3F20_1000;
+const DR: u32 = UART0 + 0x00;
+const FR: u32 = UART0 + 0x18;
+const IMSC: u32 = UART0 + 0x38;
+const ICR: u32 = UART0 + 0x44;
+
+const FR_RXFE: u32 = 1 << 4;
+const RXIM: u32 = 1 << 4;
 
 const TMR_BASE: u32 = 0x3F00_3000;
 const TMR_CS: u32 = TMR_BASE + 0x00;
@@ -22,10 +29,9 @@ const TMR_C1: u32 = TMR_BASE + 0x14; // compare 1 (0x10 = compare 0!)
 const IC_BASE: u32 = 0x3F00_B200;
 const IC_PENDING1: u32 = IC_BASE + 0x04;
 const IC_ENABLE_IRQS1: u32 = IC_BASE + 0x10;
-const IC_IRQ_RET: u32 = IC_BASE + 0x2C; // host-assisted return (see below)
 
 const IRQ_TIMER1: u32 = 1 << 29; // system timer compare 1
-const IRQ_UART: u32 = 1 << 31; // PL011 UART
+const IRQ_UART: u32 = 1 << 25; // PL011 UART0 = IRQ 57 (bank 1, bit 25)
 
 #[inline(always)]
 fn mmio_read(a: u32) -> u32 {
@@ -80,13 +86,49 @@ core::arch::global_asm!(
     "  b .", // 0x780 aarch32 err
     "  .org 0x800",
     "irq_glue:",
-    "  stp x29, x30, [sp, #-16]!", // preserve the guest's LR: the bl below
-    "  bl irq_handler_rust", //      clobbers x30 and the resumed code must
-    "  ldp x29, x30, [sp], #16", // not `ret` into the glue
+    // The host cannot force a hardware context switch (ELR/SPSR are not
+    // writable in this build), so the glue preserves the entire register
+    // file: the handler's puts/putc clobber x0-x30, and the guest may be
+    // interrupted in the middle of any puts loop (live string pointer).
+    "  stp x0, x1, [sp, #-16]!",
+    "  stp x2, x3, [sp, #-16]!",
+    "  stp x4, x5, [sp, #-16]!",
+    "  stp x6, x7, [sp, #-16]!",
+    "  stp x8, x9, [sp, #-16]!",
+    "  stp x10, x11, [sp, #-16]!",
+    "  stp x12, x13, [sp, #-16]!",
+    "  stp x14, x15, [sp, #-16]!",
+    "  stp x16, x17, [sp, #-16]!",
+    "  stp x18, x19, [sp, #-16]!",
+    "  stp x20, x21, [sp, #-16]!",
+    "  stp x22, x23, [sp, #-16]!",
+    "  stp x24, x25, [sp, #-16]!",
+    "  stp x26, x27, [sp, #-16]!",
+    "  stp x28, x29, [sp, #-16]!",
+    "  str x30, [sp, #-16]!",
+    "  bl irq_handler_rust",
+    // The IRQ_RET magic tells the host the handler is done; it clobbers
+    // w0/w1, so write it before restoring the register file.
     "  movz w0, #1",
     "  movz w1, #0xb22c",
     "  movk w1, #0x3f00, lsl #16",
     "  str w0, [x1]",
+    "  ldr x30, [sp], #16",
+    "  ldp x28, x29, [sp], #16",
+    "  ldp x26, x27, [sp], #16",
+    "  ldp x24, x25, [sp], #16",
+    "  ldp x22, x23, [sp], #16",
+    "  ldp x20, x21, [sp], #16",
+    "  ldp x18, x19, [sp], #16",
+    "  ldp x16, x17, [sp], #16",
+    "  ldp x14, x15, [sp], #16",
+    "  ldp x12, x13, [sp], #16",
+    "  ldp x10, x11, [sp], #16",
+    "  ldp x8, x9, [sp], #16",
+    "  ldp x6, x7, [sp], #16",
+    "  ldp x4, x5, [sp], #16",
+    "  ldp x2, x3, [sp], #16",
+    "  ldp x0, x1, [sp], #16",
     "  b .",
 );
 
@@ -104,11 +146,16 @@ pub extern "C" fn irq_handler_rust() {
         mmio_write(TMR_C1, mmio_read(TMR_CLO).wrapping_add(1_000_000)); // re-arm
     }
     if p & IRQ_UART != 0 {
-        let ch = unsafe { *RX_SLOT } as u8;
-        unsafe { *RX_SLOT = 0 }; // consume the key
-        puts("[irq key: '");
-        putc(ch);
-        puts("']\r\n");
+        // Read keys out of the PL011 RX FIFO until it empties (reading DR
+        // pops it); the RXINTR line follows the FIFO, so draining it here
+        // de-asserts the IRQ at the next slice boundary.
+        while mmio_read(FR) & FR_RXFE == 0 {
+            let ch = (mmio_read(DR) & 0xff) as u8;
+            puts("[irq key: '");
+            putc(ch);
+            puts("']\r\n");
+        }
+        mmio_write(ICR, RXIM); // W1C: absorb (the line follows the FIFO)
     }
 }
 
@@ -133,6 +180,7 @@ pub extern "C" fn rust_main() -> ! {
             "msr daifclr, #2",
             options(nostack)
         );
+        mmio_write(IMSC, RXIM); // arm the PL011 RXINTR
         mmio_write(IC_ENABLE_IRQS1, IRQ_TIMER1 | IRQ_UART);
         mmio_write(TMR_C1, mmio_read(TMR_CLO).wrapping_add(1_000_000));
         puts("irq: timer C1 + UART RX armed, IRQ enabled\r\n");

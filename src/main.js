@@ -6,11 +6,10 @@ import { createPwm } from './pwm.js';
 import { createI2c } from './i2c.js';
 import { createSpi } from './spi.js';
 import { createUart1 } from './uart1.js';
+import { createUart0 } from './uart0.js';
 import { createSdhci } from './sdhci.js';
 
 const UART_WINDOW = 0x1000;
-const TX_SLOT_STRIDE = 4;
-const TX_SLOTS = 32;
 const RAM_BASE = 0x0;
 const RAM_SIZE = 0x400000;
 const SLICE_INSNS = 512;
@@ -153,6 +152,16 @@ let uart1SyncOut = null;
 let uart1SyncIn = null;
 let uart1LineStart = true; // next UART1 char starts a line (add the [u1] tag)
 
+// PL011 UART0 (see uart0.js): the real BCM2837 register model at
+// 0x3F201000. TX is emitted by a DR write hook, RX keys are queued by the
+// host (uart0Push) and popped by the guest's DR reads, and RXINTR drives
+// the interrupt controller's IRQ 57 line (bank 1, bit 25).
+let uart0SyncOut = null;
+let uart0SyncIn = null;
+let uart0State = null;
+let uart0Push = null;
+let uart0IrqActive = null;
+
 // Host-arbitrated SDHCI (EMMC) controller (see sdhci.js): a FAT12 microSD
 // card at 0x3F300000 with a DONE host extension at +0x54. Guest parks on
 // SD_DONE after printing HELLO.TXT.
@@ -178,6 +187,7 @@ export const PROGRAMS = {
   spi: 'spi.elf',
   uart1: 'uart1.elf',
   sd: 'sd.elf',
+  uart0: 'uart0.elf',
 };
 
 const term = document.getElementById('term');
@@ -195,7 +205,6 @@ const gpioBtnEl = document.getElementById('gpio-btn');
 let ucMod = null;
 let uc = null;
 let board = null;
-let rxSlot = 0;
 let mode = 'single';
 let cores = null; // smp: one unicorn instance per core
 let entries = null; // smp: per-core resume/entry addresses
@@ -239,7 +248,6 @@ async function loadBoard() {
 // AArch64 instructions, resuming from the current PC.
 function boot(ucMod, uc, board, elf) {
   const uart = Number(board.pi_uart_base());
-  rxSlot = uart + Number(board.pi_rx_offset());
 
   uc.mem_map(RAM_BASE, RAM_SIZE, ucMod.PROT_ALL);
   uc.mem_map(uart, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
@@ -255,23 +263,21 @@ function boot(ucMod, uc, board, elf) {
   uc.mem_map(UART1_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(SD_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.devUart = { base: uart };
-  // Primary-UART TX hook: chars reach the console at write time, so they
-  // interleave with UART1's hook-pushed chars in the guest's exact write
-  // order (the diff-based pump below then only clears the slots).
-  uc.uartHook = true;
-  uc.hook_add(
-    ucMod.HOOK_MEM_WRITE,
-    (u, access, addr, size, value) => {
-      const b = Number(value) & 0xff;
-      if (b !== 0) {
-        stats.chars++;
-        board.pi_cons_push(b);
-      }
-    },
-    null,
-    uart,
-    uart + TX_SLOTS * TX_SLOT_STRIDE - 1
-  );
+  // The PL011 model (src/uart0.js): TX chars are emitted at DR-write time
+  // (same hook trick as the mini UART, so UART0 and UART1 chars keep the
+  // guest's exact write order), RX keys are queued by the host and popped
+  // by the guest's DR reads, and RXINTR drives the IC's IRQ 57 line.
+  uart0SyncOut = null;
+  uart0SyncIn = null;
+  const uart0 = createUart0(uc, ucMod, uart, (b) => {
+    stats.chars++;
+    board.pi_cons_push(b);
+  });
+  uart0SyncOut = uart0.syncOut;
+  uart0SyncIn = uart0.syncIn;
+  uart0State = uart0.state;
+  uart0Push = uart0.push;
+  uart0IrqActive = uart0.irqActive;
   uc.entry = elf.entry;
   tmrWall0 = performance.now();
   tmrPending = 0;
@@ -435,8 +441,9 @@ function fbTag(uc, addr, off, id, tsize) {
 
 // ---- BCM2835 interrupt controller (0x3F00B200): the "basic" pending
 // register and pending 1 share the same 32 lines; we model pending-1 with
-// the timer (bit 29) and PL011 UART (bit 31) sources driven by host state,
-// plus enable/disable masks the guest writes. ----
+// the timer (bit 29), the PL011 UART (bit 25 = IRQ 57, the real line) and
+// DMA (bit 16) sources driven by host state, plus enable/disable masks
+// the guest writes. ----
 
 const IC_BASE = 0x3F00B200;
 const IC_PENDING_BASIC = IC_BASE + 0x00;
@@ -449,7 +456,7 @@ const IC_DISABLE_IRQS1 = IC_BASE + 0x1C;
 const IC_DISABLE_IRQS2 = IC_BASE + 0x20;
 const IC_DISABLE_BASIC = IC_BASE + 0x24;
 const IC_IRQ_TIMER1 = 1 << 29; // system timer compare 1
-const IC_IRQ_UART = 1 << 31; // PL011 UART
+const IC_IRQ_UART = 1 << 25; // PL011 UART0 = IRQ 57 (bank 1, bit 25)
 
 let icEnabled1 = 0;
 let icEnabled2 = 0;
@@ -461,7 +468,7 @@ let icEnabledBasic = 0;
 function syncIcOut(uc) {
   let p1 = 0;
   if (tmrPending & 4) p1 |= IC_IRQ_TIMER1; // CS bit 2 = the irq guest's C1 (0x3014)
-  if (uc.mem_read(rxSlot, 1)[0] !== 0) p1 |= IC_IRQ_UART; // RX byte waiting
+  if (uart0IrqActive && uart0IrqActive()) p1 |= IC_IRQ_UART; // PL011 RXINTR (IRQ 57)
   if (dmaInt && (dmaEnable & 1)) p1 |= IRQ_DMA0; // DMA channel 0 completion
   writeU32(uc, IC_PENDING_BASIC, p1);
   writeU32(uc, IC_PENDING1, p1);
@@ -501,9 +508,11 @@ let irqResume = 0;
 function irqDeliver(uc) {
   let pending = readU32(uc, IC_PENDING1) & icEnabled1;
   // The PENDING1 window is refreshed before each slice, so it can still hold
-  // the DMA0 bit after the guest has cleared CS.INT. Re-derive the line from
-  // host state: once INT is cleared, a stale window must not re-deliver.
+  // device bits after the guest has cleared the source. Re-derive each line
+  // from host state: DMA0 once CS.INT is cleared, and the UART line once the
+  // handler has drained the RX FIFO (RXINTR follows the FIFO).
   if (!(dmaInt && (dmaEnable & 1))) pending &= ~IRQ_DMA0;
+  if (uart0IrqActive && !uart0IrqActive()) pending &= ~IC_IRQ_UART;
   if (!pending || irqInFlight) return;
   if (mode === SMP_MODE) return;
   irqElr = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry;
@@ -612,28 +621,6 @@ function syncTimerIn(uc) {
   }
 }
 
-function pumpUart(ucMod, uc, board) {
-  const { base } = uc.devUart;
-  const window = uc.mem_read(base, TX_SLOTS * TX_SLOT_STRIDE);
-  let found = 0;
-  for (let i = 0; i < TX_SLOTS; i++) {
-    const c = window[i * TX_SLOT_STRIDE];
-    if (c !== 0) {
-      found++;
-      // The write hook already pushed the chars on this uc (boot() set
-      // uc.uartHook); the SMP cores have no hook, so the pump pushes here.
-      if (!uc.uartHook) {
-        stats.chars++;
-        board.pi_cons_push(c);
-      }
-      for (let k = 0; k < TX_SLOT_STRIDE; k++) {
-        uc.mem_write(base + i * TX_SLOT_STRIDE + k, [0]);
-      }
-    }
-  }
-  return found;
-}
-
 function drain(board) {
   let out = '';
   for (;;) {
@@ -696,6 +683,22 @@ function smpBoot(elf) {
     c.mem_map(Number(board.pi_uart_base()), UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
     c.mem_map(SMP_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
     c.devUart = { base: Number(board.pi_uart_base()) };
+    // Each core prints through the PL011 DR: a TX write hook pushes the
+    // chars (the cores have no slice-loop pump anymore — the slots are
+    // gone).
+    c.hook_add(
+      ucMod.HOOK_MEM_WRITE,
+      (u, access, addr, size, value) => {
+        const b = Number(value) & 0xff;
+        if (b !== 0) {
+          stats.chars++;
+          board.pi_cons_push(b);
+        }
+      },
+      null,
+      Number(board.pi_uart_base()),
+      Number(board.pi_uart_base()) + 3
+    );
     loadElf(c, elf);
     cores.push(c);
   }
@@ -726,7 +729,6 @@ function smpRun() {
       stats.emuMs += performance.now() - t0;
       stats.steps += 1;
       stats.insns += SLICE_INSNS;
-      pumpUart(ucMod, c, board);
       syncDeviceIn(c, i);
     }
     out += drain(board);
@@ -858,6 +860,7 @@ function runSlice(count) {
   syncIcOut(uc);
   syncMmuOut(uc);
   syncDmaOut(uc);
+  if (uart0SyncOut) uart0SyncOut(uc);
   if (pwmSyncOut) pwmSyncOut(uc);
   if (i2cSyncOut) i2cSyncOut(uc);
   if (spiSyncOut) spiSyncOut(uc);
@@ -882,10 +885,7 @@ function runSlice(count) {
   if (i2cSyncIn) i2cSyncIn(uc);
   if (spiSyncIn) spiSyncIn(uc);
   if (sdSyncIn) sdSyncIn(uc);
-  // The UART TX hooks (see boot) already pushed this slice's chars in the
-  // guest's write order; the pump only clears the slots (and pushes for the
-  // hookless SMP cores).
-  pumpUart(ucMod, uc, board);
+  if (uart0SyncIn) uart0SyncIn(uc);
   if (uart1SyncIn) uart1SyncIn(uc);
   const out = drain(board);
   irqDeliver(uc);
@@ -1132,7 +1132,7 @@ function runUntilIdle() {
 }
 
 function guestKey(code) {
-  uc.mem_write(rxSlot, [code]);
+  uart0Push(code); // queue into the PL011 RX FIFO (guest's getc pops it)
   return runUntilIdle();
 }
 
@@ -1142,7 +1142,7 @@ function handleKey(e) {
     const c = e.key.length === 1 ? e.key.charCodeAt(0) : e.key === 'Enter' ? 13 : 0;
     if (!c) return;
     e.preventDefault();
-    uc.mem_write(rxSlot, [c]); // rx slot -> UART RX IRQ at the next slice
+    uart0Push(c); // RX FIFO -> RXINTR (IRQ 57) at the next slice
     return;
   }
   if (mode === SMP_MODE || mode === FB_MODE) return;
@@ -1166,11 +1166,11 @@ function tapKeys(btn) {
   if (mode === IRQ_MODE) {
     const action = btn.dataset.action;
     if (action === 'enter') {
-      uc.mem_write(rxSlot, [13]);
+      uart0Push(13);
     } else if (action === 'bs') {
-      uc.mem_write(rxSlot, [0x7f]);
+      uart0Push(0x7f);
     } else {
-      for (const ch of btn.dataset.keys) uc.mem_write(rxSlot, [ch.charCodeAt(0)]);
+      for (const ch of btn.dataset.keys) uart0Push(ch.charCodeAt(0));
     }
     term.focus();
     return;
@@ -1240,12 +1240,14 @@ async function run() {
       setStatus(
         `booted — running fb — framebuffer 160x120x32 @ 0x200000 via mailbox — live canvas`
       );
-    } else if (progSel.value === IRQ_MODE) {
+    } else if (progSel.value === IRQ_MODE || progSel.value === 'uart0') {
       mode = IRQ_MODE;
       boot(ucMod, uc, board, elf);
       irqRun(); // async: rAF-paced slices, IRQs delivered at slice ends
       setStatus(
-        `booted — running irq — BCM2835 interrupt controller @ 0x3F00B200 — timer + UART IRQs live`
+        progSel.value === 'uart0'
+          ? `booted — running uart0 — BCM2837 PL011 @ 0x3F201000 — config verified, RXINTR -> IRQ 57 — type a key`
+          : `booted — running irq — BCM2835 interrupt controller @ 0x3F00B200 — timer + PL011 IRQs live`
       );
     } else if (progSel.value === 'mmu') {
       mode = 'mmu';

@@ -16,10 +16,7 @@
 //! PA 0x300200 and calls it at VA 0x80000200 (executing from the shadow
 //! copy), and verifies every result.
 
-use pi_runtime::{puts, putu};
-
-const UART: *mut u32 = 0x3F20_1000 as *mut u32;
-const RX_SLOT: *mut u32 = (0x3F20_1000 + 0x80) as *mut u32;
+use pi_runtime::puts;
 
 const MMU_CTL: u32 = 0x3F00_D000;
 

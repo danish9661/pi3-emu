@@ -105,6 +105,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "uart0"
+version = "0.1.0"
+dependencies = [
+ "pi-runtime",
+]
+
+[[package]]
 name = "uart1"
 version = "0.1.0"
 dependencies = [

@@ -59,11 +59,6 @@ pub extern "C" fn pi_cons_poll() -> u32 {
     c as u32
 }
 
-#[no_mangle]
-pub extern "C" fn pi_rx_offset() -> u32 {
-    0x80
-}
-
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {}

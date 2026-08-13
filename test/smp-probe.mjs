@@ -7,10 +7,9 @@ const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MUnicorn = require(join(__dirname, '..', 'public', 'unicorn.js'));
 const { parseElf, loadElf } = await import(join(__dirname, '..', 'src', 'elf.js'));
+const { createUart0 } = await import(join(__dirname, '..', 'src', 'uart0.js'));
 
 const UART_WINDOW = 0x1000;
-const TX_SLOT_STRIDE = 4;
-const TX_SLOTS = 32;
 const RAM_SIZE = 0x400000;
 const SLICE_INSNS = 512;
 const MAX_ROUNDS = 2000;
@@ -81,17 +80,11 @@ async function main() {
     if (state.msg[i] === 0) state.msg[i] = readU32(c, SMP_MSG + i * 4);
     state.park |= readU32(c, SMP_PARK);
   };
-  const pump = (c) => {
-    const base = c.devUart.base;
-    const win = c.mem_read(base, TX_SLOTS * TX_SLOT_STRIDE);
-    for (let i = 0; i < TX_SLOTS; i++) {
-      const ch = win[i * TX_SLOT_STRIDE];
-      if (ch !== 0) {
-        board.pi_cons_push(ch);
-        for (let k = 0; k < TX_SLOT_STRIDE; k++) c.mem_write(base + i * TX_SLOT_STRIDE + k, [0]);
-      }
-    }
-  };
+  // Each core prints through the PL011 DR: the TX write hook pushes chars
+  // straight into the board console (the slots are gone).
+  for (const c of cores) {
+    createUart0(c, ucMod, uart, (b) => board.pi_cons_push(b));
+  }
   const drain = () => {
     let out = '';
     for (;;) {
@@ -120,7 +113,6 @@ async function main() {
       syncOut(c, i);
       const pc = Number(c.reg_read_i32(ucMod.ARM64_REG_PC)) || entries[i];
       c.emu_start(pc, 0, 0, SLICE_INSNS);
-      pump(c);
       syncIn(c, i);
     }
     chars += drain();

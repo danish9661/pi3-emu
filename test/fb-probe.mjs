@@ -7,10 +7,9 @@ const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MUnicorn = require(join(__dirname, '..', 'public', 'unicorn.js'));
 const { parseElf, loadElf } = await import(join(__dirname, '..', 'src', 'elf.js'));
+const { createUart0 } = await import(join(__dirname, '..', 'src', 'uart0.js'));
 
 const UART_WINDOW = 0x1000;
-const TX_SLOT_STRIDE = 4;
-const TX_SLOTS = 32;
 const RAM_SIZE = 0x400000;
 const SLICE_INSNS = 512;
 const MAX_SLICES = 60000;
@@ -137,17 +136,7 @@ async function main() {
     }
   };
 
-  const pump = () => {
-    const base = uc.devUart.base;
-    const win = uc.mem_read(base, TX_SLOTS * TX_SLOT_STRIDE);
-    for (let i = 0; i < TX_SLOTS; i++) {
-      const ch = win[i * TX_SLOT_STRIDE];
-      if (ch !== 0) {
-        board.pi_cons_push(ch);
-        for (let k = 0; k < TX_SLOT_STRIDE; k++) uc.mem_write(base + i * TX_SLOT_STRIDE + k, [0]);
-      }
-    }
-  };
+  const uart0 = createUart0(uc, ucMod, uc.devUart.base, (b) => board.pi_cons_push(b));
   const drain = () => {
     let out = '';
     for (;;) {
@@ -161,9 +150,10 @@ async function main() {
     syncTmr();
     syncMbxOut();
     const pc = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || elf.entry;
+    uart0.syncOut(uc);
     uc.emu_start(pc, 0, 0, SLICE_INSNS);
     syncMbxIn();
-    pump();
+    uart0.syncIn(uc);
     return drain();
   };
   const pixel = (x, y) => {

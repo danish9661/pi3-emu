@@ -450,6 +450,35 @@ sd: all checks passed
 sd: parked
 ```
 
+## UART0 — the PL011 (0x3F201000, real BCM2837 layout)
+
+The main console is now the real PL011: the guest configures IBRD/FBRD/
+LCRH/CR like a real driver, polls FR for TX/RX flow control, reads and
+writes DR, and RXINTR (IMSC bit 4) drives the interrupt controller's
+IRQ 57 line (bank 1, bit 25). This replaces the original console "slots"
+window that the runtime used to know about. TX: a DR write is captured
+by a HOOK_MEM_WRITE and emitted at write time (gated on CR.UARTEN read
+live from the window), so console chars keep the guest's exact write
+order. RX: the host pushes key bytes into a small FIFO and pre-loads
+the head byte into the DR cell before every slice; delivery is split
+across the FR and DR read hooks — this unicorn build runs a read hook
+*before* the CPU latches the read, so a hook may never rewrite the
+register being read (the FR hook only re-mirrors the DR cell with the
+current FIFO head; the DR hook pops the FIFO but leaves the cell alone).
+The `uart0` program verifies the whole path: config latched, FR TX-ready,
+RXINTR armed, a typed key fires `RXINTR` (MIS 0x10) through the IC and
+is echoed via a DR read.
+
+```
+> uart0
+uart0: BCM2837 PL011 @ 0x3F201000
+uart0: IBRD 1 FBRD 28 (115200 @ 3 MHz), LCRH 0x70, CR 0x301
+uart0: FR shows TXFE set, TXFF clear — TX ready
+uart0: RXINTR armed (IMSC bit 4) -> IRQ 57 — type a key
+uart0: RXINTR fired (MIS 0x10)
+uart0: [rx 'x']
+```
+
 ## Programs
 
 | Program | What it does |
@@ -469,6 +498,7 @@ sd: parked
 | `spi`   | auto-runs: two identical SPI0 transactions against a flash slave; JEDEC ID 0xEF 0x40 0x18, CLEAR-reset proven by r1 == r2 (Reboot to re-run) |
 | `uart1` | auto-runs: second console on the AUX mini UART, output tagged `[u1] ` (Reboot to re-run) |
 | `sd`    | auto-runs: SDHCI init sequence + FAT12 card read; parses boot sector/root dir, prints HELLO.TXT (Reboot to re-run) |
+| `uart0` | auto-runs: real PL011 console — verifies the baud-rate config, FR flow control, RXINTR → IRQ 57 and RX echo (type a key to see `[rx 'x']`, Reboot to re-run) |
 
 Backspace (`⌫`) sends 0x7F; the guest unwrites its line buffer and the
 host trims the display. The terminal auto-focuses on boot; an on-screen
@@ -502,6 +532,7 @@ node test/i2c-probe.mjs          # I2C: sensor WHO_AM_I/TEMP/COUNTER reads, slav
 node test/spi-probe.mjs          # SPI: JEDEC ID transaction, CLEAR resets, r1 == r2
 node test/uart1-probe.mjs        # UART1: mini UART config, [u1]-tagged stream, TX-empty pacing
 node test/sd-probe.mjs           # SD: init sequence, FAT12 boot/root parse, HELLO.TXT payload
+node test/uart0-probe.mjs        # UART0: PL011 config latched, FR TX-ready, RXINTR via IC, RX echo
 ```
 
 ## Build
@@ -528,6 +559,7 @@ programs/             Rust workspace: runtime lib + shell/sum/fib/smp guests
   spi/                SPI demo: SPI0 master, flash slave JEDEC ID
   uart1/              mini UART demo: second console tagged [u1]
   sd/                 SD demo: SDHCI init + FAT12 card, prints HELLO.TXT
+  uart0/              PL011 demo: baud config, FR flow control, RXINTR -> IRQ 57, RX echo
 src/elf.js            ELF64 loader (PT_LOAD + bss zeroing)
 src/mmu.js            host-assisted MMU: table walk, shadow mapping, mirror
 src/dma.js            host-arbitrated DMA: CB chain walk + transfer engine
@@ -535,6 +567,7 @@ src/pwm.js            host-arbitrated PWM: FIFO model, drain ring, write hook
 src/i2c.js            host-arbitrated I2C: BSC window, sensor slave
 src/spi.js            host-arbitrated SPI: SPI0 window, flash slave
 src/uart1.js          mini UART model: write hook emits chars at write time
+src/uart0.js          PL011 model: DR/FR/RIS/MIS windows, RX FIFO, RXINTR -> IRQ 57
 src/sdhci.js          host-arbitrated SDHCI: block buffer, FAT12 image
 src/main.js           browser host loop (run-until-idle scheduler)
 board/src/lib.rs      board model (UART console FIFO only)
@@ -653,4 +686,22 @@ dist/                 production bundle
   at +0x20 on every read — a plain window can't pop, and the first
   attempt at +0x20 collided with INTERRUPT at +0x30; FAT12 cluster low
   word read at dir entry +20; SD_DONE (0x3F300054); `sd` program +
+  probe + browser E2E
+- M19 — PL011 UART0: the main console is the real BCM2837 PL011
+  (0x3F201000), replacing the console "slots" window — the guest
+  configures IBRD/FBRD/LCRH/CR like a real driver, polls FR for TX/RX
+  flow control, and RXINTR (IMSC bit 4) drives the interrupt
+  controller's IRQ 57 line (bank 1, bit 25); TX is a DR write hook
+  gated on CR.UARTEN, RX is a small FIFO whose head byte is pre-loaded
+  into the DR cell each slice, delivered across the FR and DR read
+  hooks — this unicorn build runs a read hook *before* the CPU latches
+  the read, so a hook that rewrites the register being read hands the
+  guest the post-hook value (first symptom: every key came back as
+  0x00); the runtime lib and all programs moved to PL011 putc/getc;
+  the irq guest arms IMSC and its vector glue now preserves the full
+  register file (an IRQ can land mid-puts; the old glue saved only
+  x29/x30); the probes resumed at a `lastPc` trace instead of the PC
+  register — a boundary between `ldrb w15,[x0],#1` and its `str`
+  re-executed the post-indexed load and skipped one byte per puts
+  (first symptom: the irq banner lost its `:`); `uart0` program +
   probe + browser E2E

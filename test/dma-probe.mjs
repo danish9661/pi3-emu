@@ -7,13 +7,12 @@ const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MUnicorn = require(join(__dirname, '..', 'public', 'unicorn.js'));
 const { parseElf, loadElf } = await import(join(__dirname, '..', 'src', 'elf.js'));
+const { createUart0 } = await import(join(__dirname, '..', 'src', 'uart0.js'));
 const { dmaRunChain } = await import(join(__dirname, '..', 'src', 'dma.js'));
 
 const RAM_SIZE = 0x400000;
 const SLICE_INSNS = 512;
 const UART_WINDOW = 0x1000;
-const TX_SLOT_STRIDE = 4;
-const TX_SLOTS = 32;
 const PROG = join(__dirname, '..', 'public', 'programs', 'dma.elf');
 
 const DMA_BASE = 0x3f007000;
@@ -52,7 +51,6 @@ const board = (
 const uart = Number(board.pi_uart_base());
 
 let chars = '';
-let lastPc = 0;
 let delivered = 0;
 let dmaEnd = false;
 let dmaInt = false;
@@ -76,17 +74,14 @@ function readU32(addr) {
   const b = uc.mem_read(addr, 4);
   return b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24);
 }
-function pump() {
+const uart0 = createUart0(uc, ucMod, uart, (b) => board.pi_cons_push(b));
+
+function drain() {
   let out = '';
-  const win = uc.mem_read(uart, TX_SLOTS * TX_SLOT_STRIDE);
-  for (let i = 0; i < TX_SLOTS; i++) {
-    for (let k = 0; k < TX_SLOT_STRIDE; k++) {
-      const c = win[i * TX_SLOT_STRIDE + k];
-      if (c) {
-        out += String.fromCharCode(c);
-        uc.mem_write(uart + i * TX_SLOT_STRIDE + k, [0]);
-      }
-    }
+  for (;;) {
+    const c = Number(board.pi_cons_poll());
+    if (c === -1 || c === 0xffffffff) break;
+    out += String.fromCharCode(c);
   }
   return out;
 }
@@ -144,7 +139,7 @@ function irqDeliver() {
   // host state: once INT is cleared, a stale window must not re-deliver.
   if (!(dmaInt && (dmaEnable & 1))) pending &= ~IRQ_DMA0;
   if (!pending || irqInFlight) return;
-  const pcNow = lastPc || Number(uc.reg_read_i32(ucMod.ARM64_REG_PC));
+  const pcNow = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC));
   irqElr = pcNow || elf.entry;
   irqInFlight = true;
   const vbar = Number(uc.reg_read_i32(ucMod.ARM64_REG_VBAR_EL1)) || 0x100000;
@@ -152,22 +147,23 @@ function irqDeliver() {
   delivered++;
 }
 function slice() {
-  const pc = irqResume || irqVector || lastPc || Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry;
+  const pc = irqResume || irqVector || Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry;
   if (irqResume) irqInFlight = false;
   irqResume = 0;
   irqVector = 0;
   syncDmaOut();
   syncIcOut();
+  uart0.syncOut(uc);
   uc.emu_start(pc, 0, 0, SLICE_INSNS);
   syncDmaIn();
   syncIcIn();
   syncIrqRet();
-  chars += pump();
+  uart0.syncIn(uc);
+  chars += drain();
   irqDeliver();
 }
 
 uc.hook_add(ucMod.HOOK_CODE, (u, a) => {
-  lastPc = Number(a);
 });
 for (let i = 0; i < 30000 && !dmaDone; i++) slice();
 
