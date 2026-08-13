@@ -51,6 +51,32 @@ bash build-programs.sh   # -> public/programs/{shell,sum,fib}.elf
   host clears it** (pulse protocol, exactly one char per slice)
 - `+0x80` — RX slot: host writes a byte, guest `getc` consumes it
 
+## SMP (4 cores)
+
+`smp` runs four AArch64 cores (four unicorn instances) on one guest
+ELF. Each core has its own private RAM at the same addresses — the
+"partitioned DDR" model — and its own stack top (set by a per-core
+`_start`). The only shared state is the **mailbox MMIO window at
+0x3F202000**, arbitrated by the host between slices, exactly like a bus
+master serializing device traffic:
+
+- `+0x00` START_ENTRY[3] — core 0 writes entry addresses for cores 1..3
+- `+0x10` GO — core 0 releases the secondaries
+- `+0x14` COUNTER — shared counter, device-serialized increment
+- `+0x18` LOCK — spinlock flag
+- `+0x1C` MSG[4] — per-core result mailbox
+- `+0x30` CURRENT — running core id (host-written, observability)
+- `+0x34` PARK_MASK — core i sets bit i when done
+- `+0x38` CPUID — host-written core id (device-provided identity)
+
+The host scheduler round-robins 512-instruction slices over the running
+cores until every core has parked (written its PARK_MASK bit) and the
+console is drained. The demo: core 0 launches cores 1..3 through
+START_ENTRY, each core computes its quarter of the sum 1..100, reports
+through the spinlocked UART, posts its result to MSG, increments the
+device counter, and parks; core 0 tallies the mailbox and prints the
+final counter.
+
 ## Programs
 
 | Program | What it does |
@@ -58,6 +84,7 @@ bash build-programs.sh   # -> public/programs/{shell,sum,fib}.elf
 | `shell` | prompt `> `, case-insensitive commands: `hi` → `HELLO`, `rpi` → `Raspberry Pi 3`, `help`, `ver` → `pi3-emu v1.0`, unknown/empty → `?`/prompt |
 | `sum`   | enter: prints `sum(1..10) = 55` (u64 division in guest) |
 | `fib`   | enter: prints fibonacci `0..12` (13 terms) |
+| `smp`   | auto-runs: 4 cores launch through the mailbox, sum quarters of 1..100, mailbox tally, joined counter (Reboot to re-run) |
 
 Backspace (`⌫`) sends 0x7F; the guest unwrites its line buffer and the
 host trims the display. The terminal auto-focuses on boot; an on-screen
@@ -76,6 +103,7 @@ npm run dev        # vite dev server -> http://localhost:5173
 ```sh
 npm run smoke                    # ELF program boot + all sessions, exact match
 node test/stats-probe.mjs        # PC/SP/MIPS after one slice of shell.elf
+node test/smp-probe.mjs          # 4-core SMP run: launch, mailbox, counter, park
 node test/branch-probe.mjs       # condition/branch encoding probes (15)
 node test/csel-probe.mjs         # csel probe (8)
 ```
@@ -89,11 +117,13 @@ npm run build    # build.sh (cargo board + guest programs) + vite build
 ## Layout
 
 ```
-programs/             Rust workspace: runtime lib + shell/sum/fib guests
+programs/             Rust workspace: runtime lib + shell/sum/fib/smp guests
   runtime/src/lib.rs  putc/puts/putu/getc + panic handler (UART I/O)
   linker.ld           entry at 0x100000, KEEP _start
   _start in each bin  naked asm: sets SP, then b rust_main (host reg
                       writes are no-ops in this unicorn build)
+  smp/                4-core demo: per-core _start entries (distinct SPs),
+                      mailbox protocol, spinlocks, park bits
 src/elf.js            ELF64 loader (PT_LOAD + bss zeroing)
 src/main.js           browser host loop (run-until-idle scheduler)
 board/src/lib.rs      board model (UART console FIFO only)
@@ -114,3 +144,6 @@ dist/                 production bundle
 - M5 — ELF loader: guest programs are cross-compiled Rust ELFs (shell,
   sum, fib) loaded into guest RAM, host runs until idle, program
   selector in the UI
+- M6 — SMP: four AArch64 cores (per-core unicorn instances, partitioned
+  RAM), host-arbitrated mailbox MMIO window, primary launches secondaries,
+  spinlocks + shared counter + per-core reports (smp program)

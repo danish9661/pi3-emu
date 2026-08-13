@@ -9,10 +9,33 @@ const RAM_SIZE = 0x400000;
 const SLICE_INSNS = 512;
 const MAX_SLICES = 5000;
 
+// SMP mailbox window (host-arbitrated device shared by all cores):
+//   +0x00 START_ENTRY[3]  core 0 writes entry addresses for cores 1..3
+//   +0x10 GO              core 0 releases the secondaries
+//   +0x14 COUNTER         shared counter (device-serialized increment)
+//   +0x18 LOCK            spinlock flag
+//   +0x1C MSG[4]          per-core result mailbox
+//   +0x30 CURRENT         running core id (host-written)
+//   +0x34 PARK_MASK       core i sets bit i when done
+//   +0x38 CPUID           host-written core id
+const SMP_BASE = 0x3F202000;
+const SMP_START = SMP_BASE + 0x00;
+const SMP_GO = SMP_BASE + 0x10;
+const SMP_COUNTER = SMP_BASE + 0x14;
+const SMP_LOCK = SMP_BASE + 0x18;
+const SMP_MSG = SMP_BASE + 0x1c;
+const SMP_CURRENT = SMP_BASE + 0x30;
+const SMP_PARK = SMP_BASE + 0x34;
+const SMP_CPUID = SMP_BASE + 0x38;
+const CORE_COUNT = 4;
+const MAX_ROUNDS = 2000;
+const SMP_MODE = 'smp';
+
 export const PROGRAMS = {
   shell: 'shell.elf',
   sum: 'sum.elf',
   fib: 'fib.elf',
+  smp: 'smp.elf',
 };
 
 const term = document.getElementById('term');
@@ -26,6 +49,10 @@ let ucMod = null;
 let uc = null;
 let board = null;
 let rxSlot = 0;
+let mode = 'single';
+let cores = null; // smp: one unicorn instance per core
+let entries = null; // smp: per-core resume/entry addresses
+let smpState = null; // smp: host-arbitrated mailbox state
 
 let stats = { steps: 0, insns: 0, emuMs: 0, chars: 0, wallStart: 0 };
 
@@ -90,6 +117,102 @@ function drain(board) {
   return out;
 }
 
+// ---- SMP: 4 cores, per-core private RAM at the same addresses (partitioned
+// DDR), one host-arbitrated MMIO mailbox window as the only shared state. ----
+
+function writeU32(uc, addr, v) {
+  uc.mem_write(addr, [v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff]);
+}
+
+function readU32(uc, addr) {
+  const b = uc.mem_read(addr, 4);
+  return b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24);
+}
+
+// Push the host's view of the mailbox into the core's device window before
+// it runs (the device the core sees IS the arbiter's commit state).
+function syncDeviceOut(c, coreId) {
+  writeU32(c, SMP_CPUID, coreId);
+  writeU32(c, SMP_CURRENT, coreId);
+  writeU32(c, SMP_GO, smpState.go);
+  writeU32(c, SMP_COUNTER, smpState.counter);
+  writeU32(c, SMP_LOCK, smpState.lock);
+  writeU32(c, SMP_PARK, smpState.park);
+  for (let i = 0; i < CORE_COUNT; i++) writeU32(c, SMP_MSG + i * 4, smpState.msg[i]);
+}
+
+// Pull whatever the core wrote back into host state (commit after each slice).
+function syncDeviceIn(c, coreId) {
+  if (coreId === 0) {
+    for (let i = 0; i < 3; i++) {
+      const v = readU32(c, SMP_START + (i + 1) * 4);
+      if (v !== 0 && smpState.start[i] === 0) smpState.start[i] = v;
+    }
+    const g = readU32(c, SMP_GO);
+    if (g !== 0) smpState.go = g;
+  }
+  const ctr = readU32(c, SMP_COUNTER);
+  if (ctr !== smpState.counter) smpState.counter = ctr;
+  const lk = readU32(c, SMP_LOCK);
+  if (lk !== smpState.lock) smpState.lock = lk;
+  if (smpState.msg[coreId] === 0) smpState.msg[coreId] = readU32(c, SMP_MSG + coreId * 4);
+  smpState.park |= readU32(c, SMP_PARK);
+}
+
+function smpBoot(elf) {
+  cores = [];
+  entries = [elf.entry, 0, 0, 0];
+  smpState = { go: 0, counter: 0, lock: 0, park: 0, msg: [0, 0, 0, 0], start: [0, 0, 0] };
+  for (let i = 0; i < CORE_COUNT; i++) {
+    const c = new ucMod.Unicorn(ucMod.ARCH_ARM64, ucMod.MODE_LITTLE_ENDIAN);
+    c.mem_map(RAM_BASE, RAM_SIZE, ucMod.PROT_ALL);
+    c.mem_map(Number(board.pi_uart_base()), UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+    c.mem_map(SMP_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+    c.devUart = { base: Number(board.pi_uart_base()) };
+    loadElf(c, elf);
+    cores.push(c);
+  }
+}
+
+// Round-robin scheduler over the 4 cores. Core 0 starts at e_entry and
+// launches cores 1..3 by writing their entry addresses to START_ENTRY. A
+// core is scheduled until it parks (sets its PARK_MASK bit) or all cores
+// have parked and the console is drained.
+function smpRun() {
+  let out = '';
+  const started = [true, false, false, false];
+  const allParked = (1 << CORE_COUNT) - 1;
+  for (let round = 0; round < MAX_ROUNDS; round++) {
+    for (let i = 0; i < CORE_COUNT; i++) {
+      if (!started[i]) {
+        const e = smpState.start[i - 1];
+        if (e === 0) continue;
+        started[i] = true;
+        entries[i] = e;
+      }
+      if (smpState.park & (1 << i)) continue;
+      const c = cores[i];
+      syncDeviceOut(c, i);
+      const pc = Number(c.reg_read_i32(ucMod.ARM64_REG_PC)) || entries[i];
+      const t0 = performance.now();
+      c.emu_start(pc, 0, 0, SLICE_INSNS);
+      stats.emuMs += performance.now() - t0;
+      stats.steps += 1;
+      stats.insns += SLICE_INSNS;
+      pumpUart(ucMod, c, board);
+      syncDeviceIn(c, i);
+    }
+    out += drain(board);
+    updateStats();
+    if (smpState.park === allParked) {
+      out += drain(board);
+      break;
+    }
+  }
+  if (smpState.park !== allParked) setStatus('warn: cores did not all park — check entry addresses');
+  return out;
+}
+
 function runSlice(count) {
   const pc = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry;
   const t0 = performance.now();
@@ -102,14 +225,24 @@ function runSlice(count) {
 }
 
 function updateStats() {
-  const pc = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry;
-  const sp = Number(uc.reg_read_i32(ucMod.ARM64_REG_SP));
   const wall = (performance.now() - stats.wallStart) / 1000;
   const mips = stats.emuMs > 0 ? (stats.insns / stats.emuMs / 1000).toFixed(2) : '—';
-  const pcs = (pc - 0x100000).toString(16).padStart(6, '0');
+  let row = '';
+  if (mode === SMP_MODE && cores) {
+    for (let i = 0; i < CORE_COUNT; i++) {
+      const c = cores[i];
+      const pc = (Number(c.reg_read_i32(ucMod.ARM64_REG_PC)) || entries[i] || 0) - 0x100000;
+      const sp = Number(c.reg_read_i32(ucMod.ARM64_REG_SP)) || 0;
+      row += `<span><span class="k">c${i}</span> pc 0x${pc.toString(16).padStart(6, '0')} sp 0x${sp.toString(16)}</span>`;
+    }
+  } else {
+    const pc = (Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry) - 0x100000;
+    const sp = Number(uc.reg_read_i32(ucMod.ARM64_REG_SP));
+    row = `<span><span class="k">pc</span> 0x100000+0x${pc.toString(16).padStart(6, '0')}</span>` +
+      `<span><span class="k">sp</span> 0x${sp.toString(16)}</span>`;
+  }
   statsEl.innerHTML =
-    `<span><span class="k">pc</span> 0x100000+0x${pcs}</span>` +
-    `<span><span class="k">sp</span> 0x${sp.toString(16)}</span>` +
+    row +
     `<span><span class="k">mips</span> ${mips}</span>` +
     `<span><span class="k">steps</span> ${stats.steps}</span>` +
     `<span><span class="k">insns</span> ${stats.insns}</span>` +
@@ -146,6 +279,7 @@ function guestKey(code) {
 
 function handleKey(e) {
   if (!uc || runBtn.disabled) return;
+  if (mode === SMP_MODE) return;
   if (e.key === 'Backspace') {
     e.preventDefault();
     if (term.textContent.length > 0) {
@@ -163,6 +297,7 @@ function handleKey(e) {
 // On-screen keyboard: feed the same guestKey path as physical keys.
 function tapKeys(btn) {
   if (!uc || runBtn.disabled) return;
+  if (mode === SMP_MODE) return;
   const action = btn.dataset.action;
   if (action === 'enter') {
     draw(guestKey(13));
@@ -191,17 +326,26 @@ async function run() {
     const resp = await fetch('./programs/' + name);
     if (!resp.ok) throw new Error('cannot fetch ./programs/' + name);
     const elf = parseElf(new Uint8Array(await resp.arrayBuffer()));
-    boot(ucMod, uc, board, elf);
 
-    draw(runUntilIdle()); // program boots, prints its banner, parks on getc
-
-    setStatus(`booted — running ${name} (AArch64 ELF at 0x100000) — type, or press Reboot`);
+    if (progSel.value === SMP_MODE) {
+      mode = SMP_MODE;
+      smpBoot(elf);
+      draw(smpRun()); // 4 cores round-robin until all park
+      setStatus(
+        `booted — running smp — 4 AArch64 cores, mailbox @ 0x3F202000 — press Reboot to re-run`
+      );
+    } else {
+      mode = 'single';
+      boot(ucMod, uc, board, elf);
+      draw(runUntilIdle()); // program boots, prints its banner, parks on getc
+      setStatus(`booted — running ${name} (AArch64 ELF at 0x100000) — type, or press Reboot`);
+    }
     runBtn.textContent = 'Reboot';
     runBtn.disabled = false;
     term.focus();
     hint.textContent = '';
   } catch (err) {
-    setStatus('ERROR: ' + err.message);
+    setStatus('ERROR: ' + (err && (err.stack || err.message || err) || err));
     console.error(err);
     runBtn.disabled = false;
   }
