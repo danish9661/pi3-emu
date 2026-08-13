@@ -212,6 +212,52 @@ irq: timer C1 + UART RX armed, IRQ enabled
 [irq #2 t+1s]
 ```
 
+## MMU (0x3F00D000, host-assisted virtual memory)
+
+This unicorn build cannot run a guest with the MMU on: writing
+SCTLR_EL1 with bit 0 (M) set raises a CPU exception and MAIR_EL1
+reads/writes are not implemented (both verified deterministically with
+page-aligned Uint8Array buffers — plain JS arrays are silently
+corrupted by `mem_write`). The `mmu` program demos host-assisted
+translation instead: the guest still does the real work — it builds a
+classic 4-level page table in RAM and enables the MMU by writing
+`rootPa | 1` to the MMU_CTL window — and the host walks those tables
+(src/mmu.js):
+
+```
+VA 0x00000000 - 0x3FFFFFFF  1G block  -> PA 0x00000000 (identity)
+VA 0x80000000 - 0x801FFFFF  2M block  -> PA 0x00300000 (alias)
+```
+
+At enable, the host maps every non-identity block at its VA with a
+shadow copy of the PA contents and installs a `HOOK_MEM_WRITE` mirror
+that keeps the shadow and the PA coherent in both directions; identity
+blocks need no shadow. Writes to unmapped VAs fault naturally
+(`UC_ERR_READ_UNMAPPED`), so the host simply ignores the `emu_start`
+error and resumes from the faulting PC — no retry logic needed.
+
+The guest polls the reflected MMU_CTL status until the host has
+enabled translation (an MMIO handshake like `getc`), then stores/
+loads data through the alias, copies a 5-word function to PA 0x200200
+and calls it at VA 0x80000200 (executing from the shadow copy), and
+verifies every result. Like the clock, the mmu guest has silent phases
+(building tables, waiting for enable) that would trip the run-until-
+idle heuristic, so it finishes by writing a magic 1 to MMU_DONE
+(0x3F00D004, host-only extension, same protocol as TMR_DONE) and
+`runUntilMmuDone()` stops when it sees it.
+
+```
+> mmu
+mmu: host-assisted MMU @ 0x3F00D000
+mmu: tables at 0x280000, enabling...
+mmu: enabled
+mmu: alias write -> PA read OK
+mmu: PA write -> alias read OK
+mmu: shadow-code call OK
+mmu: all checks passed
+mmu: parked
+```
+
 ## Programs
 
 | Program | What it does |
@@ -224,6 +270,7 @@ irq: timer C1 + UART RX armed, IRQ enabled
 | `gpio`  | auto-runs: LED knight-rider chase on pins 21..28, then polls BTN 29 (LED panel + button in the page) |
 | `fb`    | auto-runs: allocates a 160x120x32 framebuffer via mailbox, pattern + bouncing-ball animation (live canvas in the page) |
 | `irq`   | auto-runs: arms the legacy interrupt controller, timer C1 heartbeat every 1 s + a UART RX IRQ per key (type to see `[irq key: '...']`) |
+| `mmu`   | auto-runs: builds 4-level page tables in RAM, host walks them on MMU_CTL (0x3F00D000), alias VA 0x80000000→PA 0x200000, shadow-code call (Reboot to re-run) |
 
 Backspace (`⌫`) sends 0x7F; the guest unwrites its line buffer and the
 host trims the display. The terminal auto-focuses on boot; an on-screen
@@ -250,6 +297,7 @@ node test/fb-probe.mjs           # framebuffer: mailbox allocation, pattern pixe
 node test/irq-probe.mjs          # interrupts: timer C1 IRQ 29 + UART RX IRQ 31 delivered, both handlers run
 node test/branch-probe.mjs       # condition/branch encoding probes (15)
 node test/csel-probe.mjs         # csel probe (8)
+node test/mmu-probe.mjs          # MMU: host-assisted translation, alias + shadow-code checks
 ```
 
 ## Build
@@ -268,7 +316,10 @@ programs/             Rust workspace: runtime lib + shell/sum/fib/smp guests
                       writes are no-ops in this unicorn build)
   smp/                4-core demo: per-core _start entries (distinct SPs),
                       mailbox protocol, spinlocks, park bits
+  mmu/                virtual memory demo: builds 4-level page tables,
+                      enables via MMU_CTL, tests the alias + shadow code
 src/elf.js            ELF64 loader (PT_LOAD + bss zeroing)
+src/mmu.js            host-assisted MMU: table walk, shadow mapping, mirror
 src/main.js           browser host loop (run-until-idle scheduler)
 board/src/lib.rs      board model (UART console FIFO only)
 test/smoke.mjs        guest-driven end-to-end test (node)
@@ -316,3 +367,12 @@ dist/                 production bundle
   since there is no `eret`; timer C1 heartbeat (IRQ 29) + UART RX key
   IRQ (IRQ 31), one-IRQ-in-flight gating that never drops a vector on
   the return+pend same-slice edge; `irq` program + probe
+- M12 — MMU: unicorn cannot run a guest with SCTLR.M set (verified:
+  the sysreg write raises an exception and MAIR_EL1 is unimplemented),
+  so translation is host-assisted; the guest builds real 4-level page
+  tables and enables via MMU_CTL (0x3F00D000); the host walks the
+  tables, maps non-identity blocks with shadow copies + a two-way
+  write mirror (HOOK_MEM_WRITE), unmapped VAs fault naturally; the
+  guest handshakes on the reflected status and finishes with an
+  MMU_DONE write (0x3F00D004, like TMR_DONE); alias VA 0x80000000→
+  PA 0x200000 + shadow-code call; `mmu` program + probe

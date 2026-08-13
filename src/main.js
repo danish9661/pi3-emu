@@ -1,5 +1,6 @@
 import './styles.css';
 import { parseElf, loadElf } from './elf.js';
+import { mmuEnable, mmuMirrorWrite } from './mmu.js';
 
 const UART_WINDOW = 0x1000;
 const TX_SLOT_STRIDE = 4;
@@ -76,6 +77,19 @@ const CORE_COUNT = 4;
 const MAX_ROUNDS = 2000;
 const SMP_MODE = 'smp';
 
+// Host-assisted MMU (see mmu.js): this unicorn build cannot run a guest with
+// SCTLR.M set (msr sctlr_el1 traps, MAIR_EL1 unimplemented), so the host
+// provides translation. The guest writes rootPa | 1 to +0x00 to enable
+// (0 disables); the host walks the guest's page tables, maps non-identity
+// blocks at their VA with a shadow copy, and mirrors writes both ways.
+const MMU_CTL = 0x3F00D000;
+const MMU_DONE = MMU_CTL + 0x04; // host extension: guest writes 1 when finished
+const MMU_MAX_SLICES = 30000;
+let mmuState = null;
+let mmuHook = null;
+let mmuCtl = 0;
+let mmuDone = false;
+
 export const PROGRAMS = {
   shell: 'shell.elf',
   sum: 'sum.elf',
@@ -85,6 +99,7 @@ export const PROGRAMS = {
   gpio: 'gpio.elf',
   fb: 'fb.elf',
   irq: 'irq.elf',
+  mmu: 'mmu.elf',
 };
 
 const term = document.getElementById('term');
@@ -153,6 +168,7 @@ function boot(ucMod, uc, board, elf) {
   uc.mem_map(TMR_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(MBOX_WINDOW, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(GPIO_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  uc.mem_map(MMU_CTL, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.devUart = { base: uart };
   uc.entry = elf.entry;
   tmrWall0 = performance.now();
@@ -177,6 +193,12 @@ function boot(ucMod, uc, board, elf) {
   irqInFlight = false;
   irqVector = 0;
   irqResume = 0;
+  if (mmuHook) {
+    uc.hook_del(mmuHook);
+    mmuHook = null;
+  }
+  mmuState = null;
+  mmuCtl = 0;
 
   loadElf(uc, elf);
 }
@@ -574,6 +596,31 @@ function smpRun() {
   return out;
 }
 
+// MMU window: the host refreshes the status word before each slice (so the
+// guest can read it back) and pulls the guest's enable/disable write after.
+function syncMmuOut(uc) {
+  if (mmuState) writeU32(uc, MMU_CTL, (mmuState.enabled ? 1 : 0) | mmuState.root);
+}
+function syncMmuIn(uc) {
+  if (readU32(uc, MMU_DONE) !== 0) mmuDone = true;
+  const v = readU32(uc, MMU_CTL);
+  if (v === mmuCtl) return;
+  mmuCtl = v;
+  if (v & 1) {
+    mmuState = mmuEnable(uc, ucMod, v & ~1);
+    if (mmuHook) uc.hook_del(mmuHook);
+    mmuHook = uc.hook_add(ucMod.HOOK_MEM_WRITE, (u, access, addr, size, value) => {
+      mmuMirrorWrite(uc, mmuState, Number(addr), Number(size), value);
+    });
+  } else {
+    if (mmuHook) {
+      uc.hook_del(mmuHook);
+      mmuHook = null;
+    }
+    mmuState = null;
+  }
+}
+
 function runSlice(count) {
   const pc = irqResume || irqVector || Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry;
   if (irqResume) irqInFlight = false;
@@ -583,6 +630,7 @@ function runSlice(count) {
   syncMailboxOut(uc);
   syncGpioOut(uc);
   syncIcOut(uc);
+  syncMmuOut(uc);
   const t0 = performance.now();
   uc.emu_start(pc, 0, 0, count);
   stats.emuMs += performance.now() - t0;
@@ -593,6 +641,7 @@ function runSlice(count) {
   syncGpioIn(uc);
   syncIcIn(uc);
   syncIrqRet(uc);
+  syncMmuIn(uc);
   pumpUart(ucMod, uc, board);
   const out = drain(board);
   irqDeliver(uc);
@@ -642,6 +691,25 @@ function runUntilDone() {
     }
   }
   if (!clockDone) setStatus('warn: guest did not reach DONE');
+  return out;
+}
+
+// The mmu guest also has silent phases (building page tables, waiting for the
+// host to enable translation), which would trip the idle heuristic, so it uses
+// the same explicit-done protocol: slices until the guest writes MMU_DONE.
+function runUntilMmuDone() {
+  let out = '';
+  mmuDone = false;
+  for (let i = 0; i < MMU_MAX_SLICES; i++) {
+    const o = runSlice(SLICE_INSNS);
+    out += o;
+    updateStats();
+    if (mmuDone) {
+      out += drain(board);
+      break;
+    }
+  }
+  if (!mmuDone) setStatus('warn: mmu guest did not reach DONE');
   return out;
 }
 
@@ -858,6 +926,13 @@ async function run() {
       irqRun(); // async: rAF-paced slices, IRQs delivered at slice ends
       setStatus(
         `booted — running irq — BCM2835 interrupt controller @ 0x3F00B200 — timer + UART IRQs live`
+      );
+    } else if (progSel.value === 'mmu') {
+      mode = 'mmu';
+      boot(ucMod, uc, board, elf);
+      draw(runUntilMmuDone()); // guest builds page tables, host walks them on MMU_CTL
+      setStatus(
+        `booted — running mmu — host-assisted MMU @ 0x3F00D000 — press Reboot to re-run`
       );
     } else {
       mode = 'single';

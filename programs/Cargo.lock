@@ -38,6 +38,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mmu"
+version = "0.1.0"
+dependencies = [
+ "pi-runtime",
+]
+
+[[package]]
 name = "pi-runtime"
 version = "0.1.0"
 
