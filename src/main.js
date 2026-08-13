@@ -2,6 +2,7 @@ import './styles.css';
 import { parseElf, loadElf } from './elf.js';
 import { mmuEnable, mmuMirrorWrite } from './mmu.js';
 import { dmaRunChain } from './dma.js';
+import { createPwm } from './pwm.js';
 
 const UART_WINDOW = 0x1000;
 const TX_SLOT_STRIDE = 4;
@@ -110,6 +111,20 @@ let dmaLastCS = 0;
 let dmaDone = false;
 let dmaIntSeen = false;
 
+// Host-arbitrated BCM2835 PWM controller (see pwm.js): FIFO-mode model at
+// 0x3F20C000 with a DONE host extension at +0x54. The browser plays the
+// drained sample ring through WebAudio.
+const PWM_BASE = 0x3F20C000;
+const PWM_MAX_SLICES = 30000;
+let pwmSyncOut = null;
+let pwmSyncIn = null;
+let pwmState = null;
+let pwmAudioFed = 0;
+let audioCtx = null;
+let audioRing = null;
+let audioPos = 0;
+let audioLen = 0;
+
 export const PROGRAMS = {
   shell: 'shell.elf',
   sum: 'sum.elf',
@@ -121,6 +136,7 @@ export const PROGRAMS = {
   irq: 'irq.elf',
   mmu: 'mmu.elf',
   dma: 'dma.elf',
+  pwm: 'pwm.elf',
 };
 
 const term = document.getElementById('term');
@@ -192,6 +208,7 @@ function boot(ucMod, uc, board, elf) {
   uc.mem_map(MMU_CTL, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(DMA_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(0x3F00E000, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  uc.mem_map(PWM_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.devUart = { base: uart };
   uc.entry = elf.entry;
   tmrWall0 = performance.now();
@@ -228,6 +245,13 @@ function boot(ucMod, uc, board, elf) {
   dmaLastCS = 0;
   dmaDone = false;
   dmaIntSeen = false;
+  const pwm = createPwm(uc, ucMod, PWM_BASE);
+  pwmSyncOut = pwm.syncOut;
+  pwmSyncIn = pwm.syncIn;
+  pwmState = pwm.state;
+  pwmAudioFed = 0;
+  audioPos = 0;
+  audioLen = 0;
 
   loadElf(uc, elf);
 }
@@ -689,6 +713,36 @@ function syncDmaIn(uc) {
   }
 }
 
+// PWM audio playback: the host drains the guest's FIFO into a sample ring
+// (src/pwm.js); a ScriptProcessor pulls the ring to the speakers at the
+// context's rate. Created on the Run click (a user gesture), so the
+// AudioContext is allowed to play.
+function initAudio() {
+  if (audioCtx) return;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  audioCtx = new AC();
+  audioRing = new Float32Array(1 << 18);
+  const sp = audioCtx.createScriptProcessor(4096, 0, 1);
+  sp.onaudioprocess = (e) => {
+    const out = e.outputBuffer.getChannelData(0);
+    for (let i = 0; i < out.length; i++) {
+      out[i] = audioLen > 0 ? audioRing[(audioPos++) & (audioRing.length - 1)] * 0.3 : 0;
+      if (audioLen > 0) audioLen--;
+    }
+  };
+  sp.connect(audioCtx.destination);
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+function audioPush(sampleWord) {
+  if (!audioRing) return;
+  const s16 = ((sampleWord & 0xffff) << 16) >> 16; // low 16 bits = signed sample
+  if (audioLen < audioRing.length) {
+    audioRing[(audioPos + audioLen) & (audioRing.length - 1)] = s16 / 32768;
+    audioLen++;
+  }
+}
+
 function runSlice(count) {
   const pc = irqResume || irqVector || Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry;
   if (irqResume) irqInFlight = false;
@@ -700,6 +754,7 @@ function runSlice(count) {
   syncIcOut(uc);
   syncMmuOut(uc);
   syncDmaOut(uc);
+  if (pwmSyncOut) pwmSyncOut(uc);
   const t0 = performance.now();
   uc.emu_start(pc, 0, 0, count);
   stats.emuMs += performance.now() - t0;
@@ -712,6 +767,10 @@ function runSlice(count) {
   syncIrqRet(uc);
   syncMmuIn(uc);
   syncDmaIn(uc);
+  if (pwmSyncIn) {
+    pwmSyncIn(uc);
+    while (pwmAudioFed < pwmState.drained) audioPush(pwmState.ring[pwmAudioFed++]);
+  }
   pumpUart(ucMod, uc, board);
   const out = drain(board);
   irqDeliver(uc);
@@ -799,6 +858,21 @@ function runUntilDmaDone() {
     }
   }
   if (!dmaDone) setStatus('warn: dma guest did not reach DONE');
+  return out;
+}
+
+// The pwm guest generates the whole tune (paced by the FIFO handshake) in
+// one burst, so it uses the explicit-done protocol: slices until the guest
+// writes PWM_DONE; the drained samples keep playing from the audio ring.
+function runUntilPwmDone() {
+  let out = '';
+  for (let i = 0; i < PWM_MAX_SLICES && !pwmState.done; i++) {
+    const o = runSlice(SLICE_INSNS);
+    out += o;
+    updateStats();
+  }
+  if (!pwmState.done) setStatus('warn: pwm guest did not reach DONE');
+  else out += drain(board);
   return out;
 }
 
@@ -1029,6 +1103,14 @@ async function run() {
       draw(runUntilDmaDone()); // host performs the 3-CB chain between slices
       setStatus(
         `booted — running dma — BCM2835 DMA @ 0x3F007000 — 3-CB chain + completion IRQ — press Reboot to re-run`
+      );
+    } else if (progSel.value === 'pwm') {
+      mode = 'pwm';
+      boot(ucMod, uc, board, elf);
+      initAudio(); // the Run click is a user gesture: the melody can play
+      draw(runUntilPwmDone()); // FIFO-mode sample generation, paced by FULL1
+      setStatus(
+        `booted — running pwm — BCM2835 PWM @ 0x3F20C000 — ${pwmState.drained} samples in the audio ring — press Reboot to re-run`
       );
     } else {
       mode = 'single';

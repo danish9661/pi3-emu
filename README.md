@@ -301,6 +301,52 @@ dma: all checks passed
 dma: parked
 ```
 
+## PWM audio (0x3F20C000, host-arbitrated controller)
+
+The `pwm` program makes the emulator audible: the guest drives the
+BCM2835 PWM controller in FIFO mode and the browser plays the samples
+through WebAudio. The guest enables channel 1 (PWEN1) with USEF1 (FIFO
+mode) + MSEN1 (M/S enabled), clears the FIFO on the CLRF1 edge, then
+pushes square-wave samples for "Twinkle Twinkle Little Star" — one
+fixed-point phase accumulator per note, all integer math — paced by the
+FULL1/EMPT1 handshake the host refreshes in STA (the FIFO is a real
+device: it fills, the guest waits, the host drains it between slices).
+
+The controller's write-mask model (src/pwm.js): CTL level bits are
+latched from guest writes and reflected back (write-mask semantics,
+like the other windows), STA.FULL1/EMPT1 are derived from the FIFO
+depth, and FIFO/DAT1 writes are captured with a range-limited
+`HOOK_MEM_WRITE` — unicorn callbacks carry the written value, so two
+identical samples in a row can't be missed the way a window diff would.
+Each word's low 16 bits are a signed sample (the documented convention
+for this model); the host drains 64 samples per slice into a ring (the
+depth 256 absorbs one slice's burst, since the guest can only observe
+FULL1 at slice boundaries) and the browser's ScriptProcessor pulls the
+ring to the speakers at 44.1 kHz. The guest finishes with the usual
+explicit-done protocol (PWM_DONE at +0x54, like TMR_DONE/MMU_DONE).
+
+```
+> pwm
+pwm: BCM2835 PWM controller @ 0x3F20C000
+pwm: FIFO mode enabled (USEF1|MSEN1), FIFO cleared
+pwm: note 262 Hz
+pwm: note 262 Hz
+pwm: note 392 Hz
+pwm: note 392 Hz
+pwm: note 440 Hz
+pwm: note 440 Hz
+pwm: note 392 Hz
+pwm: note 349 Hz
+pwm: note 349 Hz
+pwm: note 330 Hz
+pwm: note 330 Hz
+pwm: note 294 Hz
+pwm: note 294 Hz
+pwm: note 262 Hz
+pwm: all notes played (84672 samples)
+pwm: parked
+```
+
 ## Programs
 
 | Program | What it does |
@@ -315,6 +361,7 @@ dma: parked
 | `irq`   | auto-runs: arms the legacy interrupt controller, timer C1 heartbeat every 1 s + a UART RX IRQ per key (type to see `[irq key: '...']`) |
 | `mmu`   | auto-runs: builds 4-level page tables in RAM, host walks them on MMU_CTL (0x3F00D000), alias VA 0x80000000→PA 0x200000, shadow-code call (Reboot to re-run) |
 | `dma`   | auto-runs: 3-CB DMA chain (copy/relay/fill) performed by the host between slices, CS.END + CS.INT latched, completion IRQ 16 handled, destinations verified (Reboot to re-run) |
+| `pwm`   | auto-runs: FIFO-mode PWM — the guest generates a square-wave "Twinkle" melody paced by the FULL1/EMPT1 handshake; the host drains the FIFO and plays it through WebAudio (Reboot to re-run) |
 
 Backspace (`⌫`) sends 0x7F; the guest unwrites its line buffer and the
 host trims the display. The terminal auto-focuses on boot; an on-screen
@@ -343,6 +390,7 @@ node test/branch-probe.mjs       # condition/branch encoding probes (15)
 node test/csel-probe.mjs         # csel probe (8)
 node test/mmu-probe.mjs          # MMU: host-assisted translation, alias + shadow-code checks
 node test/dma-probe.mjs          # DMA: host-performed 3-CB chain, END/INT latch, IRQ 16 delivered, dst verified
+node test/pwm-probe.mjs          # PWM: FIFO-mode config, FULL1/EMPT1 handshake, exact 84672-sample stream
 ```
 
 ## Build
@@ -364,9 +412,11 @@ programs/             Rust workspace: runtime lib + shell/sum/fib/smp guests
   mmu/                virtual memory demo: builds 4-level page tables,
                       enables via MMU_CTL, tests the alias + shadow code
   dma/                DMA demo: 3-CB chain, ACTIVE start, IRQ 16 handler
+  pwm/                PWM audio demo: FIFO-mode square-wave melody
 src/elf.js            ELF64 loader (PT_LOAD + bss zeroing)
 src/mmu.js            host-assisted MMU: table walk, shadow mapping, mirror
 src/dma.js            host-arbitrated DMA: CB chain walk + transfer engine
+src/pwm.js            host-arbitrated PWM: FIFO model, drain ring, write hook
 src/main.js           browser host loop (run-until-idle scheduler)
 board/src/lib.rs      board model (UART console FIFO only)
 test/smoke.mjs        guest-driven end-to-end test (node)
@@ -434,3 +484,16 @@ dist/                 production bundle
   and the host masks the DMA0 pending bit once INT is cleared (no
   stale-window re-delivery); DMA_DONE (0x3F00E054) protocol; `dma`
   program + probe
+- M14 — PWM audio: BCM2835 PWM window (0x3F20C000), FIFO-mode model —
+  CTL level bits latched with write-mask semantics, STA.FULL1/EMPT1
+  derived from the FIFO depth, CLRF1 edge clears, FIFO/DAT1 pushes
+  captured by a range-limited HOOK_MEM_WRITE (a window diff could not
+  tell two identical samples apart); the pwm guest generates a
+  square-wave "Twinkle Twinkle Little Star" with fixed-point phase
+  accumulators (integer-only), paced by the FULL1/EMPT1 handshake (the
+  FIFO really fills and the guest waits — depth 256 absorbs one slice's
+  burst because FULL1 is only observable at slice boundaries); the host
+  drains 64 samples/slice into a ring (low 16 bits = signed sample) and
+  the browser plays it through WebAudio (ScriptProcessor pull at
+  44.1 kHz, created on the Run click gesture); PWM_DONE (0x3F20C054)
+  protocol; `pwm` program + probe + E2E
