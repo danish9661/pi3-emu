@@ -46,6 +46,25 @@ pub fn putu(mut n: u64) {
     }
 }
 
+/// Print an unsigned integer in lowercase hex (no leading 0x).
+pub fn putx(mut n: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 16];
+    let mut i = buf.len();
+    if n == 0 {
+        putc(b'0');
+        return;
+    }
+    while n > 0 {
+        i -= 1;
+        buf[i] = HEX[(n & 0xf) as usize];
+        n >>= 4;
+    }
+    for &b in &buf[i..] {
+        putc(b);
+    }
+}
+
 /// Block until a key is available, then return it (consuming the slot).
 pub fn getc() -> u8 {
     unsafe {

@@ -94,11 +94,43 @@ The `clock` program sleeps a real wall-clock second by spinning on CLO,
 arms C1 for +0.5 s and polls the M1 match bit, then clears it. The shell
 has a `time` command printing the live counter.
 
+## VideoCore mailbox (0x3F00B880)
+
+A property-tags request/response mailbox, as used by Linux to ask the
+firmware (VideoCore) for board identity:
+
+- `+0x14` MAIL1_WRITE — guest writes `buffer_addr | 8` (channel 8 =
+  property tags); the host latches it at the next slice boundary
+- `+0x18` MAIL1_STATUS / `+0x04` STATUS — full bit `0x80000000`:
+  set when a request is pending, cleared once the host has answered
+- `+0x00` MAIL0_READ — returns the request address (response address)
+
+The guest builds a tag list in RAM (`size`, `code`, then
+`id|size|code|value` triplets, `0` terminator) and spins on STATUS until
+the host arbitrates. The host answers known tags — firmware revision,
+board revision, board serial, ARM memory layout, MAC, power state, ARM
+clock rate — writing success codes and little-endian values back into
+the guest's buffer (multi-byte values are serialized byte-by-byte, so
+`0x400000` survives as four bytes, not a clamped `0`). The shell's
+`mbox` command queries the board:
+
+```
+> mbox
+board rev:  a02082
+serial:     deadbeef00000000
+arm memory: 0x0 + 0x400000
+arm clock:  700000000 Hz
+```
+
+The request buffer lives in its own linker section (`.mbox` at
+0x300000) — the guest `.bss` had grown into the TCG env-hazard zone and
+the mailbox round-trip was corrupted intermittently.
+
 ## Programs
 
 | Program | What it does |
 |---------|--------------|
-| `shell` | prompt `> `, case-insensitive commands: `hi` → `HELLO`, `rpi` → `Raspberry Pi 3`, `help`, `ver` → `pi3-emu v1.0`, unknown/empty → `?`/prompt |
+| `shell` | prompt `> `, case-insensitive commands: `hi` → `HELLO`, `rpi` → `Raspberry Pi 3`, `help`, `ver` → `pi3-emu v1.0`, `time` → live timer, `mbox` → VideoCore property query, unknown/empty → `?`/prompt |
 | `sum`   | enter: prints `sum(1..10) = 55` (u64 division in guest) |
 | `fib`   | enter: prints fibonacci `0..12` (13 terms) |
 | `smp`   | auto-runs: 4 cores launch through the mailbox, sum quarters of 1..100, mailbox tally, joined counter (Reboot to re-run) |
@@ -123,6 +155,7 @@ npm run smoke                    # ELF program boot + all sessions, exact match
 node test/stats-probe.mjs        # PC/SP/MIPS after one slice of shell.elf
 node test/smp-probe.mjs          # 4-core SMP run: launch, mailbox, counter, park
 node test/clock-probe.mjs        # system timer: 1 s sleep, compare/match, clear
+node test/mbox-probe.mjs         # VideoCore mailbox: full property query response
 node test/branch-probe.mjs       # condition/branch encoding probes (15)
 node test/csel-probe.mjs         # csel probe (8)
 ```
@@ -169,3 +202,7 @@ dist/                 production bundle
 - M7 — system timer: real BCM2837 timer window, host-refreshed wall-clock
   counter, compare/match bits, real 1 s guest sleep (clock program),
   `time` command in the shell
+- M8 — VideoCore mailbox: property-tags request/response (channel 8),
+  host answers board identity/clock queries, multi-byte values serialized
+  properly (byte truncation fixed), `.mbox` linker section moves the
+  buffer out of the TCG env-hazard zone, `mbox` command + probe

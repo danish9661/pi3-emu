@@ -33,6 +33,23 @@ const TMR_DONE = TMR_BASE + 0x20;
 const CLOCK_MODE = 'clock';
 const CLOCK_MAX_SLICES = 60000;
 
+// BCM2837 mailbox (VideoCore interface, real layout). The guest writes a
+// tag-buffer address to MAIL1_WRITE (channel 8); the host, playing the
+// VideoCore, parses the request at the slice boundary, answers the known
+// tags into guest RAM, then posts the address back to MAIL0_READ and
+// clears the empty bit in MAIL0_STATUS.
+//  +0x00 MAIL0_READ      host: reply address | channel
+//  +0x04 MAIL0_STATUS    host: bit31 = empty
+//  +0x14 MAIL1_WRITE     guest: request address | channel
+//  +0x18 MAIL1_STATUS    host: bit31 = full (never set; writes always taken)
+const MBOX_BASE = 0x3F00B880;
+const MBOX_WINDOW = 0x3F00B000; // unicorn mem_map needs a 4K-aligned base
+const MBOX_READ = MBOX_BASE + 0x00;
+const MBOX_STATUS = MBOX_BASE + 0x04;
+const MBOX_MAIL1_WRITE = MBOX_BASE + 0x14;
+const MBOX_MAIL1_STATUS = MBOX_BASE + 0x18;
+const MBOX_CHANNEL = 8;
+
 const SMP_BASE = 0x3F202000;
 const SMP_START = SMP_BASE + 0x00;
 const SMP_GO = SMP_BASE + 0x10;
@@ -75,6 +92,9 @@ let tmrCrossed = [false, false, false, false]; // compare fired (edge-triggered)
 let tmrCompares = [0, 0, 0, 0];
 let tmrLastCS = 0; // last CS value the host wrote (detect guest writes)
 let clockDone = false;
+let mbxLastWrite = 0; // last MAIL1_WRITE value the host mirrored
+let mbxPending = false; // a reply is ready in MAIL0_READ
+let mbxAddr = 0; // reply address | channel
 
 let stats = { steps: 0, insns: 0, emuMs: 0, chars: 0, wallStart: 0 };
 
@@ -106,6 +126,7 @@ function boot(ucMod, uc, board, elf) {
   uc.mem_map(RAM_BASE, RAM_SIZE, ucMod.PROT_ALL);
   uc.mem_map(uart, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(TMR_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  uc.mem_map(MBOX_WINDOW, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.devUart = { base: uart };
   uc.entry = elf.entry;
   tmrWall0 = performance.now();
@@ -113,8 +134,77 @@ function boot(ucMod, uc, board, elf) {
   tmrCrossed = [false, false, false, false];
   tmrCompares = [0, 0, 0, 0];
   tmrLastCS = 0;
+  mbxLastWrite = 0;
+  mbxPending = false;
+  mbxAddr = 0;
 
   loadElf(uc, elf);
+}
+
+// The "VideoCore": answers a property-tags request buffer the guest wrote
+// the address of via MAIL1_WRITE. Known tags get success (0x80000000) with
+// board-identity values; unknown tags get an error code. Values are
+// serialized as tsize little-endian bytes (host memory is byte-addressed).
+function leBytes(n, len) {
+  const b = [];
+  for (let i = 0; i < len; i++) b.push(Number((BigInt(n) >> BigInt(i * 8)) & 0xffn));
+  return b;
+}
+const MBOX_TAGS = {
+  0x00010001: (v, ts) => leBytes(16968947, ts), // GET_FIRMWARE_REVISION
+  0x00010002: (v, ts) => leBytes(0xa02082, ts), // GET_BOARD_REVISION (Pi 3 Model B)
+  0x00010003: (v, ts) => leBytes(0xdeadbeef00000000n, ts), // GET_BOARD_SERIAL
+  0x00010005: (v, ts) => leBytes(0, 4).concat(leBytes(0x400000, 4)), // GET_ARM_MEMORY base,size
+  0x00010009: (v, ts) => [0xb8, 0x27, 0xeb, 0xde, 0xad, 0xbe], // GET_MAC_ADDRESS
+  0x00030001: (v, ts) => leBytes(v, 4).concat(leBytes(1, 4)), // GET_POWER_STATE device,on
+  0x00030002: (v, ts) => leBytes(700000000, ts), // GET_CLOCK_RATE (ARM)
+};
+
+function mboxProcess(uc) {
+  if (mbxPending) return;
+  const addr = mbxAddr & ~0xf;
+  const size = Math.min(readU32(uc, addr) & 0xffff, 1024);
+  if (size < 8) return;
+  let off = 8;
+  while (off + 8 <= size) {
+    const id = readU32(uc, addr + off);
+    if (id === 0) break; // end-of-tags marker
+    const tsize = readU32(uc, addr + off + 4);
+    const tag = MBOX_TAGS[id];
+    if (tag) {
+      const out = tag(readU32(uc, addr + off + 12), tsize);
+      writeU32(uc, addr + off + 8, 0x80000000);
+      for (let i = 0; i < tsize; i++) {
+        uc.mem_write(addr + off + 12 + i, [out[i] ?? 0]);
+      }
+    } else {
+      writeU32(uc, addr + off + 8, 0x80000001); // unknown tag -> error
+    }
+    off += 12 + tsize + ((4 - (tsize % 4)) % 4);
+  }
+  writeU32(uc, addr + 4, 0x80000000); // whole request succeeded
+  mbxPending = true;
+}
+
+// Mirror device state into the guest before a slice; pull guest requests out.
+function syncMailboxOut(uc) {
+  writeU32(uc, MBOX_MAIL1_STATUS, 0);
+  if (mbxPending) {
+    writeU32(uc, MBOX_STATUS, 0); // not empty: reply ready
+    writeU32(uc, MBOX_READ, mbxAddr);
+  } else {
+    writeU32(uc, MBOX_STATUS, 0x80000000); // empty
+    writeU32(uc, MBOX_READ, 0);
+  }
+}
+
+function syncMailboxIn(uc) {
+  const w = readU32(uc, MBOX_MAIL1_WRITE);
+  if (w !== mbxLastWrite) {
+    mbxLastWrite = w;
+    mbxAddr = w;
+    if ((w & 0xf) === MBOX_CHANNEL) mboxProcess(uc);
+  }
 }
 
 // Refresh the timer device from the wall clock before a slice runs: CLO/CHI
@@ -275,12 +365,14 @@ function smpRun() {
 function runSlice(count) {
   const pc = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry;
   syncTimerOut(uc);
+  syncMailboxOut(uc);
   const t0 = performance.now();
   uc.emu_start(pc, 0, 0, count);
   stats.emuMs += performance.now() - t0;
   stats.steps += 1;
   stats.insns += count;
   syncTimerIn(uc);
+  syncMailboxIn(uc);
   pumpUart(ucMod, uc, board);
   return drain(board);
 }
