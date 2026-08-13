@@ -77,6 +77,23 @@ through the spinlocked UART, posts its result to MSG, increments the
 device counter, and parks; core 0 tallies the mailbox and prints the
 final counter.
 
+## System timer (0x3F003000, real BCM2837 layout)
+
+A free-running 40-bit counter ticking in microseconds of host wall clock
+(the epoch resets when a program boots, so CLO starts near 0):
+
+- `+0x00` CS — match flags M0..M3 (host sets each bit once when the
+  counter first crosses the compare; guest clears by rewriting the mask —
+  host-arbitrated memory can only observe byte changes, so CS is
+  write-mask here rather than the real chip's W1C)
+- `+0x04` CLO / `+0x08` CHI — counter low/high (host-refreshed each slice)
+- `+0x0C..0x18` C0..C3 — compare registers (guest)
+- `+0x20` DONE — host extension: the clock guest parks by writing 1
+
+The `clock` program sleeps a real wall-clock second by spinning on CLO,
+arms C1 for +0.5 s and polls the M1 match bit, then clears it. The shell
+has a `time` command printing the live counter.
+
 ## Programs
 
 | Program | What it does |
@@ -85,6 +102,7 @@ final counter.
 | `sum`   | enter: prints `sum(1..10) = 55` (u64 division in guest) |
 | `fib`   | enter: prints fibonacci `0..12` (13 terms) |
 | `smp`   | auto-runs: 4 cores launch through the mailbox, sum quarters of 1..100, mailbox tally, joined counter (Reboot to re-run) |
+| `clock` | auto-runs: real 1 s timer sleep, C1 compare + M1 match, W1C-style clear (Reboot to re-run) |
 
 Backspace (`⌫`) sends 0x7F; the guest unwrites its line buffer and the
 host trims the display. The terminal auto-focuses on boot; an on-screen
@@ -104,6 +122,7 @@ npm run dev        # vite dev server -> http://localhost:5173
 npm run smoke                    # ELF program boot + all sessions, exact match
 node test/stats-probe.mjs        # PC/SP/MIPS after one slice of shell.elf
 node test/smp-probe.mjs          # 4-core SMP run: launch, mailbox, counter, park
+node test/clock-probe.mjs        # system timer: 1 s sleep, compare/match, clear
 node test/branch-probe.mjs       # condition/branch encoding probes (15)
 node test/csel-probe.mjs         # csel probe (8)
 ```
@@ -147,3 +166,6 @@ dist/                 production bundle
 - M6 — SMP: four AArch64 cores (per-core unicorn instances, partitioned
   RAM), host-arbitrated mailbox MMIO window, primary launches secondaries,
   spinlocks + shared counter + per-core reports (smp program)
+- M7 — system timer: real BCM2837 timer window, host-refreshed wall-clock
+  counter, compare/match bits, real 1 s guest sleep (clock program),
+  `time` command in the shell

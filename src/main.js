@@ -18,6 +18,21 @@ const MAX_SLICES = 5000;
 //   +0x30 CURRENT         running core id (host-written)
 //   +0x34 PARK_MASK       core i sets bit i when done
 //   +0x38 CPUID           host-written core id
+// BCM2837 system timer: host refreshes CLO/CHI from wall clock before each
+// slice (epoch = program boot, so the counter starts near 0 and ticks in us).
+//  +0x00 CS   match flags M0..M3 (host sets as CLO passes each compare)
+//  +0x04 CLO  counter low  (host)
+//  +0x08 CHI  counter high (host)
+//  +0x0C..0x18 C0..C3 compare registers (guest)
+//  +0x20 DONE host extension: clock guest parks by writing 1
+const TMR_BASE = 0x3F003000;
+const TMR_CS = TMR_BASE + 0x00;
+const TMR_CLO = TMR_BASE + 0x04;
+const TMR_CMP = TMR_BASE + 0x0c;
+const TMR_DONE = TMR_BASE + 0x20;
+const CLOCK_MODE = 'clock';
+const CLOCK_MAX_SLICES = 60000;
+
 const SMP_BASE = 0x3F202000;
 const SMP_START = SMP_BASE + 0x00;
 const SMP_GO = SMP_BASE + 0x10;
@@ -36,6 +51,7 @@ export const PROGRAMS = {
   sum: 'sum.elf',
   fib: 'fib.elf',
   smp: 'smp.elf',
+  clock: 'clock.elf',
 };
 
 const term = document.getElementById('term');
@@ -53,6 +69,12 @@ let mode = 'single';
 let cores = null; // smp: one unicorn instance per core
 let entries = null; // smp: per-core resume/entry addresses
 let smpState = null; // smp: host-arbitrated mailbox state
+let tmrWall0 = 0; // timer epoch: performance.now() at program boot
+let tmrPending = 0; // CS match bits not yet cleared by the guest
+let tmrCrossed = [false, false, false, false]; // compare fired (edge-triggered)
+let tmrCompares = [0, 0, 0, 0];
+let tmrLastCS = 0; // last CS value the host wrote (detect guest writes)
+let clockDone = false;
 
 let stats = { steps: 0, insns: 0, emuMs: 0, chars: 0, wallStart: 0 };
 
@@ -83,10 +105,47 @@ function boot(ucMod, uc, board, elf) {
 
   uc.mem_map(RAM_BASE, RAM_SIZE, ucMod.PROT_ALL);
   uc.mem_map(uart, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  uc.mem_map(TMR_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.devUart = { base: uart };
   uc.entry = elf.entry;
+  tmrWall0 = performance.now();
+  tmrPending = 0;
+  tmrCrossed = [false, false, false, false];
+  tmrCompares = [0, 0, 0, 0];
+  tmrLastCS = 0;
 
   loadElf(uc, elf);
+}
+
+// Refresh the timer device from the wall clock before a slice runs: CLO/CHI
+// tick in microseconds since program boot, and each compare register sets
+// its CS match bit once when the counter first crosses it (edge-triggered).
+// The guest clears a bit by rewriting the status mask (host-arbitrated
+// memory can only observe byte changes, so CS here is write-mask, not the
+// real BCM2837's W1C); a monotonic counter never re-fires a cleared compare.
+function syncTimerOut(uc) {
+  const us = ((performance.now() - tmrWall0) * 1000) & 0xffffffff;
+  writeU32(uc, TMR_CLO, us);
+  writeU32(uc, TMR_CLO + 4, 0);
+  for (let i = 0; i < 4; i++) {
+    const c = tmrCompares[i];
+    if (!tmrCrossed[i] && c !== 0 && ((us - c) & 0x80000000) === 0) {
+      tmrCrossed[i] = true;
+      tmrPending |= 1 << i;
+    }
+  }
+  writeU32(uc, TMR_CS, tmrPending);
+  tmrLastCS = tmrPending;
+}
+
+function syncTimerIn(uc) {
+  for (let i = 0; i < 4; i++) tmrCompares[i] = readU32(uc, TMR_CMP + i * 4);
+  const cs = readU32(uc, TMR_CS);
+  if (cs !== tmrLastCS) tmrPending &= cs & 0xf; // guest rewrote the status mask
+  if (mode === CLOCK_MODE) {
+    const d = readU32(uc, TMR_DONE);
+    if (d !== 0) clockDone = true;
+  }
 }
 
 function pumpUart(ucMod, uc, board) {
@@ -215,11 +274,13 @@ function smpRun() {
 
 function runSlice(count) {
   const pc = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry;
+  syncTimerOut(uc);
   const t0 = performance.now();
   uc.emu_start(pc, 0, 0, count);
   stats.emuMs += performance.now() - t0;
   stats.steps += 1;
   stats.insns += count;
+  syncTimerIn(uc);
   pumpUart(ucMod, uc, board);
   return drain(board);
 }
@@ -249,6 +310,25 @@ function updateStats() {
     `<span><span class="k">emu</span> ${stats.emuMs.toFixed(2)}ms</span>` +
     `<span><span class="k">wall</span> ${wall.toFixed(2)}s</span>` +
     `<span><span class="k">chars</span> ${stats.chars}</span>`;
+}
+
+// The clock guest sleeps for a real wall-clock second, which the idle
+// heuristic can't tell apart from an infinite spin, so it uses the same
+// explicit-done protocol as smp: slices until the guest writes TMR_DONE.
+function clockRun() {
+  let out = '';
+  clockDone = false;
+  for (let i = 0; i < CLOCK_MAX_SLICES; i++) {
+    const o = runSlice(SLICE_INSNS);
+    out += o;
+    updateStats();
+    if (clockDone) {
+      out += drain(board);
+      break;
+    }
+  }
+  if (!clockDone) setStatus('warn: clock guest did not reach DONE');
+  return out;
 }
 
 // The guest drives itself: it prints to the UART TX slots (one char per
@@ -333,6 +413,13 @@ async function run() {
       draw(smpRun()); // 4 cores round-robin until all park
       setStatus(
         `booted — running smp — 4 AArch64 cores, mailbox @ 0x3F202000 — press Reboot to re-run`
+      );
+    } else if (progSel.value === CLOCK_MODE) {
+      mode = CLOCK_MODE;
+      boot(ucMod, uc, board, elf);
+      draw(clockRun()); // runs until the guest writes TMR_DONE
+      setStatus(
+        `booted — running clock — BCM system timer @ 0x3F003000 — press Reboot to re-run`
       );
     } else {
       mode = 'single';

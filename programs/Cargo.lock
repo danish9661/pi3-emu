@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "clock"
+version = "0.1.0"
+dependencies = [
+ "pi-runtime",
+]
+
+[[package]]
 name = "fib"
 version = "0.1.0"
 dependencies = [
