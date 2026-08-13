@@ -1,16 +1,24 @@
 import './styles.css';
+import { parseElf, loadElf } from './elf.js';
 
 const UART_WINDOW = 0x1000;
 const TX_SLOT_STRIDE = 4;
 const TX_SLOTS = 32;
 const RAM_BASE = 0x0;
 const RAM_SIZE = 0x400000;
-const KERNEL_ADDR = 0x80000;
-const KERNEL_SLICES = 512;
+const SLICE_INSNS = 512;
+const MAX_SLICES = 5000;
+
+export const PROGRAMS = {
+  shell: 'shell.elf',
+  sum: 'sum.elf',
+  fib: 'fib.elf',
+};
 
 const term = document.getElementById('term');
 const status = document.getElementById('status');
 const runBtn = document.getElementById('run');
+const progSel = document.getElementById('prog');
 const statsEl = document.getElementById('stats');
 const hint = document.getElementById('hint');
 
@@ -36,32 +44,24 @@ async function loadBoard() {
   return instance.exports;
 }
 
-// M4: the guest kernel owns everything after boot — RX polling, key echo,
-// line buffer, command dispatch, responses, prompt.  The host only delivers
-// keystrokes to the RX slot, runs a bounded slice of the kernel, and drains
-// TX slots to the console FIFO.  Device window (0x3F201000, 4 KiB):
-//   +0x00..  TX slots, one char per word (16 slots, host drains)
-//   +0x40    RX slot  (host writes a byte, guest consumes)
-function boot(ucMod, uc, board) {
+// The programs are static bare-metal AArch64 ELFs; the host maps RAM + the
+// UART window and loads the ELF segments at their vaddrs. The CPU starts at
+// e_entry (passed to emu_start — reg_write is a no-op in this unicorn build)
+// and the guest's own _start sets SP, so the host never touches registers.
+// After that the guest runs freely: each slice is SLICE_INSNS of real
+// AArch64 instructions, resuming from the current PC.
+function boot(ucMod, uc, board, elf) {
   const uart = Number(board.pi_uart_base());
   rxSlot = uart + Number(board.pi_rx_offset());
 
   uc.mem_map(RAM_BASE, RAM_SIZE, ucMod.PROT_ALL);
   uc.mem_map(uart, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.devUart = { base: uart };
+  uc.entry = elf.entry;
 
-  const loadKernel = (addr, ptr, len) => {
-    const bytes = new Uint8Array(board.memory.buffer, Number(ptr), Number(len));
-    for (let i = 0; i < bytes.length; i++) uc.mem_write(addr + i, [bytes[i]]);
-  };
-  loadKernel(KERNEL_ADDR, board.pi_kernel(), board.pi_kernel_len());
-
-  uc.reg_write_i32(ucMod.ARM64_REG_PC, KERNEL_ADDR);
-  uc.reg_write_i32(ucMod.ARM64_REG_SP, RAM_BASE + RAM_SIZE - 16);
+  loadElf(uc, elf);
 }
 
-// Pull TX characters out of the device window into the board console FIFO,
-// blank the consumed slots. Returns how many characters were found.
 function pumpUart(ucMod, uc, board) {
   const { base } = uc.devUart;
   const window = uc.mem_read(base, TX_SLOTS * TX_SLOT_STRIDE);
@@ -90,9 +90,10 @@ function drain(board) {
   return out;
 }
 
-function runSlice(addr, count) {
+function runSlice(count) {
+  const pc = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry;
   const t0 = performance.now();
-  uc.emu_start(addr, 0, 0, count);
+  uc.emu_start(pc, 0, 0, count);
   stats.emuMs += performance.now() - t0;
   stats.steps += 1;
   stats.insns += count;
@@ -101,13 +102,13 @@ function runSlice(addr, count) {
 }
 
 function updateStats() {
-  const pc = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC));
+  const pc = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry;
   const sp = Number(uc.reg_read_i32(ucMod.ARM64_REG_SP));
   const wall = (performance.now() - stats.wallStart) / 1000;
   const mips = stats.emuMs > 0 ? (stats.insns / stats.emuMs / 1000).toFixed(2) : '—';
-  const pcs = (pc - KERNEL_ADDR).toString(16).padStart(6, '0');
+  const pcs = (pc - 0x100000).toString(16).padStart(6, '0');
   statsEl.innerHTML =
-    `<span><span class="k">pc</span> 0x80000+0x${pcs}</span>` +
+    `<span><span class="k">pc</span> 0x100000+0x${pcs}</span>` +
     `<span><span class="k">sp</span> 0x${sp.toString(16)}</span>` +
     `<span><span class="k">mips</span> ${mips}</span>` +
     `<span><span class="k">steps</span> ${stats.steps}</span>` +
@@ -117,19 +118,30 @@ function updateStats() {
     `<span><span class="k">chars</span> ${stats.chars}</span>`;
 }
 
-// The guest kernel is a live process: it parks in its RX poll loop between
-// host slices, so every keystroke slice resumes from the current PC.
-function guestSlice() {
-  const pc = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC));
-  const out = runSlice(pc, KERNEL_SLICES);
-  updateStats();
+// The guest drives itself: it prints to the UART TX slots (one char per
+// slice) and parks in getc until a key arrives. Run slices until the guest
+// has gone quiet for two consecutive slices — i.e. it is back waiting for
+// input (or finished all its work).
+function runUntilIdle() {
+  let out = '';
+  let quiet = 0;
+  for (let i = 0; i < MAX_SLICES; i++) {
+    const o = runSlice(SLICE_INSNS);
+    out += o;
+    updateStats();
+    if (o === '') {
+      quiet++;
+      if (quiet >= 2) break;
+    } else {
+      quiet = 0;
+    }
+  }
   return out;
 }
 
-// Deliver one keystroke to the guest kernel, let it do all the work.
 function guestKey(code) {
   uc.mem_write(rxSlot, [code]);
-  return guestSlice();
+  return runUntilIdle();
 }
 
 function handleKey(e) {
@@ -139,7 +151,7 @@ function handleKey(e) {
     if (term.textContent.length > 0) {
       term.textContent = term.textContent.slice(0, -1);
     }
-    draw(guestKey(0x7f)); // guest unwrites its line buffer
+    draw(guestKey(0x7f)); // guest unwrites its own line buffer
     return;
   }
   const c = e.key.length === 1 ? e.key.charCodeAt(0) : e.key === 'Enter' ? 13 : 0;
@@ -174,11 +186,16 @@ async function run() {
     ucMod = await MUnicorn();
     board = await loadBoard();
     uc = new ucMod.Unicorn(ucMod.ARCH_ARM64, ucMod.MODE_LITTLE_ENDIAN);
-    boot(ucMod, uc, board);
 
-    draw(guestSlice()); // boot greeting + prompt
+    const name = PROGRAMS[progSel.value];
+    const resp = await fetch('./programs/' + name);
+    if (!resp.ok) throw new Error('cannot fetch ./programs/' + name);
+    const elf = parseElf(new Uint8Array(await resp.arrayBuffer()));
+    boot(ucMod, uc, board, elf);
 
-    setStatus('booted (AArch64 guest kernel) — type a command: HI, RPI, HELP, VER');
+    draw(runUntilIdle()); // program boots, prints its banner, parks on getc
+
+    setStatus(`booted — running ${name} (AArch64 ELF at 0x100000) — type, or press Reboot`);
     runBtn.textContent = 'Reboot';
     runBtn.disabled = false;
     term.focus();

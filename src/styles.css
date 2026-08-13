@@ -56,6 +56,16 @@ button {
   cursor: pointer;
 }
 
+select {
+  background: #1c2731;
+  border: 1px solid #2d3d4c;
+  color: #d8e0e8;
+  font: inherit;
+  font-size: 13px;
+  padding: 8px 10px;
+  border-radius: 6px;
+}
+
 button:disabled {
   opacity: 0.5;
   cursor: default;

@@ -6,13 +6,15 @@ import { fileURLToPath } from 'url';
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MUnicorn = require(join(__dirname, '..', 'public', 'unicorn.js'));
+const { parseElf, loadElf } = await import(join(__dirname, '..', 'src', 'elf.js'));
 
 const UART_WINDOW = 0x1000;
 const TX_SLOT_STRIDE = 4;
 const TX_SLOTS = 32;
 const RAM_SIZE = 0x400000;
-const KERNEL_ADDR = 0x80000;
-const KERNEL_SLICES = 512;
+const SLICE_INSNS = 512;
+const MAX_SLICES = 5000;
+const PROG = join(__dirname, '..', 'public', 'programs', 'shell.elf');
 
 async function main() {
   const ucMod = await MUnicorn();
@@ -29,14 +31,11 @@ async function main() {
   uc.mem_map(0, RAM_SIZE, ucMod.PROT_ALL);
   uc.mem_map(uart, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
 
-  const loadKernel = (addr, ptr, len) => {
-    const bytes = new Uint8Array(board.memory.buffer, Number(ptr), Number(len));
-    for (let i = 0; i < bytes.length; i++) uc.mem_write(addr + i, [bytes[i]]);
-  };
-  loadKernel(KERNEL_ADDR, board.pi_kernel(), board.pi_kernel_len());
-
-  uc.reg_write_i32(ucMod.ARM64_REG_PC, KERNEL_ADDR);
-  uc.reg_write_i32(ucMod.ARM64_REG_SP, RAM_SIZE - 16);
+  const elf = parseElf(new Uint8Array(readFileSync(PROG)));
+  loadElf(uc, elf);
+  // reg_write is a no-op in this unicorn build: the guest _start sets its own
+  // SP, and the first slice starts at e_entry via the begin argument.
+  let pc = elf.entry;
 
   let chars = '';
   const drain = () => {
@@ -61,36 +60,38 @@ async function main() {
   };
 
   const slice = () => {
-    const pc = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC));
-    uc.emu_start(pc, 0, 0, KERNEL_SLICES);
-    drain();
+    const pc = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || elf.entry;
+    uc.emu_start(pc, 0, 0, SLICE_INSNS);
+    return drain();
+  };
+
+  // Run slices until the guest goes quiet (2 empty drains) — same as the host.
+  const runUntilIdle = () => {
+    let quiet = 0;
+    for (let i = 0; i < MAX_SLICES && quiet < 2; i++) {
+      quiet = slice() === 0 ? quiet + 1 : 0;
+    }
   };
 
   const type = (str) => {
     for (const ch of str) {
       uc.mem_write(rx, [typeof ch === 'number' ? ch : ch.charCodeAt(0)]);
-      slice();
+      runUntilIdle();
     }
   };
 
   const t0 = Date.now();
-  // 1. boot greeting (starts at KERNEL_ADDR; afterwards slices resume from PC)
-  uc.reg_write_i32(ucMod.ARM64_REG_PC, KERNEL_ADDR);
-  slice();
+  runUntilIdle(); // boot greeting ("Hi\n> ") then park on getc
 
-  // 2. session 1: HI
+  // sessions (shell.elf behavior, same expected console as before)
   type('HI\r');
-  // 3. session 2: RPI
   type('RPI\r');
-  // 4. session 3: unknown ZZ
   type('ZZ\r');
-  // 5. backspace editing: H X <bs> I \r -> buffer "HI" -> HELLO
   type(['H', 'X', 0x7f, 'I', '\r']);
   const elapsed = Date.now() - t0;
 
   const want = 'Hi\n> HI\rHELLO\r\n> RPI\rRaspberry Pi 3\r\n> ZZ\r?\r\n> HXI\rHELLO\r\n> ';
-  const got = JSON.stringify(chars);
-  console.log('console output:', got);
+  console.log('console output:', JSON.stringify(chars));
   console.log('console OK:', chars === want);
   if (chars !== want) console.log('want          :', JSON.stringify(want));
   console.log('session time:', elapsed, 'ms');
