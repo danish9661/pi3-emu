@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["runtime", "clock", "shell", "sum", "fib", "smp", "gpio"]
+members = ["runtime", "clock", "shell", "sum", "fib", "smp", "gpio", "fb"]
 
 [profile.release]
 opt-level = "s"

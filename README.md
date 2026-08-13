@@ -150,6 +150,28 @@ the chase is paced with `requestAnimationFrame` (slices run for ~16 ms
 per frame), so the LEDs visibly blink instead of finishing inside one
 synchronous run.
 
+## Framebuffer (display via the VideoCore)
+
+The mailbox property channel also serves as the display: the `fb`
+program sends `SET_PHYSICAL_W/H`, `SET_VIRTUAL_W/H`, `SET_DEPTH` and
+`SET_PIXEL_ORDER` tags, then `ALLOCATE_BUFFER` — the host carves
+`0x200000` out of guest RAM (160x120x32, RGB byte order) and answers
+`GET_PITCH` with `640`. The guest then writes pixels straight into the
+framebuffer (little-endian `R | G<<8 | B<<16`):
+
+```
+> fb
+fb: 160x120 pitch 640 @ 0x200000
+pattern drawn
+```
+
+After a deterministic test pattern (red screen, blue border, yellow
+ball) the guest runs a bouncing-ball animation paced by the system
+timer. `fbRun()` advances slices on `requestAnimationFrame` (~16 ms per
+frame, the guest never parks) and blits the framebuffer to a
+`<canvas>` (scaled 3x, `image-rendering: pixelated`) after every
+batch — a live display until Reboot.
+
 ## Programs
 
 | Program | What it does |
@@ -160,6 +182,7 @@ synchronous run.
 | `smp`   | auto-runs: 4 cores launch through the mailbox, sum quarters of 1..100, mailbox tally, joined counter (Reboot to re-run) |
 | `clock` | auto-runs: real 1 s timer sleep, C1 compare + M1 match, W1C-style clear (Reboot to re-run) |
 | `gpio`  | auto-runs: LED knight-rider chase on pins 21..28, then polls BTN 29 (LED panel + button in the page) |
+| `fb`    | auto-runs: allocates a 160x120x32 framebuffer via mailbox, pattern + bouncing-ball animation (live canvas in the page) |
 
 Backspace (`⌫`) sends 0x7F; the guest unwrites its line buffer and the
 host trims the display. The terminal auto-focuses on boot; an on-screen
@@ -182,6 +205,7 @@ node test/smp-probe.mjs          # 4-core SMP run: launch, mailbox, counter, par
 node test/clock-probe.mjs        # system timer: 1 s sleep, compare/match, clear
 node test/mbox-probe.mjs         # VideoCore mailbox: full property query response
 node test/gpio-probe.mjs         # GPIO: LED chase toggles + button press edges
+node test/fb-probe.mjs           # framebuffer: mailbox allocation, pattern pixels, ball moves
 node test/branch-probe.mjs       # condition/branch encoding probes (15)
 node test/csel-probe.mjs         # csel probe (8)
 ```
@@ -236,3 +260,10 @@ dist/                 production bundle
   GPLEV (write-1 latches + refreshed input levels), pull-down button,
   LED knight-rider chase timed by the system timer, rAF-paced chase so
   the page's LED panel visibly blinks, `gpio` program + probe
+- M10 — framebuffer: the mailbox now runs a display — SET physical/
+  virtual W/H, depth, pixel order, ALLOCATE_BUFFER (host carves
+  `0x200000` out of guest RAM) and GET_PITCH tags; the `fb` program
+  draws a deterministic pattern then a bouncing-ball animation paced by
+  the system timer; `fbRun()` advances slices on rAF and blits the
+  framebuffer to a 3x pixelated canvas — a live display, `fb` program +
+  probe

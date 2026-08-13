@@ -83,6 +83,7 @@ export const PROGRAMS = {
   smp: 'smp.elf',
   clock: 'clock.elf',
   gpio: 'gpio.elf',
+  fb: 'fb.elf',
 };
 
 const term = document.getElementById('term');
@@ -92,6 +93,8 @@ const progSel = document.getElementById('prog');
 const statsEl = document.getElementById('stats');
 const hint = document.getElementById('hint');
 const gpioPanel = document.getElementById('gpiopanel');
+const fbCanvas = document.getElementById('fbscreen');
+const fbCtx = fbCanvas.getContext('2d');
 const gpioLedsEl = document.getElementById('gpio-leds');
 const gpioBtnEl = document.getElementById('gpio-btn');
 
@@ -161,6 +164,11 @@ function boot(ucMod, uc, board, elf) {
   mbxAddr = 0;
   gpioOut = 0;
   gpioBtn = 0;
+  fbW = 0;
+  fbH = 0;
+  fbDepth = 0;
+  fbPitch = 0;
+  fbReady = false;
 
   loadElf(uc, elf);
 }
@@ -194,20 +202,68 @@ function mboxProcess(uc) {
     const id = readU32(uc, addr + off);
     if (id === 0) break; // end-of-tags marker
     const tsize = readU32(uc, addr + off + 4);
-    const tag = MBOX_TAGS[id];
-    if (tag) {
-      const out = tag(readU32(uc, addr + off + 12), tsize);
-      writeU32(uc, addr + off + 8, 0x80000000);
-      for (let i = 0; i < tsize; i++) {
-        uc.mem_write(addr + off + 12 + i, [out[i] ?? 0]);
-      }
+    if (fbTag(uc, addr, off, id, tsize)) {
+      // handled by the framebuffer path
     } else {
-      writeU32(uc, addr + off + 8, 0x80000001); // unknown tag -> error
+      const tag = MBOX_TAGS[id];
+      if (tag) {
+        const out = tag(readU32(uc, addr + off + 12), tsize);
+        writeU32(uc, addr + off + 8, 0x80000000);
+        for (let i = 0; i < tsize; i++) {
+          uc.mem_write(addr + off + 12 + i, [out[i] ?? 0]);
+        }
+      } else {
+        writeU32(uc, addr + off + 8, 0x80000001); // unknown tag -> error
+      }
     }
     off += 12 + tsize + ((4 - (tsize % 4)) % 4);
   }
   writeU32(uc, addr + 4, 0x80000000); // whole request succeeded
   mbxPending = true;
+}
+
+// The "VideoCore" display: the guest sets a mode (physical/virtual W/H,
+// depth, pixel order) and allocates a buffer; the host carves it out of
+// guest RAM and blits it to the canvas every animation frame.
+const FB_MODE = 'fb';
+const FB_ADDR = 0x200000; // allocated framebuffer inside guest RAM
+let fbW = 0;
+let fbH = 0;
+let fbDepth = 0;
+let fbPitch = 0;
+let fbReady = false;
+let fbFrame = 0;
+
+function fbTag(uc, addr, off, id, tsize) {
+  const v = addr + off + 12;
+  switch (id) {
+    case 0x00048003: // SET_PHYSICAL_W/H
+    case 0x00048004: // SET_VIRTUAL_W/H
+      fbW = readU32(uc, v);
+      fbH = readU32(uc, v + 4);
+      writeU32(uc, addr + off + 8, 0x80000000);
+      return true;
+    case 0x00048005: // SET_DEPTH
+      fbDepth = readU32(uc, v);
+      writeU32(uc, addr + off + 8, 0x80000000);
+      return true;
+    case 0x00048006: // SET_PIXEL_ORDER (0 = RGB byte order)
+      writeU32(uc, addr + off + 8, 0x80000000);
+      return true;
+    case 0x00040001: // ALLOCATE_BUFFER: address + pitch
+      fbPitch = fbW * 4;
+      writeU32(uc, addr + off + 8, 0x80000000);
+      writeU32(uc, v, FB_ADDR);
+      writeU32(uc, v + 4, fbPitch);
+      fbReady = fbW > 0 && fbH > 0 && fbDepth === 32;
+      return true;
+    case 0x00040008: // GET_PITCH
+      writeU32(uc, addr + off + 8, 0x80000000);
+      writeU32(uc, v, fbPitch);
+      return true;
+    default:
+      return false;
+  }
 }
 
 // Mirror device state into the guest before a slice; pull guest requests out.
@@ -513,6 +569,36 @@ function gpioRun() {
   gpioFrame = requestAnimationFrame(frame);
 }
 
+// The fb guest animates forever and never parks, so a rAF loop advances
+// slices (~16 ms of wall time per frame) and blits the framebuffer to the
+// canvas right after each batch — the display runs live until Reboot.
+function fbRun() {
+  let out = '';
+  const frame = () => {
+    if (mode !== FB_MODE) return;
+    const t0 = performance.now();
+    do {
+      out += runSlice(SLICE_INSNS);
+    } while (performance.now() - t0 < 16);
+    draw(out);
+    out = '';
+    updateStats();
+    if (fbReady) blit();
+    fbFrame = requestAnimationFrame(frame);
+  };
+  fbFrame = requestAnimationFrame(frame);
+}
+
+function blit() {
+  if (!fbCtx || fbW === 0) return;
+  const n = fbW * fbH * 4;
+  const mem = uc.mem_read(FB_ADDR, n);
+  const img = fbCtx.createImageData(fbW, fbH);
+  img.data.set(mem);
+  for (let i = 3; i < img.data.length; i += 4) img.data[i] = 255; // opaque
+  fbCtx.putImageData(img, 0, 0);
+}
+
 // The guest drives itself: it prints to the UART TX slots (one char per
 // slice) and parks in getc until a key arrives. Run slices until the guest
 // has gone quiet for two consecutive slices — i.e. it is back waiting for
@@ -541,7 +627,7 @@ function guestKey(code) {
 
 function handleKey(e) {
   if (!uc || runBtn.disabled) return;
-  if (mode === SMP_MODE) return;
+  if (mode === SMP_MODE || mode === FB_MODE) return;
   if (e.key === 'Backspace') {
     e.preventDefault();
     if (term.textContent.length > 0) {
@@ -559,7 +645,7 @@ function handleKey(e) {
 // On-screen keyboard: feed the same guestKey path as physical keys.
 function tapKeys(btn) {
   if (!uc || runBtn.disabled) return;
-  if (mode === SMP_MODE) return;
+  if (mode === SMP_MODE || mode === FB_MODE) return;
   const action = btn.dataset.action;
   if (action === 'enter') {
     draw(guestKey(13));
@@ -574,10 +660,12 @@ function tapKeys(btn) {
 
 async function run() {
   cancelAnimationFrame(gpioFrame);
+  cancelAnimationFrame(fbFrame);
   gpioLoopActive = false;
   runBtn.disabled = true;
   term.textContent = '';
   gpioPanel.hidden = true;
+  fbCanvas.hidden = true;
   stats = { steps: 0, insns: 0, emuMs: 0, chars: 0, wallStart: performance.now() };
   statsEl.textContent = '';
   try {
@@ -613,6 +701,14 @@ async function run() {
       updateGpioPanel();
       gpioRun(); // async: rAF-paced slices, chase visibly blinks the LEDs
       setStatus(`booted — running gpio — GPIO @ 0x3F200000 — chase in progress`);
+    } else if (progSel.value === FB_MODE) {
+      mode = FB_MODE;
+      fbCanvas.hidden = false;
+      boot(ucMod, uc, board, elf);
+      fbRun(); // async: rAF-paced slices + canvas blit every frame
+      setStatus(
+        `booted — running fb — framebuffer 160x120x32 @ 0x200000 via mailbox — live canvas`
+      );
     } else {
       mode = 'single';
       boot(ucMod, uc, board, elf);

@@ -10,6 +10,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fb"
+version = "0.1.0"
+dependencies = [
+ "pi-runtime",
+]
+
+[[package]]
 name = "fib"
 version = "0.1.0"
 dependencies = [

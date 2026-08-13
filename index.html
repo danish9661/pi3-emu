@@ -15,6 +15,7 @@
         <div class="gpio-leds" id="gpio-leds"></div>
         <button id="gpio-btn" class="gpio-btn" type="button">BTN 29 (hold)</button>
       </div>
+      <canvas id="fbscreen" class="fbscreen" width="160" height="120" hidden></canvas>
       <div class="hint" id="hint">click the terminal, then type (or use the keys below)</div>
       <div class="osk" id="osk">
         <button class="k" data-keys="HI">HI</button>
@@ -32,6 +33,7 @@
           <option value="smp">smp (4 cores)</option>
           <option value="clock">clock (system timer)</option>
           <option value="gpio">gpio (LEDs + button)</option>
+          <option value="fb">fb (framebuffer)</option>
         </select>
         <button id="run">Run</button>
         <span id="status">loading...</span>

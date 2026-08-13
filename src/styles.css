@@ -56,6 +56,17 @@ h1 {
   border-radius: 6px;
 }
 
+.fbscreen {
+  display: block;
+  margin: 0 0 12px;
+  width: 480px;
+  height: 360px;
+  background: #000;
+  border: 1px solid #26313c;
+  border-radius: 6px;
+  image-rendering: pixelated;
+}
+
 .gpio-tag {
   font-size: 11px;
   color: #7f95a8;
