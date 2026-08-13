@@ -1,0 +1,14 @@
+[package]
+name = "sd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pi-runtime = { path = "../runtime" }
+
+[[bin]]
+name = "sd"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"

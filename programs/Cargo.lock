@@ -38,6 +38,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "i2c"
+version = "0.1.0"
+dependencies = [
+ "pi-runtime",
+]
+
+[[package]]
 name = "irq"
 version = "0.1.0"
 dependencies = [
@@ -63,6 +70,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sd"
+version = "0.1.0"
+dependencies = [
+ "pi-runtime",
+]
+
+[[package]]
 name = "shell"
 version = "0.1.0"
 dependencies = [
@@ -77,7 +91,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "spi"
+version = "0.1.0"
+dependencies = [
+ "pi-runtime",
+]
+
+[[package]]
 name = "sum"
+version = "0.1.0"
+dependencies = [
+ "pi-runtime",
+]
+
+[[package]]
+name = "uart1"
 version = "0.1.0"
 dependencies = [
  "pi-runtime",

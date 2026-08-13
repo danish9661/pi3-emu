@@ -347,6 +347,109 @@ pwm: all notes played (84672 samples)
 pwm: parked
 ```
 
+## I2C (0x3F804000, host-arbitrated sensor)
+
+The `i2c` program reads a host-played sensor: the BCM2835 BSC master at
+0x3F804000, pure window model like the DMA/IC (src/i2c.js) — when the
+guest raises C.ST the host snapshots the FIFO window (DLEN bytes), runs
+the slave, and for reads loads the response back into the FIFO window.
+The slave is a classic sensor sequence: write the register address, read
+the data. Registers: 0x00 WHO_AM_I = 0x68, 0x10 TEMP = 26 C (2 bytes),
+0x20 COUNTER increments per read (1, 2, 3). The guest's three read
+pairs verify all three; the stale-window race (a poll started in the
+same slice as its own write can read the previous transfer's S.DONE)
+is handled by a pre-wait loop like the SPI/SD guests. I2C_DONE at
++0x54 (explicit-done protocol).
+
+```
+> i2c
+i2c: BCM2835 BSC master @ 0x3F804000
+i2c: WHO_AM_I = 0x68
+i2c: temp = 26 C
+i2c: counter = 3 (reads 1, 2, 3)
+i2c: all checks passed
+i2c: parked
+```
+
+## SPI (0x3F204000, host-arbitrated flash slave)
+
+The `spi` program drives the BCM2835 SPI0 master (src/spi.js) with the
+host playing an SPI slave: a flash chip answering the JEDEC ID command
+(0x9F) with 0xEF 0x40 0x18. The guest runs a real transaction: select
+CS0, push the command bytes into the FIFO, raise TA, poll CS.DONE, read
+the response, CLEAR the FIFOs — twice, and requires the two responses
+to be identical (proves the CLEAR resets the session). The FIFO and CS
+registers are write-hooked: a window diff only sees the last write of a
+slice, so a CLEAR followed by TA in one slice would be invisible, and
+identical FIFO pushes can't be told apart. (Also found: this unicorn
+build's hook range end is inclusive, so the CS hook would fire for the
+adjacent FIFO — the hooks guard by address.) SPI_DONE at +0x54.
+
+```
+> spi
+spi: SPI0 master @ 0x3F204000
+spi: JEDEC ID = 0xEF 0x40 0x18 (Winbond W25Q128)
+spi: both transactions identical (CLEAR resets OK)
+spi: all checks passed
+spi: parked
+```
+
+## Mini UART (0x3F215000, second console)
+
+The `uart1` program adds a second console: the BCM2835 AUX mini UART at
+0x3F215000, configured like a real driver (AUX_ENABLES, 8N1 LCR, TX
+enable, baud) and written through MU_IO with LSR bit 5 TX-empty pacing.
+Its chars reach the same terminal tagged `[u1] ` once per line. MU_IO is
+write-hooked so UART1 chars interleave with the primary UART's chars in
+the exact order the guest wrote them (a slice diff would reorder chars
+written in the same slice — the first symptom was a UART0 `\n` landing
+after the first UART1 `u`); the primary UART got the same hook, and the
+diff pump now only clears the slots (the hookless SMP cores still get
+pushed by the pump). Output-only: input stays on UART0. The guest parks
+on getc, so it runs under the run-until-idle heuristic.
+
+```
+> uart1
+uart1: mini UART (AUX) @ 0x3F215000
+uart1: UART0 console is active
+uart1: starting UART1 diagnostics
+[u1] uart1: hello from the mini UART
+[u1] uart1: LSR TX-empty pacing works
+[u1] uart1: diag line 3/3
+uart1: UART1 diagnostics complete
+uart1: parked
+```
+
+## SD card (0x3F300000, host-arbitrated SDHCI + FAT12)
+
+The `sd` program boots from a microSD card: the BCM2835 SDHCI (EMMC)
+controller at 0x3F300000, backed by a host-played 5-sector FAT12 disk
+image holding one file, HELLO.TXT ("hello from the SD card"). The guest
+runs the real init sequence (CMD0/CMD8/ACMD41/CMD2/CMD3/CMD7) with
+write-1-to-clear CMD_COMPLETE polling, then CMD17 single-block reads,
+parses the boot sector and root directory, finds HELLO.TXT and prints
+it. CMD is write-hooked (the same CMD value recurs, so a window diff
+could not detect repeats); the block is exposed at +0x100 (the real
+controller pops the data FIFO at +0x20 on every read — a plain window
+can't pop, so the guest walks the buffer addresses; the naive first
+version exposed the block at +0x20 and collided with INTERRUPT at
++0x30). SD_DONE at +0x54.
+
+```
+> sd
+sd: SDHCI (EMMC) @ 0x3F300000, FAT12 card
+sd: CMD8 echo OK (v2, 3.3V)
+sd: ACMD41 ready (high capacity)
+sd: RCA = 0x1234
+sd: card selected (R1 ready)
+sd: FAT12 boot sector OK (512B, 2 FATs)
+sd: HELLO.TXT found in root directory
+sd: file HELLO.TXT: sd: "hello from the SD card"
+sd: payload matches
+sd: all checks passed
+sd: parked
+```
+
 ## Programs
 
 | Program | What it does |
@@ -362,6 +465,10 @@ pwm: parked
 | `mmu`   | auto-runs: builds 4-level page tables in RAM, host walks them on MMU_CTL (0x3F00D000), alias VA 0x80000000→PA 0x200000, shadow-code call (Reboot to re-run) |
 | `dma`   | auto-runs: 3-CB DMA chain (copy/relay/fill) performed by the host between slices, CS.END + CS.INT latched, completion IRQ 16 handled, destinations verified (Reboot to re-run) |
 | `pwm`   | auto-runs: FIFO-mode PWM — the guest generates a square-wave "Twinkle" melody paced by the FULL1/EMPT1 handshake; the host drains the FIFO and plays it through WebAudio (Reboot to re-run) |
+| `i2c`   | auto-runs: reads a host-played sensor over BSC: WHO_AM_I, TEMP, and a COUNTER that increments per read (Reboot to re-run) |
+| `spi`   | auto-runs: two identical SPI0 transactions against a flash slave; JEDEC ID 0xEF 0x40 0x18, CLEAR-reset proven by r1 == r2 (Reboot to re-run) |
+| `uart1` | auto-runs: second console on the AUX mini UART, output tagged `[u1] ` (Reboot to re-run) |
+| `sd`    | auto-runs: SDHCI init sequence + FAT12 card read; parses boot sector/root dir, prints HELLO.TXT (Reboot to re-run) |
 
 Backspace (`⌫`) sends 0x7F; the guest unwrites its line buffer and the
 host trims the display. The terminal auto-focuses on boot; an on-screen
@@ -391,6 +498,10 @@ node test/csel-probe.mjs         # csel probe (8)
 node test/mmu-probe.mjs          # MMU: host-assisted translation, alias + shadow-code checks
 node test/dma-probe.mjs          # DMA: host-performed 3-CB chain, END/INT latch, IRQ 16 delivered, dst verified
 node test/pwm-probe.mjs          # PWM: FIFO-mode config, FULL1/EMPT1 handshake, exact 84672-sample stream
+node test/i2c-probe.mjs          # I2C: sensor WHO_AM_I/TEMP/COUNTER reads, slave register select
+node test/spi-probe.mjs          # SPI: JEDEC ID transaction, CLEAR resets, r1 == r2
+node test/uart1-probe.mjs        # UART1: mini UART config, [u1]-tagged stream, TX-empty pacing
+node test/sd-probe.mjs           # SD: init sequence, FAT12 boot/root parse, HELLO.TXT payload
 ```
 
 ## Build
@@ -413,10 +524,18 @@ programs/             Rust workspace: runtime lib + shell/sum/fib/smp guests
                       enables via MMU_CTL, tests the alias + shadow code
   dma/                DMA demo: 3-CB chain, ACTIVE start, IRQ 16 handler
   pwm/                PWM audio demo: FIFO-mode square-wave melody
+  i2c/                I2C demo: BSC master, host-played sensor reads
+  spi/                SPI demo: SPI0 master, flash slave JEDEC ID
+  uart1/              mini UART demo: second console tagged [u1]
+  sd/                 SD demo: SDHCI init + FAT12 card, prints HELLO.TXT
 src/elf.js            ELF64 loader (PT_LOAD + bss zeroing)
 src/mmu.js            host-assisted MMU: table walk, shadow mapping, mirror
 src/dma.js            host-arbitrated DMA: CB chain walk + transfer engine
 src/pwm.js            host-arbitrated PWM: FIFO model, drain ring, write hook
+src/i2c.js            host-arbitrated I2C: BSC window, sensor slave
+src/spi.js            host-arbitrated SPI: SPI0 window, flash slave
+src/uart1.js          mini UART model: write hook emits chars at write time
+src/sdhci.js          host-arbitrated SDHCI: block buffer, FAT12 image
 src/main.js           browser host loop (run-until-idle scheduler)
 board/src/lib.rs      board model (UART console FIFO only)
 test/smoke.mjs        guest-driven end-to-end test (node)
@@ -497,3 +616,41 @@ dist/                 production bundle
   the browser plays it through WebAudio (ScriptProcessor pull at
   44.1 kHz, created on the Run click gesture); PWM_DONE (0x3F20C054)
   protocol; `pwm` program + probe + E2E
+- M15 — I2C: BCM2835 BSC master window (0x3F804000) with a host-played
+  sensor slave — when the guest raises C.ST the host snapshots the FIFO
+  window, runs the slave (write the register address, read the data),
+  and loads the response back; WHO_AM_I = 0x68, TEMP = 26 C, COUNTER
+  increments per read (1, 2, 3); the guest pre-waits before each read
+  because a poll started in the same slice as its own write can see the
+  previous transfer's S.DONE (stale-window race); I2C_DONE (0x3F804054)
+  protocol; `i2c` program + probe + browser E2E
+- M16 — SPI: BCM2835 SPI0 master window (0x3F204000) with the host
+  playing a flash slave answering the JEDEC ID command (0x9F → 0xEF
+  0x40 0x18); the guest runs a real transaction — select CS0, push the
+  command into the FIFO, raise TA, poll CS.DONE, read, CLEAR — twice,
+  and requires identical responses (proves CLEAR resets the session);
+  FIFO/CS are write-hooked because a window diff only sees the last
+  write of a slice and identical FIFO pushes can't be told apart;
+  discovered the hook range end is inclusive (the CS hook fired for the
+  adjacent FIFO — guarded by address); SPI_DONE (0x3F204054); `spi`
+  program + probe + browser E2E
+- M17 — Mini UART: second console on the BCM2835 AUX mini UART
+  (0x3F215000, real AUX_ENABLES/LCR/baud config, LSR TX-empty pacing),
+  tagged `[u1] ` once per line; MU_IO is write-hooked so UART1 chars
+  interleave with UART0 chars in the guest's exact write order (a slice
+  diff reorders chars written in the same slice — first symptom: a
+  UART0 `\n` landing after the first UART1 `u`); the primary UART got
+  the same write hook and the diff pump now only clears the slots (the
+  hookless SMP cores still get pushed by the pump); `uart1` program +
+  probe + browser E2E
+- M18 — SD card: BCM2835 SDHCI (EMMC) window (0x3F300000) backed by a
+  host-played 5-sector FAT12 disk image with HELLO.TXT; the guest runs
+  the real init sequence (CMD0/CMD8/ACMD41/CMD2/CMD3/CMD7, write-1
+  CMD_COMPLETE clears) then CMD17 single-block reads and parses the
+  boot sector + root directory; CMD is write-hooked (the same CMD value
+  recurs — a window diff could not detect repeats); the 512-byte block
+  buffer sits at +0x100 because the real controller pops the data FIFO
+  at +0x20 on every read — a plain window can't pop, and the first
+  attempt at +0x20 collided with INTERRUPT at +0x30; FAT12 cluster low
+  word read at dir entry +20; SD_DONE (0x3F300054); `sd` program +
+  probe + browser E2E

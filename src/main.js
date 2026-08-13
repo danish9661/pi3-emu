@@ -3,6 +3,10 @@ import { parseElf, loadElf } from './elf.js';
 import { mmuEnable, mmuMirrorWrite } from './mmu.js';
 import { dmaRunChain } from './dma.js';
 import { createPwm } from './pwm.js';
+import { createI2c } from './i2c.js';
+import { createSpi } from './spi.js';
+import { createUart1 } from './uart1.js';
+import { createSdhci } from './sdhci.js';
 
 const UART_WINDOW = 0x1000;
 const TX_SLOT_STRIDE = 4;
@@ -125,6 +129,39 @@ let audioRing = null;
 let audioPos = 0;
 let audioLen = 0;
 
+// Host-arbitrated I2C (BSC) master (see i2c.js): a sensor slave at 0x3F804000
+// with a DONE host extension at +0x54. The guest parks by writing I2C_DONE.
+const I2C_BASE = 0x3F804000;
+const I2C_MAX_SLICES = 30000;
+let i2cSyncOut = null;
+let i2cSyncIn = null;
+let i2cState = null;
+
+// Host-arbitrated SPI0 master (see spi.js): a flash-slave JEDEC responder at
+// 0x3F204000 with a DONE host extension at +0x54. Guest parks on SPI_DONE.
+const SPI_BASE = 0x3F204000;
+const SPI_MAX_SLICES = 30000;
+let spiSyncOut = null;
+let spiSyncIn = null;
+let spiState = null;
+
+// Host-arbitrated AUX mini UART (UART1) at 0x3F215000 (see uart1.js): a
+// second console, output-only. Its chars are tagged "[u1] " per line. The
+// guest parks on getc like the plain programs, so runUntilIdle applies.
+const UART1_BASE = 0x3F215000;
+let uart1SyncOut = null;
+let uart1SyncIn = null;
+let uart1LineStart = true; // next UART1 char starts a line (add the [u1] tag)
+
+// Host-arbitrated SDHCI (EMMC) controller (see sdhci.js): a FAT12 microSD
+// card at 0x3F300000 with a DONE host extension at +0x54. Guest parks on
+// SD_DONE after printing HELLO.TXT.
+const SD_BASE = 0x3F300000;
+const SD_MAX_SLICES = 30000;
+let sdSyncOut = null;
+let sdSyncIn = null;
+let sdState = null;
+
 export const PROGRAMS = {
   shell: 'shell.elf',
   sum: 'sum.elf',
@@ -137,6 +174,10 @@ export const PROGRAMS = {
   mmu: 'mmu.elf',
   dma: 'dma.elf',
   pwm: 'pwm.elf',
+  i2c: 'i2c.elf',
+  spi: 'spi.elf',
+  uart1: 'uart1.elf',
+  sd: 'sd.elf',
 };
 
 const term = document.getElementById('term');
@@ -209,7 +250,28 @@ function boot(ucMod, uc, board, elf) {
   uc.mem_map(DMA_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(0x3F00E000, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(PWM_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  uc.mem_map(I2C_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  uc.mem_map(SPI_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  uc.mem_map(UART1_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  uc.mem_map(SD_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.devUart = { base: uart };
+  // Primary-UART TX hook: chars reach the console at write time, so they
+  // interleave with UART1's hook-pushed chars in the guest's exact write
+  // order (the diff-based pump below then only clears the slots).
+  uc.uartHook = true;
+  uc.hook_add(
+    ucMod.HOOK_MEM_WRITE,
+    (u, access, addr, size, value) => {
+      const b = Number(value) & 0xff;
+      if (b !== 0) {
+        stats.chars++;
+        board.pi_cons_push(b);
+      }
+    },
+    null,
+    uart,
+    uart + TX_SLOTS * TX_SLOT_STRIDE - 1
+  );
   uc.entry = elf.entry;
   tmrWall0 = performance.now();
   tmrPending = 0;
@@ -252,6 +314,26 @@ function boot(ucMod, uc, board, elf) {
   pwmAudioFed = 0;
   audioPos = 0;
   audioLen = 0;
+
+  const i2c = createI2c(uc, ucMod, I2C_BASE);
+  i2cSyncOut = i2c.syncOut;
+  i2cSyncIn = i2c.syncIn;
+  i2cState = i2c.state;
+
+  const spi = createSpi(uc, ucMod, SPI_BASE);
+  spiSyncOut = spi.syncOut;
+  spiSyncIn = spi.syncIn;
+  spiState = spi.state;
+
+  const uart1 = createUart1(uc, ucMod, UART1_BASE, uart1Emit);
+  uart1SyncOut = uart1.syncOut;
+  uart1SyncIn = uart1.syncIn;
+  uart1LineStart = true;
+
+  const sd = createSdhci(uc, ucMod, SD_BASE);
+  sdSyncOut = sd.syncOut;
+  sdSyncIn = sd.syncIn;
+  sdState = sd.state;
 
   loadElf(uc, elf);
 }
@@ -538,8 +620,12 @@ function pumpUart(ucMod, uc, board) {
     const c = window[i * TX_SLOT_STRIDE];
     if (c !== 0) {
       found++;
-      stats.chars++;
-      board.pi_cons_push(c);
+      // The write hook already pushed the chars on this uc (boot() set
+      // uc.uartHook); the SMP cores have no hook, so the pump pushes here.
+      if (!uc.uartHook) {
+        stats.chars++;
+        board.pi_cons_push(c);
+      }
       for (let k = 0; k < TX_SLOT_STRIDE; k++) {
         uc.mem_write(base + i * TX_SLOT_STRIDE + k, [0]);
       }
@@ -743,6 +829,24 @@ function audioPush(sampleWord) {
   }
 }
 
+// UART1 chars reach the same terminal, tagged "[u1] " once per line (the
+// probe replicates the same tagging; the guest's own output is unchanged).
+// Newline chars are never tagged, so a CRLF pair stays adjacent and the
+// terminal renders it as a single line break.
+function uart1Emit(b) {
+  const isNl = b === 0x0a || b === 0x0d;
+  if (uart1LineStart && !isNl) {
+    for (const c of '[u1] ') {
+      stats.chars++;
+      board.pi_cons_push(c.charCodeAt(0));
+    }
+    uart1LineStart = false;
+  }
+  stats.chars++;
+  board.pi_cons_push(b);
+  if (isNl) uart1LineStart = true;
+}
+
 function runSlice(count) {
   const pc = irqResume || irqVector || Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry;
   if (irqResume) irqInFlight = false;
@@ -755,6 +859,10 @@ function runSlice(count) {
   syncMmuOut(uc);
   syncDmaOut(uc);
   if (pwmSyncOut) pwmSyncOut(uc);
+  if (i2cSyncOut) i2cSyncOut(uc);
+  if (spiSyncOut) spiSyncOut(uc);
+  if (sdSyncOut) sdSyncOut(uc);
+  if (uart1SyncOut) uart1SyncOut(uc);
   const t0 = performance.now();
   uc.emu_start(pc, 0, 0, count);
   stats.emuMs += performance.now() - t0;
@@ -771,7 +879,14 @@ function runSlice(count) {
     pwmSyncIn(uc);
     while (pwmAudioFed < pwmState.drained) audioPush(pwmState.ring[pwmAudioFed++]);
   }
+  if (i2cSyncIn) i2cSyncIn(uc);
+  if (spiSyncIn) spiSyncIn(uc);
+  if (sdSyncIn) sdSyncIn(uc);
+  // The UART TX hooks (see boot) already pushed this slice's chars in the
+  // guest's write order; the pump only clears the slots (and pushes for the
+  // hookless SMP cores).
   pumpUart(ucMod, uc, board);
+  if (uart1SyncIn) uart1SyncIn(uc);
   const out = drain(board);
   irqDeliver(uc);
   return out;
@@ -872,6 +987,48 @@ function runUntilPwmDone() {
     updateStats();
   }
   if (!pwmState.done) setStatus('warn: pwm guest did not reach DONE');
+  else out += drain(board);
+  return out;
+}
+
+// The i2c guest runs its three sensor transfers then parks, so it uses the
+// explicit-done protocol: slices until the guest writes I2C_DONE.
+function runUntilI2cDone() {
+  let out = '';
+  for (let i = 0; i < I2C_MAX_SLICES && !i2cState.done; i++) {
+    const o = runSlice(SLICE_INSNS);
+    out += o;
+    updateStats();
+  }
+  if (!i2cState.done) setStatus('warn: i2c guest did not reach DONE');
+  else out += drain(board);
+  return out;
+}
+
+// The spi guest runs its two identical JEDEC transactions then parks, so it
+// uses the explicit-done protocol: slices until the guest writes SPI_DONE.
+function runUntilSpiDone() {
+  let out = '';
+  for (let i = 0; i < SPI_MAX_SLICES && !spiState.done; i++) {
+    const o = runSlice(SLICE_INSNS);
+    out += o;
+    updateStats();
+  }
+  if (!spiState.done) setStatus('warn: spi guest did not reach DONE');
+  else out += drain(board);
+  return out;
+}
+
+// The sd guest reads the FAT12 card and prints HELLO.TXT, then parks, so it
+// uses the explicit-done protocol: slices until the guest writes SD_DONE.
+function runUntilSdDone() {
+  let out = '';
+  for (let i = 0; i < SD_MAX_SLICES && !sdState.done; i++) {
+    const o = runSlice(SLICE_INSNS);
+    out += o;
+    updateStats();
+  }
+  if (!sdState.done) setStatus('warn: sd guest did not reach DONE');
   else out += drain(board);
   return out;
 }
@@ -1111,6 +1268,34 @@ async function run() {
       draw(runUntilPwmDone()); // FIFO-mode sample generation, paced by FULL1
       setStatus(
         `booted — running pwm — BCM2835 PWM @ 0x3F20C000 — ${pwmState.drained} samples in the audio ring — press Reboot to re-run`
+      );
+    } else if (progSel.value === 'i2c') {
+      mode = 'i2c';
+      boot(ucMod, uc, board, elf);
+      draw(runUntilI2cDone()); // sensor slave: WHO_AM_I, TEMP, COUNTER reads
+      setStatus(
+        `booted — running i2c — BCM2835 BSC master @ 0x3F804000 — sensor reads — press Reboot to re-run`
+      );
+    } else if (progSel.value === 'spi') {
+      mode = 'spi';
+      boot(ucMod, uc, board, elf);
+      draw(runUntilSpiDone()); // flash slave answers the JEDEC ID, twice
+      setStatus(
+        `booted — running spi — BCM2835 SPI0 master @ 0x3F204000 — JEDEC ID — press Reboot to re-run`
+      );
+    } else if (progSel.value === 'uart1') {
+      mode = 'uart1';
+      boot(ucMod, uc, board, elf);
+      draw(runUntilIdle()); // second console: parks on getc like the shell
+      setStatus(
+        `booted — running uart1 — BCM2835 AUX mini UART @ 0x3F215000 — output tagged [u1] — press Reboot to re-run`
+      );
+    } else if (progSel.value === 'sd') {
+      mode = 'sd';
+      boot(ucMod, uc, board, elf);
+      draw(runUntilSdDone()); // FAT12 card: boot sector, root dir, HELLO.TXT
+      setStatus(
+        `booted — running sd — BCM2835 SDHCI (EMMC) @ 0x3F300000 — FAT12 card, HELLO.TXT read — press Reboot to re-run`
       );
     } else {
       mode = 'single';
