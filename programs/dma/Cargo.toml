@@ -1,0 +1,14 @@
+[package]
+name = "dma"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pi-runtime = { path = "../runtime" }
+
+[[bin]]
+name = "dma"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"

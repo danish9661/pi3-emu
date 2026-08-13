@@ -258,6 +258,49 @@ mmu: all checks passed
 mmu: parked
 ```
 
+## DMA (0x3F007000, host-arbitrated controller)
+
+The `dma` program demos the BCM2835 DMA controller with the host
+performing the transfers (the guest still does the real work: it writes
+control blocks, programs the channel and arms the IRQ). Channel 0 has
+the real register layout — CS at +0x00 with ACTIVE/END/INT bits,
+CONBLK_AD at +0x04 — plus the real DMA_ENABLE register at 0x3F00E050.
+The guest builds a 3-CB chain in RAM and starts it by writing
+CS.ACTIVE; the host walks the chain between slices (src/dma.js), copies
+or fills the buffers, latches CS.END and raises CS.INT — the INTEN bit
+(31, a documented host extension) on the final CB drives the IC's DMA0
+line (bit 16), and the M11 delivery path vectors the guest:
+
+```
+CB0 0x284000: copy 64 bytes  0x285000 -> 0x286000 (pattern 0x5a+i)
+CB1 0x284020: copy 32 bytes  0x286000 -> 0x287000 (relay)
+CB2 0x284040: fill  16 bytes 0x288000 with the byte at 0x284080
+             (SRC_IGNORE, final CB sets INTEN -> completion IRQ)
+```
+
+Because the host re-asserts the DMA0 line until the guest clears CS.INT,
+the guest's own code must stay interrupt-safe: `poll_end` and a small
+`delay_spin` keep their state in callee-saved registers (the delivery
+clobbers x0-x18), the vector glue preserves x30 (the `bl` to the Rust
+handler would otherwise make the guest's next `ret` jump into the glue),
+and the host masks the DMA0 pending bit once INT is cleared so a stale
+window can't re-deliver after the guest has acknowledged. The guest
+then verifies all three destinations and parks via the DMA_DONE
+protocol (0x3F00E054, like TMR_DONE/MMU_DONE).
+
+```
+> dma
+dma: BCM2835 DMA controller @ 0x3F007000
+dma: channel 0 enabled, IRQ 16 armed, chain at 0x284000
+[dma irq] completed
+dma: chain done (END set)
+dma: full copy OK (64 bytes)
+dma: relay copy OK (32 bytes)
+dma: fill OK (SRC_IGNORE, 16 bytes)
+dma: all checks passed
+dma: parked
+```
+
 ## Programs
 
 | Program | What it does |
@@ -271,6 +314,7 @@ mmu: parked
 | `fb`    | auto-runs: allocates a 160x120x32 framebuffer via mailbox, pattern + bouncing-ball animation (live canvas in the page) |
 | `irq`   | auto-runs: arms the legacy interrupt controller, timer C1 heartbeat every 1 s + a UART RX IRQ per key (type to see `[irq key: '...']`) |
 | `mmu`   | auto-runs: builds 4-level page tables in RAM, host walks them on MMU_CTL (0x3F00D000), alias VA 0x80000000→PA 0x200000, shadow-code call (Reboot to re-run) |
+| `dma`   | auto-runs: 3-CB DMA chain (copy/relay/fill) performed by the host between slices, CS.END + CS.INT latched, completion IRQ 16 handled, destinations verified (Reboot to re-run) |
 
 Backspace (`⌫`) sends 0x7F; the guest unwrites its line buffer and the
 host trims the display. The terminal auto-focuses on boot; an on-screen
@@ -298,6 +342,7 @@ node test/irq-probe.mjs          # interrupts: timer C1 IRQ 29 + UART RX IRQ 31 
 node test/branch-probe.mjs       # condition/branch encoding probes (15)
 node test/csel-probe.mjs         # csel probe (8)
 node test/mmu-probe.mjs          # MMU: host-assisted translation, alias + shadow-code checks
+node test/dma-probe.mjs          # DMA: host-performed 3-CB chain, END/INT latch, IRQ 16 delivered, dst verified
 ```
 
 ## Build
@@ -318,8 +363,10 @@ programs/             Rust workspace: runtime lib + shell/sum/fib/smp guests
                       mailbox protocol, spinlocks, park bits
   mmu/                virtual memory demo: builds 4-level page tables,
                       enables via MMU_CTL, tests the alias + shadow code
+  dma/                DMA demo: 3-CB chain, ACTIVE start, IRQ 16 handler
 src/elf.js            ELF64 loader (PT_LOAD + bss zeroing)
 src/mmu.js            host-assisted MMU: table walk, shadow mapping, mirror
+src/dma.js            host-arbitrated DMA: CB chain walk + transfer engine
 src/main.js           browser host loop (run-until-idle scheduler)
 board/src/lib.rs      board model (UART console FIFO only)
 test/smoke.mjs        guest-driven end-to-end test (node)
@@ -376,3 +423,14 @@ dist/                 production bundle
   guest handshakes on the reflected status and finishes with an
   MMU_DONE write (0x3F00D004, like TMR_DONE); alias VA 0x80000000→
   PA 0x200000 + shadow-code call; `mmu` program + probe
+- M13 — DMA: BCM2835 DMA channel 0 window (0x3F007000, real CS/
+  CONBLK_AD layout + the real DMA_ENABLE at 0x3F00E050); the host
+  performs the chain between slices; the guest builds a 3-CB chain
+  (copy/relay/fill), INTEN (host extension, bit 31) on the final CB
+  drives the IC's DMA0 line, END/INT latched in CS and INT cleared by
+  write-mask; interrupt-safety fixes: the vector glue preserves x30
+  (the `bl` to the Rust handler must not redirect the guest's next
+  `ret`), poll/delay loops keep their state in callee-saved registers,
+  and the host masks the DMA0 pending bit once INT is cleared (no
+  stale-window re-delivery); DMA_DONE (0x3F00E054) protocol; `dma`
+  program + probe

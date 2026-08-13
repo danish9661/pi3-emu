@@ -80,7 +80,9 @@ core::arch::global_asm!(
     "  b .", // 0x780 aarch32 err
     "  .org 0x800",
     "irq_glue:",
-    "  bl irq_handler_rust",
+    "  stp x29, x30, [sp, #-16]!", // preserve the guest's LR: the bl below
+    "  bl irq_handler_rust", //      clobbers x30 and the resumed code must
+    "  ldp x29, x30, [sp], #16", // not `ret` into the glue
     "  movz w0, #1",
     "  movz w1, #0xb22c",
     "  movk w1, #0x3f00, lsl #16",

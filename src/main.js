@@ -1,6 +1,7 @@
 import './styles.css';
 import { parseElf, loadElf } from './elf.js';
 import { mmuEnable, mmuMirrorWrite } from './mmu.js';
+import { dmaRunChain } from './dma.js';
 
 const UART_WINDOW = 0x1000;
 const TX_SLOT_STRIDE = 4;
@@ -90,6 +91,25 @@ let mmuHook = null;
 let mmuCtl = 0;
 let mmuDone = false;
 
+// Host-arbitrated BCM2835 DMA controller (see dma.js): channel 0 registers at
+// 0x3F007000 (CS +0x00, CONBLK_AD +0x04), the real ENABLE at 0x3F00E050, and a
+// DONE host extension at +0x54. ACTIVE starts the chain; the host performs the
+// transfers between slices and latches CS.END + CS.INT (INTEN on the final CB
+// drives the IC's DMA0 line, bit 16).
+const DMA_BASE = 0x3F007000;
+const DMA_CS = DMA_BASE + 0x00;
+const DMA_CONBLK = DMA_BASE + 0x04;
+const DMA_ENABLE = 0x3F00E050;
+const DMA_DONE = 0x3F00E054;
+const IRQ_DMA0 = 1 << 16;
+const DMA_MAX_SLICES = 30000;
+let dmaInt = false;
+let dmaEnd = false;
+let dmaEnable = 0;
+let dmaLastCS = 0;
+let dmaDone = false;
+let dmaIntSeen = false;
+
 export const PROGRAMS = {
   shell: 'shell.elf',
   sum: 'sum.elf',
@@ -100,6 +120,7 @@ export const PROGRAMS = {
   fb: 'fb.elf',
   irq: 'irq.elf',
   mmu: 'mmu.elf',
+  dma: 'dma.elf',
 };
 
 const term = document.getElementById('term');
@@ -169,6 +190,8 @@ function boot(ucMod, uc, board, elf) {
   uc.mem_map(MBOX_WINDOW, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(GPIO_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(MMU_CTL, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  uc.mem_map(DMA_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  uc.mem_map(0x3F00E000, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.devUart = { base: uart };
   uc.entry = elf.entry;
   tmrWall0 = performance.now();
@@ -199,6 +222,12 @@ function boot(ucMod, uc, board, elf) {
   }
   mmuState = null;
   mmuCtl = 0;
+  dmaInt = false;
+  dmaEnd = false;
+  dmaEnable = 0;
+  dmaLastCS = 0;
+  dmaDone = false;
+  dmaIntSeen = false;
 
   loadElf(uc, elf);
 }
@@ -327,6 +356,7 @@ function syncIcOut(uc) {
   let p1 = 0;
   if (tmrPending & 4) p1 |= IC_IRQ_TIMER1; // CS bit 2 = the irq guest's C1 (0x3014)
   if (uc.mem_read(rxSlot, 1)[0] !== 0) p1 |= IC_IRQ_UART; // RX byte waiting
+  if (dmaInt && (dmaEnable & 1)) p1 |= IRQ_DMA0; // DMA channel 0 completion
   writeU32(uc, IC_PENDING_BASIC, p1);
   writeU32(uc, IC_PENDING1, p1);
   writeU32(uc, IC_PENDING2, 0);
@@ -363,7 +393,11 @@ let irqVector = 0;
 let irqResume = 0;
 
 function irqDeliver(uc) {
-  const pending = readU32(uc, IC_PENDING1) & icEnabled1;
+  let pending = readU32(uc, IC_PENDING1) & icEnabled1;
+  // The PENDING1 window is refreshed before each slice, so it can still hold
+  // the DMA0 bit after the guest has cleared CS.INT. Re-derive the line from
+  // host state: once INT is cleared, a stale window must not re-deliver.
+  if (!(dmaInt && (dmaEnable & 1))) pending &= ~IRQ_DMA0;
   if (!pending || irqInFlight) return;
   if (mode === SMP_MODE) return;
   irqElr = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry;
@@ -621,6 +655,40 @@ function syncMmuIn(uc) {
   }
 }
 
+// DMA window: the host refreshes CS (END/INT flags) and ENABLE before each
+// slice, then pulls the guest's writes out after it. An ACTIVE rise starts
+// the chain (the host performs the transfers); the INT clear must be gated
+// on the host having latched INT, or the same-slice ACTIVE write (which has
+// no bit 4) would wipe a freshly latched dmaInt.
+function syncDmaOut(uc) {
+  let cs = 0;
+  if (dmaEnd) cs |= 2;
+  if (dmaInt) cs |= 4;
+  writeU32(uc, DMA_CS, cs);
+  dmaLastCS = cs;
+  writeU32(uc, DMA_ENABLE, dmaEnable);
+}
+function syncDmaIn(uc) {
+  const cs = readU32(uc, DMA_CS);
+  const conblk = readU32(uc, DMA_CONBLK);
+  dmaEnable = readU32(uc, DMA_ENABLE);
+  if (readU32(uc, DMA_DONE) !== 0) dmaDone = true;
+  if (cs & (1 << 31)) {
+    dmaEnd = false;
+    dmaInt = false;
+  } else {
+    if ((cs & 1) && !(dmaLastCS & 1) && conblk !== 0 && (dmaEnable & 1)) {
+      const r = dmaRunChain(uc, conblk);
+      dmaEnd = true;
+      if (r.int) {
+        dmaInt = true;
+        dmaIntSeen = true;
+      }
+    }
+    if (dmaInt && (dmaLastCS & 4) !== 0 && (cs & 4) === 0) dmaInt = false; // guest cleared INT
+  }
+}
+
 function runSlice(count) {
   const pc = irqResume || irqVector || Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry;
   if (irqResume) irqInFlight = false;
@@ -631,6 +699,7 @@ function runSlice(count) {
   syncGpioOut(uc);
   syncIcOut(uc);
   syncMmuOut(uc);
+  syncDmaOut(uc);
   const t0 = performance.now();
   uc.emu_start(pc, 0, 0, count);
   stats.emuMs += performance.now() - t0;
@@ -642,6 +711,7 @@ function runSlice(count) {
   syncIcIn(uc);
   syncIrqRet(uc);
   syncMmuIn(uc);
+  syncDmaIn(uc);
   pumpUart(ucMod, uc, board);
   const out = drain(board);
   irqDeliver(uc);
@@ -710,6 +780,25 @@ function runUntilMmuDone() {
     }
   }
   if (!mmuDone) setStatus('warn: mmu guest did not reach DONE');
+  return out;
+}
+
+// The dma guest finishes its chain work and verification in one burst after
+// the host performs the transfers, so it uses the same explicit-done
+// protocol: slices until the guest writes DMA_DONE.
+function runUntilDmaDone() {
+  let out = '';
+  dmaDone = false;
+  for (let i = 0; i < DMA_MAX_SLICES; i++) {
+    const o = runSlice(SLICE_INSNS);
+    out += o;
+    updateStats();
+    if (dmaDone) {
+      out += drain(board);
+      break;
+    }
+  }
+  if (!dmaDone) setStatus('warn: dma guest did not reach DONE');
   return out;
 }
 
@@ -933,6 +1022,13 @@ async function run() {
       draw(runUntilMmuDone()); // guest builds page tables, host walks them on MMU_CTL
       setStatus(
         `booted — running mmu — host-assisted MMU @ 0x3F00D000 — press Reboot to re-run`
+      );
+    } else if (progSel.value === 'dma') {
+      mode = 'dma';
+      boot(ucMod, uc, board, elf);
+      draw(runUntilDmaDone()); // host performs the 3-CB chain between slices
+      setStatus(
+        `booted — running dma — BCM2835 DMA @ 0x3F007000 — 3-CB chain + completion IRQ — press Reboot to re-run`
       );
     } else {
       mode = 'single';
