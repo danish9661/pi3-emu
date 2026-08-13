@@ -45,6 +45,50 @@ h1 {
   gap: 12px;
 }
 
+.gpiopanel {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  background: #0e141a;
+  border: 1px solid #26313c;
+  border-radius: 6px;
+}
+
+.gpio-tag {
+  font-size: 11px;
+  color: #7f95a8;
+}
+
+.gpio-leds {
+  display: flex;
+  gap: 8px;
+}
+
+.led {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #1c2731;
+  border: 1px solid #26313c;
+  transition: background 0.08s, box-shadow 0.08s;
+}
+
+.led.on {
+  background: #ff3b30;
+  box-shadow: 0 0 10px #ff3b30;
+}
+
+.gpio-btn {
+  background: #2b3a4a;
+  padding: 8px 14px;
+}
+
+.gpio-btn.held {
+  background: #ff9500;
+}
+
 button {
   background: #1d6f42;
   border: none;

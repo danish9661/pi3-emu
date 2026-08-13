@@ -10,6 +10,11 @@
       <h1>RPi 3 (BCM2837) emulator spike</h1>
       <p class="sub">CPU: unicorn.js (QEMU TCG, AArch64 core) · Board: Rust → wasm · UART @ 0x3F201000 — type HI, RPI or HELP</p>
       <pre id="term" tabindex="0"></pre>
+      <div id="gpiopanel" class="gpiopanel" hidden>
+        <div class="gpio-tag">GPIO 21..28</div>
+        <div class="gpio-leds" id="gpio-leds"></div>
+        <button id="gpio-btn" class="gpio-btn" type="button">BTN 29 (hold)</button>
+      </div>
       <div class="hint" id="hint">click the terminal, then type (or use the keys below)</div>
       <div class="osk" id="osk">
         <button class="k" data-keys="HI">HI</button>
@@ -26,6 +31,7 @@
           <option value="fib">fib</option>
           <option value="smp">smp (4 cores)</option>
           <option value="clock">clock (system timer)</option>
+          <option value="gpio">gpio (LEDs + button)</option>
         </select>
         <button id="run">Run</button>
         <span id="status">loading...</span>

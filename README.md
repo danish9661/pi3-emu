@@ -126,6 +126,30 @@ The request buffer lives in its own linker section (`.mbox` at
 0x300000) — the guest `.bss` had grown into the TCG env-hazard zone and
 the mailbox round-trip was corrupted intermittently.
 
+## GPIO (0x3F200000, real BCM2837 layout)
+
+Output pins are host-arbitrated like the timer: the host pulls `GPSET0`/
+`GPCLR0` out of the window after each slice (write-1 latches) and
+refreshes `GPLEV0` before each slice so input pins reflect the UI. The
+`gpio` program configures pins 21..28 as outputs and pin 29 as an input
+with a proper `GPPUD`/`GPPUDCLK0` pull-down sequence, runs a
+knight-rider chase across the 8 LEDs timed by the system timer, then
+polls BTN 29 and reports each press edge:
+
+```
+> gpio
+gpio: LEDs 21..28 output, BTN 29 input (pull-down)
+chase:
+...
+chase done - hold BTN 29
+button: 1 pressed
+```
+
+The page shows 8 live LED dots and a hold-button next to the terminal;
+the chase is paced with `requestAnimationFrame` (slices run for ~16 ms
+per frame), so the LEDs visibly blink instead of finishing inside one
+synchronous run.
+
 ## Programs
 
 | Program | What it does |
@@ -135,6 +159,7 @@ the mailbox round-trip was corrupted intermittently.
 | `fib`   | enter: prints fibonacci `0..12` (13 terms) |
 | `smp`   | auto-runs: 4 cores launch through the mailbox, sum quarters of 1..100, mailbox tally, joined counter (Reboot to re-run) |
 | `clock` | auto-runs: real 1 s timer sleep, C1 compare + M1 match, W1C-style clear (Reboot to re-run) |
+| `gpio`  | auto-runs: LED knight-rider chase on pins 21..28, then polls BTN 29 (LED panel + button in the page) |
 
 Backspace (`⌫`) sends 0x7F; the guest unwrites its line buffer and the
 host trims the display. The terminal auto-focuses on boot; an on-screen
@@ -156,6 +181,7 @@ node test/stats-probe.mjs        # PC/SP/MIPS after one slice of shell.elf
 node test/smp-probe.mjs          # 4-core SMP run: launch, mailbox, counter, park
 node test/clock-probe.mjs        # system timer: 1 s sleep, compare/match, clear
 node test/mbox-probe.mjs         # VideoCore mailbox: full property query response
+node test/gpio-probe.mjs         # GPIO: LED chase toggles + button press edges
 node test/branch-probe.mjs       # condition/branch encoding probes (15)
 node test/csel-probe.mjs         # csel probe (8)
 ```
@@ -206,3 +232,7 @@ dist/                 production bundle
   host answers board identity/clock queries, multi-byte values serialized
   properly (byte truncation fixed), `.mbox` linker section moves the
   buffer out of the TCG env-hazard zone, `mbox` command + probe
+- M9 — GPIO: real BCM2837 GPIO window, host-arbitrated GPSET/GPCLR/
+  GPLEV (write-1 latches + refreshed input levels), pull-down button,
+  LED knight-rider chase timed by the system timer, rAF-paced chase so
+  the page's LED panel visibly blinks, `gpio` program + probe

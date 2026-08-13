@@ -33,6 +33,19 @@ const TMR_DONE = TMR_BASE + 0x20;
 const CLOCK_MODE = 'clock';
 const CLOCK_MAX_SLICES = 60000;
 
+// BCM2837 GPIO (real layout). Writes are host-arbitrated like the timer:
+// the host pulls GPSET/GPCLR out of the window after each slice to track
+// output levels, and refreshes GPLEV before each slice so input pins show
+// the UI button. The 8 LEDs live on pins 21..28, the button on pin 29.
+const GPIO_BASE = 0x3F200000;
+const GPIO_WINDOW = GPIO_BASE; // already 4K-aligned
+const GPSET0 = GPIO_BASE + 0x1C;
+const GPCLR0 = GPIO_BASE + 0x28;
+const GPLEV0 = GPIO_BASE + 0x34;
+const GPIO_LEDS = [21, 22, 23, 24, 25, 26, 27, 28];
+const GPIO_BTN = 29;
+const GPIO_MODE = 'gpio';
+
 // BCM2837 mailbox (VideoCore interface, real layout). The guest writes a
 // tag-buffer address to MAIL1_WRITE (channel 8); the host, playing the
 // VideoCore, parses the request at the slice boundary, answers the known
@@ -69,6 +82,7 @@ export const PROGRAMS = {
   fib: 'fib.elf',
   smp: 'smp.elf',
   clock: 'clock.elf',
+  gpio: 'gpio.elf',
 };
 
 const term = document.getElementById('term');
@@ -77,6 +91,9 @@ const runBtn = document.getElementById('run');
 const progSel = document.getElementById('prog');
 const statsEl = document.getElementById('stats');
 const hint = document.getElementById('hint');
+const gpioPanel = document.getElementById('gpiopanel');
+const gpioLedsEl = document.getElementById('gpio-leds');
+const gpioBtnEl = document.getElementById('gpio-btn');
 
 let ucMod = null;
 let uc = null;
@@ -95,6 +112,10 @@ let clockDone = false;
 let mbxLastWrite = 0; // last MAIL1_WRITE value the host mirrored
 let mbxPending = false; // a reply is ready in MAIL0_READ
 let mbxAddr = 0; // reply address | channel
+
+let gpioOut = 0; // guest-driven output levels (built from GPSET/GPCLR)
+let gpioBtn = 0; // host-driven input: button pin high while held
+let gpioLedEls = null; // DOM spans for the LED panel
 
 let stats = { steps: 0, insns: 0, emuMs: 0, chars: 0, wallStart: 0 };
 
@@ -127,6 +148,7 @@ function boot(ucMod, uc, board, elf) {
   uc.mem_map(uart, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(TMR_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(MBOX_WINDOW, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  uc.mem_map(GPIO_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.devUart = { base: uart };
   uc.entry = elf.entry;
   tmrWall0 = performance.now();
@@ -137,6 +159,8 @@ function boot(ucMod, uc, board, elf) {
   mbxLastWrite = 0;
   mbxPending = false;
   mbxAddr = 0;
+  gpioOut = 0;
+  gpioBtn = 0;
 
   loadElf(uc, elf);
 }
@@ -207,6 +231,41 @@ function syncMailboxIn(uc) {
   }
 }
 
+// GPIO: refresh input levels (GPLEV = guest outputs + host button) before a
+// slice, then pull GPSET/GPCLR out after it. GPSET/GPCLR stay set in the
+// window (real semantics: write-1 registers), so level tracking is monotone:
+// a bit set in GPSET latches the output high, a bit set in GPCLR latches low.
+function syncGpioOut(uc) {
+  const host = gpioBtn ? (1 << GPIO_BTN) : 0;
+  writeU32(uc, GPLEV0, (gpioOut & ~(1 << GPIO_BTN)) | host);
+  writeU32(uc, GPLEV0 + 4, 0); // pins 32..53 stay low
+}
+
+function syncGpioIn(uc) {
+  const set = readU32(uc, GPSET0);
+  const clr = readU32(uc, GPCLR0);
+  gpioOut = (gpioOut | set) & ~clr;
+  updateGpioPanel();
+}
+
+// The 8 LED dots mirror the guest-driven levels (red = on).
+function updateGpioPanel() {
+  if (mode !== GPIO_MODE || !gpioPanel) return;
+  if (!gpioLedEls) {
+    gpioLedEls = [];
+    for (const p of GPIO_LEDS) {
+      const el = document.createElement('span');
+      el.className = 'led';
+      el.title = 'GPIO ' + p;
+      gpioLedsEl.appendChild(el);
+      gpioLedEls.push(el);
+    }
+  }
+  for (let i = 0; i < GPIO_LEDS.length; i++) {
+    gpioLedEls[i].classList.toggle('on', (gpioOut & (1 << GPIO_LEDS[i])) !== 0);
+  }
+}
+
 // Refresh the timer device from the wall clock before a slice runs: CLO/CHI
 // tick in microseconds since program boot, and each compare register sets
 // its CS match bit once when the counter first crosses it (edge-triggered).
@@ -232,7 +291,7 @@ function syncTimerIn(uc) {
   for (let i = 0; i < 4; i++) tmrCompares[i] = readU32(uc, TMR_CMP + i * 4);
   const cs = readU32(uc, TMR_CS);
   if (cs !== tmrLastCS) tmrPending &= cs & 0xf; // guest rewrote the status mask
-  if (mode === CLOCK_MODE) {
+  if (mode === CLOCK_MODE || mode === GPIO_MODE) {
     const d = readU32(uc, TMR_DONE);
     if (d !== 0) clockDone = true;
   }
@@ -366,6 +425,7 @@ function runSlice(count) {
   const pc = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry;
   syncTimerOut(uc);
   syncMailboxOut(uc);
+  syncGpioOut(uc);
   const t0 = performance.now();
   uc.emu_start(pc, 0, 0, count);
   stats.emuMs += performance.now() - t0;
@@ -373,6 +433,7 @@ function runSlice(count) {
   stats.insns += count;
   syncTimerIn(uc);
   syncMailboxIn(uc);
+  syncGpioIn(uc);
   pumpUart(ucMod, uc, board);
   return drain(board);
 }
@@ -404,10 +465,10 @@ function updateStats() {
     `<span><span class="k">chars</span> ${stats.chars}</span>`;
 }
 
-// The clock guest sleeps for a real wall-clock second, which the idle
-// heuristic can't tell apart from an infinite spin, so it uses the same
+// The clock and gpio guests sleep for real wall-clock time, which the idle
+// heuristic can't tell apart from an infinite spin, so they use the same
 // explicit-done protocol as smp: slices until the guest writes TMR_DONE.
-function clockRun() {
+function runUntilDone() {
   let out = '';
   clockDone = false;
   for (let i = 0; i < CLOCK_MAX_SLICES; i++) {
@@ -419,8 +480,37 @@ function clockRun() {
       break;
     }
   }
-  if (!clockDone) setStatus('warn: clock guest did not reach DONE');
+  if (!clockDone) setStatus('warn: guest did not reach DONE');
   return out;
+}
+
+// The gpio chase is paced in animation frames: slices run for ~16 ms of wall
+// time per frame, so the browser paints the LED panel between frames and the
+// knight-rider chase is actually visible (the guest sleeps by the same wall
+// clock, so emulated time keeps pace with the display).
+let gpioLoopActive = false;
+let gpioFrame = 0;
+function gpioRun() {
+  let out = '';
+  clockDone = false;
+  gpioLoopActive = true;
+  const frame = () => {
+    const t0 = performance.now();
+    do {
+      out += runSlice(SLICE_INSNS);
+      if (clockDone) break;
+    } while (performance.now() - t0 < 16);
+    draw(out);
+    out = '';
+    updateStats();
+    if (clockDone) {
+      gpioLoopActive = false;
+      setStatus('booted — running gpio — GPIO @ 0x3F200000 — chase done — hold BTN 29 to press');
+      return;
+    }
+    gpioFrame = requestAnimationFrame(frame);
+  };
+  gpioFrame = requestAnimationFrame(frame);
 }
 
 // The guest drives itself: it prints to the UART TX slots (one char per
@@ -483,8 +573,11 @@ function tapKeys(btn) {
 }
 
 async function run() {
+  cancelAnimationFrame(gpioFrame);
+  gpioLoopActive = false;
   runBtn.disabled = true;
   term.textContent = '';
+  gpioPanel.hidden = true;
   stats = { steps: 0, insns: 0, emuMs: 0, chars: 0, wallStart: performance.now() };
   statsEl.textContent = '';
   try {
@@ -509,10 +602,17 @@ async function run() {
     } else if (progSel.value === CLOCK_MODE) {
       mode = CLOCK_MODE;
       boot(ucMod, uc, board, elf);
-      draw(clockRun()); // runs until the guest writes TMR_DONE
+      draw(runUntilDone()); // runs until the guest writes TMR_DONE
       setStatus(
         `booted — running clock — BCM system timer @ 0x3F003000 — press Reboot to re-run`
       );
+    } else if (progSel.value === GPIO_MODE) {
+      mode = GPIO_MODE;
+      gpioPanel.hidden = false;
+      boot(ucMod, uc, board, elf);
+      updateGpioPanel();
+      gpioRun(); // async: rAF-paced slices, chase visibly blinks the LEDs
+      setStatus(`booted — running gpio — GPIO @ 0x3F200000 — chase in progress`);
     } else {
       mode = 'single';
       boot(ucMod, uc, board, elf);
@@ -530,11 +630,24 @@ async function run() {
   }
 }
 
+// The GPIO button is a host-side input: while held, the host drives BTN 29
+// high in GPLEV, and slices are resumed so the guest's poll loop sees it.
+// (During the rAF-paced chase the frame loop advances the guest itself.)
+function pressGpioBtn(down) {
+  if (!uc || runBtn.disabled || mode !== GPIO_MODE) return;
+  gpioBtn = down ? 1 : 0;
+  gpioBtnEl.classList.toggle('held', !!down);
+  if (!gpioLoopActive) draw(runUntilIdle());
+}
+
 window.addEventListener('keydown', handleKey);
 term.addEventListener('click', () => term.focus());
 document.querySelectorAll('.osk button').forEach((btn) =>
   btn.addEventListener('click', () => tapKeys(btn))
 );
+gpioBtnEl.addEventListener('pointerdown', () => pressGpioBtn(true));
+gpioBtnEl.addEventListener('pointerup', () => pressGpioBtn(false));
+gpioBtnEl.addEventListener('pointerleave', () => pressGpioBtn(false));
 window.addEventListener('error', (e) => {
   setStatus('ERROR: ' + (e.message || e.type));
 });
