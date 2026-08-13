@@ -1,6 +1,7 @@
 ENTRY(_start)
 SECTIONS {
   . = 0x100000;
+  .vectors : ALIGN(128) { KEEP(*(.vectors)) }
   .text : { KEEP(*(.text._start)) *(.text*) }
   .rodata : { *(.rodata*) *(.rodata.*) }
   .data : { *(.data*) *(.got*) }

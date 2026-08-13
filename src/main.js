@@ -84,6 +84,7 @@ export const PROGRAMS = {
   clock: 'clock.elf',
   gpio: 'gpio.elf',
   fb: 'fb.elf',
+  irq: 'irq.elf',
 };
 
 const term = document.getElementById('term');
@@ -169,6 +170,13 @@ function boot(ucMod, uc, board, elf) {
   fbDepth = 0;
   fbPitch = 0;
   fbReady = false;
+  icEnabled1 = 0;
+  icEnabled2 = 0;
+  icEnabledBasic = 0;
+  irqElr = 0;
+  irqInFlight = false;
+  irqVector = 0;
+  irqResume = 0;
 
   loadElf(uc, elf);
 }
@@ -226,13 +234,15 @@ function mboxProcess(uc) {
 // depth, pixel order) and allocates a buffer; the host carves it out of
 // guest RAM and blits it to the canvas every animation frame.
 const FB_MODE = 'fb';
+let fbFrame = 0;
+const IRQ_MODE = 'irq';
+let irqFrame = 0;
 const FB_ADDR = 0x200000; // allocated framebuffer inside guest RAM
 let fbW = 0;
 let fbH = 0;
 let fbDepth = 0;
 let fbPitch = 0;
 let fbReady = false;
-let fbFrame = 0;
 
 function fbTag(uc, addr, off, id, tsize) {
   const v = addr + off + 12;
@@ -263,6 +273,89 @@ function fbTag(uc, addr, off, id, tsize) {
       return true;
     default:
       return false;
+  }
+}
+
+// ---- BCM2835 interrupt controller (0x3F00B200): the "basic" pending
+// register and pending 1 share the same 32 lines; we model pending-1 with
+// the timer (bit 29) and PL011 UART (bit 31) sources driven by host state,
+// plus enable/disable masks the guest writes. ----
+
+const IC_BASE = 0x3F00B200;
+const IC_PENDING_BASIC = IC_BASE + 0x00;
+const IC_PENDING1 = IC_BASE + 0x04;
+const IC_PENDING2 = IC_BASE + 0x08;
+const IC_ENABLE_IRQS1 = IC_BASE + 0x10;
+const IC_ENABLE_IRQS2 = IC_BASE + 0x14;
+const IC_ENABLE_BASIC = IC_BASE + 0x18;
+const IC_DISABLE_IRQS1 = IC_BASE + 0x1C;
+const IC_DISABLE_IRQS2 = IC_BASE + 0x20;
+const IC_DISABLE_BASIC = IC_BASE + 0x24;
+const IC_IRQ_TIMER1 = 1 << 29; // system timer compare 1
+const IC_IRQ_UART = 1 << 31; // PL011 UART
+
+let icEnabled1 = 0;
+let icEnabled2 = 0;
+let icEnabledBasic = 0;
+
+// Pending lines are derived from the device state before every slice, and
+// enable/disable writes are pulled out after it (write-mask semantics, like
+// the other host-arbitrated windows).
+function syncIcOut(uc) {
+  let p1 = 0;
+  if (tmrPending & 4) p1 |= IC_IRQ_TIMER1; // CS bit 2 = the irq guest's C1 (0x3014)
+  if (uc.mem_read(rxSlot, 1)[0] !== 0) p1 |= IC_IRQ_UART; // RX byte waiting
+  writeU32(uc, IC_PENDING_BASIC, p1);
+  writeU32(uc, IC_PENDING1, p1);
+  writeU32(uc, IC_PENDING2, 0);
+}
+
+function syncIcIn(uc) {
+  const en = readU32(uc, IC_ENABLE_IRQS1);
+  const dis = readU32(uc, IC_DISABLE_IRQS1);
+  if (en) writeU32(uc, IC_ENABLE_IRQS1, 0);
+  if (dis) writeU32(uc, IC_DISABLE_IRQS1, 0);
+  icEnabled1 = (icEnabled1 | en) & ~dis;
+  const en2 = readU32(uc, IC_ENABLE_IRQS2);
+  const dis2 = readU32(uc, IC_DISABLE_IRQS2);
+  if (en2) writeU32(uc, IC_ENABLE_IRQS2, 0);
+  if (dis2) writeU32(uc, IC_DISABLE_IRQS2, 0);
+  icEnabled2 = (icEnabled2 | en2) & ~dis2;
+  const enB = readU32(uc, IC_ENABLE_BASIC);
+  const disB = readU32(uc, IC_DISABLE_BASIC);
+  if (enB) writeU32(uc, IC_ENABLE_BASIC, 0);
+  if (disB) writeU32(uc, IC_DISABLE_BASIC, 0);
+  icEnabledBasic = (icEnabledBasic | enB) & ~disB;
+}
+
+// Deliver a pending, enabled IRQ at a slice boundary. reg_write(PC/ELR) is a
+// no-op in this unicorn build, so the delivery is host-assisted: the next
+// slice *starts* at the IRQ vector (VBAR + 0x280), and the vector stub
+// signals IRQ_RET when the handler is done — the host then resumes the guest
+// at the saved PC. While a handler is in flight no further delivery happens
+// (the DAIF.I mask is not observable through this build's PSTATE).
+const IC_IRQ_RET = IC_BASE + 0x2C;
+let irqElr = 0;
+let irqInFlight = false;
+let irqVector = 0;
+let irqResume = 0;
+
+function irqDeliver(uc) {
+  const pending = readU32(uc, IC_PENDING1) & icEnabled1;
+  if (!pending || irqInFlight) return;
+  if (mode === SMP_MODE) return;
+  irqElr = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry;
+  irqInFlight = true;
+  const vbar = Number(uc.reg_read_i32(ucMod.ARM64_REG_VBAR_EL1)) || 0x100000;
+  irqVector = vbar + 0x280;
+}
+
+// Pull the guest's "handler finished" write out of the IC window.
+function syncIrqRet(uc) {
+  const r = readU32(uc, IC_IRQ_RET);
+  if (r !== 0) {
+    writeU32(uc, IC_IRQ_RET, 0);
+    irqResume = irqElr;
   }
 }
 
@@ -344,7 +437,11 @@ function syncTimerOut(uc) {
 }
 
 function syncTimerIn(uc) {
-  for (let i = 0; i < 4; i++) tmrCompares[i] = readU32(uc, TMR_CMP + i * 4);
+  for (let i = 0; i < 4; i++) {
+    const c = readU32(uc, TMR_CMP + i * 4);
+    if (c !== tmrCompares[i]) tmrCrossed[i] = false; // re-armed compare
+    tmrCompares[i] = c;
+  }
   const cs = readU32(uc, TMR_CS);
   if (cs !== tmrLastCS) tmrPending &= cs & 0xf; // guest rewrote the status mask
   if (mode === CLOCK_MODE || mode === GPIO_MODE) {
@@ -478,10 +575,14 @@ function smpRun() {
 }
 
 function runSlice(count) {
-  const pc = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry;
+  const pc = irqResume || irqVector || Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry;
+  if (irqResume) irqInFlight = false;
+  irqResume = 0;
+  irqVector = 0;
   syncTimerOut(uc);
   syncMailboxOut(uc);
   syncGpioOut(uc);
+  syncIcOut(uc);
   const t0 = performance.now();
   uc.emu_start(pc, 0, 0, count);
   stats.emuMs += performance.now() - t0;
@@ -490,8 +591,12 @@ function runSlice(count) {
   syncTimerIn(uc);
   syncMailboxIn(uc);
   syncGpioIn(uc);
+  syncIcIn(uc);
+  syncIrqRet(uc);
   pumpUart(ucMod, uc, board);
-  return drain(board);
+  const out = drain(board);
+  irqDeliver(uc);
+  return out;
 }
 
 function updateStats() {
@@ -599,6 +704,24 @@ function blit() {
   fbCtx.putImageData(img, 0, 0);
 }
 
+// The irq guest also never parks (infinite spin with IRQs unmasked), so it
+// runs on rAF slices; deliveries happen at slice boundaries inside runSlice.
+function irqRun() {
+  let out = '';
+  const frame = () => {
+    if (mode !== IRQ_MODE) return;
+    const t0 = performance.now();
+    do {
+      out += runSlice(SLICE_INSNS);
+    } while (performance.now() - t0 < 16);
+    draw(out);
+    out = '';
+    updateStats();
+    irqFrame = requestAnimationFrame(frame);
+  };
+  irqFrame = requestAnimationFrame(frame);
+}
+
 // The guest drives itself: it prints to the UART TX slots (one char per
 // slice) and parks in getc until a key arrives. Run slices until the guest
 // has gone quiet for two consecutive slices — i.e. it is back waiting for
@@ -627,6 +750,13 @@ function guestKey(code) {
 
 function handleKey(e) {
   if (!uc || runBtn.disabled) return;
+  if (mode === IRQ_MODE) {
+    const c = e.key.length === 1 ? e.key.charCodeAt(0) : e.key === 'Enter' ? 13 : 0;
+    if (!c) return;
+    e.preventDefault();
+    uc.mem_write(rxSlot, [c]); // rx slot -> UART RX IRQ at the next slice
+    return;
+  }
   if (mode === SMP_MODE || mode === FB_MODE) return;
   if (e.key === 'Backspace') {
     e.preventDefault();
@@ -645,6 +775,18 @@ function handleKey(e) {
 // On-screen keyboard: feed the same guestKey path as physical keys.
 function tapKeys(btn) {
   if (!uc || runBtn.disabled) return;
+  if (mode === IRQ_MODE) {
+    const action = btn.dataset.action;
+    if (action === 'enter') {
+      uc.mem_write(rxSlot, [13]);
+    } else if (action === 'bs') {
+      uc.mem_write(rxSlot, [0x7f]);
+    } else {
+      for (const ch of btn.dataset.keys) uc.mem_write(rxSlot, [ch.charCodeAt(0)]);
+    }
+    term.focus();
+    return;
+  }
   if (mode === SMP_MODE || mode === FB_MODE) return;
   const action = btn.dataset.action;
   if (action === 'enter') {
@@ -661,6 +803,7 @@ function tapKeys(btn) {
 async function run() {
   cancelAnimationFrame(gpioFrame);
   cancelAnimationFrame(fbFrame);
+  cancelAnimationFrame(irqFrame);
   gpioLoopActive = false;
   runBtn.disabled = true;
   term.textContent = '';
@@ -708,6 +851,13 @@ async function run() {
       fbRun(); // async: rAF-paced slices + canvas blit every frame
       setStatus(
         `booted — running fb — framebuffer 160x120x32 @ 0x200000 via mailbox — live canvas`
+      );
+    } else if (progSel.value === IRQ_MODE) {
+      mode = IRQ_MODE;
+      boot(ucMod, uc, board, elf);
+      irqRun(); // async: rAF-paced slices, IRQs delivered at slice ends
+      setStatus(
+        `booted — running irq — BCM2835 interrupt controller @ 0x3F00B200 — timer + UART IRQs live`
       );
     } else {
       mode = 'single';

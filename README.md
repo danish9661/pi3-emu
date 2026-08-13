@@ -172,6 +172,46 @@ frame, the guest never parks) and blits the framebuffer to a
 `<canvas>` (scaled 3x, `image-rendering: pixelated`) after every
 batch — a live display until Reboot.
 
+## Interrupt controller (0x3F00B200)
+
+The `irq` program demos host-assisted IRQ delivery. The BCM2837 legacy
+interrupt controller window (0x3F00B200, real register layout) is
+mapped read/write: the host refreshes PENDING1 (0x204) from device
+state each slice and latches ENABLE_IRQS1 (0x210) when the guest arms
+interrupts. The guest installs its own VBAR (vector table at
+0x100280) and the host watches it: on a new delivery the next slice
+starts at the vector instead of the guest's PC.
+
+The guest never sees a real exception — no `eret` in this unicorn
+build, and host writes to ELR_EL1 don't stick — so a delivery is:
+
+1. host saves the interrupted PC (`irqElr`) and runs the next slice
+   from `VBAR+0x280`;
+2. the guest stub (`bl irq_handler_rust; movz/movk; str w0,[x1]; b .`)
+   finishes the handler and writes a magic 1 to IC_IRQ_RET
+   (0x3F00B22C, a host-only extension register);
+3. the host sees the write at the next slice boundary, clears it and
+   resumes the guest at `irqElr`.
+
+IRQ 29 (system timer C1 match at 0x3F003014) drives a 1 s heartbeat;
+IRQ 31 (UART RX slot non-empty) fires when a key arrives — the guest
+handler prints `[irq key: '...']` and consumes the slot. Only one IRQ
+can be in flight (nested delivery is gated on the handler's return):
+in the same slice a return and a fresh pending bit can both appear —
+the new IRQ is not vectored until the guest actually resumes at
+`irqElr`, so the vector is never dropped. In the browser the guest
+spins with IRQs unmasked, so `irqRun()` advances slices on rAF; keys
+write the RX slot and the IRQ is delivered at the next slice boundary.
+
+```
+> irq
+irq: BCM2835 interrupt controller @ 0x3F00B200
+irq: timer C1 + UART RX armed, IRQ enabled
+[irq #1 t+1s]
+[irq key: 'H']
+[irq #2 t+1s]
+```
+
 ## Programs
 
 | Program | What it does |
@@ -183,6 +223,7 @@ batch — a live display until Reboot.
 | `clock` | auto-runs: real 1 s timer sleep, C1 compare + M1 match, W1C-style clear (Reboot to re-run) |
 | `gpio`  | auto-runs: LED knight-rider chase on pins 21..28, then polls BTN 29 (LED panel + button in the page) |
 | `fb`    | auto-runs: allocates a 160x120x32 framebuffer via mailbox, pattern + bouncing-ball animation (live canvas in the page) |
+| `irq`   | auto-runs: arms the legacy interrupt controller, timer C1 heartbeat every 1 s + a UART RX IRQ per key (type to see `[irq key: '...']`) |
 
 Backspace (`⌫`) sends 0x7F; the guest unwrites its line buffer and the
 host trims the display. The terminal auto-focuses on boot; an on-screen
@@ -206,6 +247,7 @@ node test/clock-probe.mjs        # system timer: 1 s sleep, compare/match, clear
 node test/mbox-probe.mjs         # VideoCore mailbox: full property query response
 node test/gpio-probe.mjs         # GPIO: LED chase toggles + button press edges
 node test/fb-probe.mjs           # framebuffer: mailbox allocation, pattern pixels, ball moves
+node test/irq-probe.mjs          # interrupts: timer C1 IRQ 29 + UART RX IRQ 31 delivered, both handlers run
 node test/branch-probe.mjs       # condition/branch encoding probes (15)
 node test/csel-probe.mjs         # csel probe (8)
 ```
@@ -267,3 +309,10 @@ dist/                 production bundle
   the system timer; `fbRun()` advances slices on rAF and blits the
   framebuffer to a 3x pixelated canvas — a live display, `fb` program +
   probe
+- M11 — interrupts: legacy BCM2837 interrupt controller window
+  (0x3F00B200), host-refreshed PENDING1/latched ENABLE_IRQS1, guest
+  VBAR + vector table; host-assisted delivery (slice starts at
+  `VBAR+0x280`, stub signals IC_IRQ_RET, host resumes at the saved PC)
+  since there is no `eret`; timer C1 heartbeat (IRQ 29) + UART RX key
+  IRQ (IRQ 31), one-IRQ-in-flight gating that never drops a vector on
+  the return+pend same-slice edge; `irq` program + probe

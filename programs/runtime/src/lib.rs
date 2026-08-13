@@ -4,7 +4,7 @@
 //!
 //! Device window (0x3F201000, 4 KiB):
 //!   +0x00   TX slot 0 — host drains one char per slice (pulse protocol:
-//!           putc writes a char, then spins until the host clears it)
+//!           putc waits (bounded) until the host clears it)
 //!   +0x80   RX slot  — host writes a byte, getc consumes it
 
 use core::panic::PanicInfo;
@@ -15,7 +15,10 @@ const RX: *mut u32 = (0x3F20_1000 + 0x80) as *mut u32;
 #[inline]
 pub fn putc(c: u8) {
     unsafe {
-        while *UART != 0 {
+        for _ in 0..2000 {
+            if *UART == 0 {
+                break;
+            }
             core::hint::spin_loop();
         }
         *UART = c as u32;
