@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["runtime", "clock", "shell", "sum", "fib", "smp", "gpio", "fb", "irq", "mmu", "dma", "pwm", "i2c", "spi", "uart1", "sd", "uart0"]
+members = ["runtime", "clock", "shell", "sum", "fib", "smp", "gpio", "fb", "irq", "mmu", "dma", "pwm", "i2c", "spi", "uart1", "sd", "uart0", "irqcore"]
 
 [profile.release]
 opt-level = "s"

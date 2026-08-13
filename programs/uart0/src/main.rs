@@ -151,6 +151,7 @@ pub extern "C" fn rust_main() -> ! {
             "mov x0, #0x100000",
             "msr vbar_el1, x0",
             "msr daifclr, #2",
+            out("x0") _,
             options(nostack)
         );
         mmio_write(IMSC, RXIM); // arm RXINTR
