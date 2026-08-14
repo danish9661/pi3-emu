@@ -130,8 +130,9 @@ Verified semantics (irqcore guest + probe, 13/13 PASS):
   4 cntpct, 5 env.pc, 6/7 delivery counters, 8/9/10 last-TB ring.
   NOTE: arm64_debug returns a BigInt — Number() it before comparisons.
 
-### Phase 2a — BCM2836 local interrupt block (DONE, uncommitted)
+### Phase 2a — BCM2836 local interrupt block (DONE, committed 2b79e05)
 
+- COMMITTED + pushed (2b79e05); README History M20 entry written.
 - src/localint.js: window model at 0x40000000 (CONTROL/PRESCALER/
   GPU_ROUTING/FIQ_ROUTING/CORE_TIMER_CTRL/MAILBOX_CTRL per core +
   CORE_IRQ_SRC/CORE_FIQ_SRC at +0x60/+0x70); source bits 0 CNTPSIRQ,
@@ -166,10 +167,54 @@ Verified semantics (irqcore guest + probe, 13/13 PASS):
   select resetting to "" → PROGRAMS[undefined]).
 - test/lirq-probe.mjs 14/14 PASS; browser E2E /tmp/opencode/
   lirq-e2e.mjs prints "lirq: A and B delivered"; 19/19 regression.
-- COMMIT CHECKLIST (pending): programs/lirq/, src/localint.js,
-  src/main.js, index.html, test/lirq-probe.mjs, public/programs/
-  lirq.elf + irqcore.elf, build-programs.sh, programs/Cargo.toml/
-  Cargo.lock; README History M20 entry written; push.
+
+### Phase 2a-MMU — REAL MMU in the rebuilt core (DONE, uncommitted)
+
+- mva guest (programs/mva/): enables SCTLR_EL1.M/C/I with real 4K-granule
+  LPAE stage-1 tables — T0SZ=25 (39-bit VA), TTBR0_EL1 at 0x280000, MAIR
+  attr0=0xFF — then keeps executing (identity code path), stores through
+  an alias, verifies both PAs agree, prints PASS (test/mva-probe.mjs 7/7).
+- Tables: L0[0]=0x401 (1G identity block, VA 0..1G == PA), L0[2] at
+  L0+16=0x282003 (table -> L1B), L1B[0]=0x200401 (2M block VA
+  0x80000000 -> PA 0x200000). NO L2 table — a 2M block descriptor read
+  at level 3 is the reserved encoding (bit1=0 at level 3) -> Translation
+  fault (fsr=6). Block descriptors need bits[1:0]=01, tables 11.
+- Guest init gotchas found by host diagnostics: L0[2] must go at L0+16
+  (8-byte stride, not +8), zeroing loops must run BEFORE the entry
+  writes (an L0 loop with 8*i for i>=1 wipes L0[2] at i=2), tables are
+  written 32-bit (a 64-bit store writes the adjacent cell).
+- Fork facts (QEMU ~4.2 era, NOT 2.5): fork ARMFaultType enum
+  (internals.h:555): 0 None, 1 AccessFlag, 2 Alignment, 3 Background,
+  4 Domain, 5 Permission, 6 Translation, 7 AddressSize, 8 SyncExternal,
+  9 SyncExternalOnWalk. arm_el_is_aa64(env,1) is FALSE on bare-metal
+  reset (SCR_EL3.RW=0, HCR_EL2.RW=0) -> the whole EL1 regime was walked
+  as AArch32 (v6 tables, wrong faults on valid blocks) — fixed in cpu.h
+  to return aa64 for el<=2. T0SZ=25 -> inputsize 39, stride 9, start
+  level 1 -> TTBR0 IS the level-1 table (no separate L0). mmu_idx 0x18
+  = ARMMMUIdx_SE10_1 (8|ARM_MMU_IDX_A 0x10) — secure EL1, no stage-2.
+  ptw reads go through UC-aware address_space_ldq_le (result 2 =
+  MEMTX_ERROR, e.g. unmapped 0x800). mair has no mair_el1 field —
+  record mair0_ns | (mair1_ns << 32).
+- uc_arm64_debug sels extended (all uint64_t, Number() them): 14-29
+  arm64_walk[0..15] (14 ret, 15 fi.type, 16 ttbr0_el1, 17 tcr_el1,
+  18 mair, 19 sctlr_el1, 20/21 last ptw addr/desc, 22 fault va,
+  23 raw core mmu_idx, 24 ttbr used, 25 level, 26 inputsize,
+  27 ptw result, 28 access_type, 29 page_size), 30 ptw read count,
+  31-38/39-46 ptw ring (8 pairs addr/desc), 47 fill count, 48-87 fill
+  ring (5 per fill: va, access_type, mmu_idx, ret, fi.type), 88-111
+  lpae ring (0 mmu_idx, 1 va, 2 ttbr, 3 select, 4 tbi, 5 granule,
+  6 ptw read count, 7 level, 8 inputsize, 9+3n reads up to 5 (addr,
+  desc, result), 18 exit ret, 19 exit fault_type, 20 exit fault_src
+  (1 top-bits, 2 epd, 3 s2 startlevel, 4 invalid desc, 5 AF,
+  6 permission), 21 desc at fault, 22 exit level).
+- Wrapper gotcha: uc_arm64_timer_tick's cntpct is uint64_t — the wasm
+  export needs a BigInt (ccall argTypes 'number' throws "Cannot convert
+  X to a BigInt") — pass BigInt(cntpct) like emu_start does.
+- Regression: 19/19 (branch csel clock dma fb gpio i2c instr irq mbox
+  mmu pwm sd smp stats uart0 uart1 lirq mva), all exit 0.
+- COMMIT CHECKLIST (pending): programs/mva/, test/mva-probe.mjs,
+  public/programs/mva.elf, programs/Cargo.toml/Cargo.lock,
+  build-programs.sh, AGENTS.md; README History M21 entry; push.
 
 ### Phase 2 — real devices
 

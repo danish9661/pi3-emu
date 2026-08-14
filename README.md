@@ -729,5 +729,25 @@ dist/                 production bundle
   → GPU line → local block bit 8 → real vector) whose `str wzr` TMR_CS
   write is a real-time hook that de-asserts the line, so no re-entry;
   the browser ticks the arch timer at the real 19.2 MHz rate during
-  lirq runs; `lirq` program + probe (14/14) + browser E2E, full
-  19-probe regression green
+   lirq runs; `lirq` program + probe (14/14) + browser E2E, full
+   19-probe regression green
+- M21 — the REAL MMU runs in the rebuilt core. The `mva` guest enables
+  SCTLR_EL1.M/C/I with genuine 4K-granule LPAE stage-1 tables (T0SZ=25,
+  TTBR0_EL1 at 0x280000, MAIR attr0=0xFF), keeps executing through the
+  identity-mapped code path, stores via a 2M-block alias
+  (L1B[0]=0x200401, VA 0x80000000 → PA 0x200000) and verifies both PAs
+  agree (PASS, probe 7/7). The hunt was a walk that faulted on a valid
+  chain: the alias went one level too deep — L0[2]→L1B[0]→L2[0] placed
+  a 2M block at level 3, where bit1=0 is the reserved level-3 encoding
+  → Translation fault. Fixing the guest tables dropped the L2
+  indirection. Host side: `uc_arm64_debug` grew walk/fill/lpae
+  diagnostics (sels 14-111: walk results, per-ptw-read addr/desc,
+  per-fill va/access/mmu_idx/ret/fi.type, and an lpae exit ring with
+  fault type, fault source (1 top-bits, 2 epd, 3 s2 startlevel, 4
+  invalid desc, 5 AF, 6 permission), descriptor at fault, and exit
+  level); the fork is QEMU ~4.2-era where `arm_el_is_aa64(env,1)` is
+  false on bare-metal reset — the EL1 regime was being walked as
+  AArch32 until cpu.h forced aa64 for el≤2; wrapper fix: the
+  `uc_arm64_timer_tick` i64 param needs `BigInt(cntpct)` (ccall
+  'number' throws), restoring `lirq` 14/14; full 19-probe regression
+  green
