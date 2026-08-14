@@ -8,6 +8,7 @@ import { createSpi } from './spi.js';
 import { createUart1 } from './uart1.js';
 import { createUart0 } from './uart0.js';
 import { createSdhci } from './sdhci.js';
+import { createLocalInt } from './localint.js';
 
 const UART_WINDOW = 0x1000;
 const RAM_BASE = 0x0;
@@ -188,6 +189,7 @@ export const PROGRAMS = {
   uart1: 'uart1.elf',
   sd: 'sd.elf',
   uart0: 'uart0.elf',
+  lirq: 'lirq.elf',
 };
 
 const term = document.getElementById('term');
@@ -262,6 +264,18 @@ function boot(ucMod, uc, board, elf) {
   uc.mem_map(SPI_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(UART1_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(SD_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  uc.mem_map(LOCAL_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  localInt = createLocalInt(uc, ucMod, LOCAL_BASE, localLines);
+  // Real-time GPU-line de-assert: a guest TMR_CS ack must drop the local
+  // block's line before the handler eret's, or the stale high level
+  // re-triggers delivery (see tmrCsHook).
+  uc.hook_add(
+    ucMod.HOOK_MEM_WRITE,
+    (u, access, addr, size, value) => tmrCsHook(u, access, Number(addr), Number(size), value),
+    null,
+    TMR_CS,
+    TMR_CS + 3
+  );
   uc.devUart = { base: uart };
   // The PL011 model (src/uart0.js): TX chars are emitted at DR-write time
   // (same hook trick as the mini UART, so UART0 and UART1 chars keep the
@@ -400,6 +414,7 @@ const FB_MODE = 'fb';
 let fbFrame = 0;
 const IRQ_MODE = 'irq';
 let irqFrame = 0;
+const LIRQ_MODE = 'lirq';
 const FB_ADDR = 0x200000; // allocated framebuffer inside guest RAM
 let fbW = 0;
 let fbH = 0;
@@ -458,18 +473,35 @@ const IC_DISABLE_BASIC = IC_BASE + 0x24;
 const IC_IRQ_TIMER1 = 1 << 29; // system timer compare 1
 const IC_IRQ_UART = 1 << 25; // PL011 UART0 = IRQ 57 (bank 1, bit 25)
 
+// BCM2836 ARM-local interrupt controller: per-core IRQ source registers
+// (0x40000060+4n) reported through a window, with real delivery — the host
+// drives CPU_INTERRUPT_HARD via uc.arm64_set_irq (src/localint.js).
+const LOCAL_BASE = 0x40000000;
+
+let localInt = null;
+
 let icEnabled1 = 0;
 let icEnabled2 = 0;
 let icEnabledBasic = 0;
 
 // Pending lines are derived from the device state before every slice, and
 // enable/disable writes are pulled out after it (write-mask semantics, like
-// the other host-arbitrated windows).
+// the other host-arbitrated windows). The same derivation is the GPU IRQ
+// line into the local interrupt block: any pending-and-enabled legacy IC
+// bit raises it.
+function gpuLine() {
+  const p1 =
+    (tmrPending & 4 ? IC_IRQ_TIMER1 : 0) |
+    (uart0IrqActive && uart0IrqActive() ? IC_IRQ_UART : 0) |
+    (dmaInt && (dmaEnable & 1) ? IRQ_DMA0 : 0);
+  return ((p1 & icEnabled1) !== 0 || (p1 & icEnabledBasic) !== 0) ? 1 : 0;
+}
+
 function syncIcOut(uc) {
-  let p1 = 0;
-  if (tmrPending & 4) p1 |= IC_IRQ_TIMER1; // CS bit 2 = the irq guest's C1 (0x3014)
-  if (uart0IrqActive && uart0IrqActive()) p1 |= IC_IRQ_UART; // PL011 RXINTR (IRQ 57)
-  if (dmaInt && (dmaEnable & 1)) p1 |= IRQ_DMA0; // DMA channel 0 completion
+  const p1 =
+    (tmrPending & 4 ? IC_IRQ_TIMER1 : 0) |
+    (uart0IrqActive && uart0IrqActive() ? IC_IRQ_UART : 0) |
+    (dmaInt && (dmaEnable & 1) ? IRQ_DMA0 : 0);
   writeU32(uc, IC_PENDING_BASIC, p1);
   writeU32(uc, IC_PENDING1, p1);
   writeU32(uc, IC_PENDING2, 0);
@@ -491,6 +523,42 @@ function syncIcIn(uc) {
   if (enB) writeU32(uc, IC_ENABLE_BASIC, 0);
   if (disB) writeU32(uc, IC_DISABLE_BASIC, 0);
   icEnabledBasic = (icEnabledBasic | enB) & ~disB;
+}
+
+// The local interrupt block's source lines: arch-timer bits come straight
+// from the core (the gt lines the timer path drives), GPU from the legacy
+// IC aggregation above.
+function localLines() {
+  return {
+    cntps: uc.arm64_debug(13) ? 1 : 0,
+    cntpns: uc.arm64_debug(3) ? 1 : 0,
+    cnthp: uc.arm64_debug(12) ? 1 : 0,
+    cntv: uc.arm64_debug(11) ? 1 : 0,
+    gpu: gpuLine(),
+    pmu: 0,
+    axi: 0,
+    ltimer: 0,
+    mailbox: [0, 0, 0, 0],
+  };
+}
+
+function syncLocalOut(uc) {
+  if (!localInt) return;
+  localInt.syncOut(uc);
+  localInt.syncIrq(uc, (level) => uc.arm64_set_irq(level));
+}
+
+function syncLocalIn(uc) {
+  if (!localInt) return;
+  localInt.syncIn(uc);
+}
+
+// A TMR_CS ack (or any CS write) from the guest re-derives the GPU line in
+// real time, so a level that dropped mid-slice cannot re-trigger after the
+// handler's eret (the next slice-boundary sync would be too late).
+function tmrCsHook(uc, access, addr, size, value) {
+  tmrPending &= Number(value) & 0xf;
+  if (localInt) localInt.syncIrq(uc, (level) => uc.arm64_set_irq(level));
 }
 
 // Deliver a pending, enabled IRQ at a slice boundary. reg_write(PC/ELR) is a
@@ -858,6 +926,13 @@ function runSlice(count) {
   syncMailboxOut(uc);
   syncGpioOut(uc);
   syncIcOut(uc);
+  syncLocalOut(uc);
+  if (mode === LIRQ_MODE) {
+    // The lirq guest's Phase A arms CNTP and waits for the host to advance
+    // the arch timer counter; run it at the real 19.2 MHz rate (CNTFRQ).
+    const us = (performance.now() - tmrWall0) * 1000;
+    uc.arm64_timer_tick(Math.floor(us * 19.2));
+  }
   syncMmuOut(uc);
   syncDmaOut(uc);
   if (uart0SyncOut) uart0SyncOut(uc);
@@ -875,6 +950,7 @@ function runSlice(count) {
   syncMailboxIn(uc);
   syncGpioIn(uc);
   syncIcIn(uc);
+  syncLocalIn(uc);
   syncIrqRet(uc);
   syncMmuIn(uc);
   syncDmaIn(uc);
@@ -1092,12 +1168,13 @@ function blit() {
   fbCtx.putImageData(img, 0, 0);
 }
 
-// The irq guest also never parks (infinite spin with IRQs unmasked), so it
-// runs on rAF slices; deliveries happen at slice boundaries inside runSlice.
+// The irq and lirq guests never park (infinite spin with IRQs unmasked), so
+// they run on rAF slices; deliveries happen at slice boundaries inside
+// runSlice (host-assisted for irq, real CPU_INTERRUPT_HARD for lirq).
 function irqRun() {
   let out = '';
   const frame = () => {
-    if (mode !== IRQ_MODE) return;
+    if (mode !== IRQ_MODE && mode !== LIRQ_MODE) return;
     const t0 = performance.now();
     do {
       out += runSlice(SLICE_INSNS);
@@ -1248,6 +1325,13 @@ async function run() {
         progSel.value === 'uart0'
           ? `booted — running uart0 — BCM2837 PL011 @ 0x3F201000 — config verified, RXINTR -> IRQ 57 — type a key`
           : `booted — running irq — BCM2835 interrupt controller @ 0x3F00B200 — timer + PL011 IRQs live`
+      );
+    } else if (progSel.value === LIRQ_MODE) {
+      mode = LIRQ_MODE;
+      boot(ucMod, uc, board, elf);
+      irqRun(); // async: rAF-paced slices, real IRQs via the local block
+      setStatus(
+        `booted — running lirq — BCM2836 local interrupt block @ 0x40000000 — CNTPNS + GPU IRQ delivered to a real vector`
       );
     } else if (progSel.value === 'mmu') {
       mode = 'mmu';

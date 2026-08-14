@@ -56,6 +56,13 @@ name = "irqcore"
 version = "0.1.0"
 
 [[package]]
+name = "lirq"
+version = "0.1.0"
+dependencies = [
+ "pi-runtime",
+]
+
+[[package]]
 name = "mmu"
 version = "0.1.0"
 dependencies = [

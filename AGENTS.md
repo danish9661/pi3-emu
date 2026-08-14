@@ -21,10 +21,11 @@ into guest memory before each slice, pull guest writes out after):
   (0x3F00B200), MMU (0x3F00D000, host-assisted table walk), DMA
   (0x3F007000, host-arbitrated CB chains), PWM audio (0x3F20C000), I2C
   (0x3F804000), SPI (0x3F204000), mini UART (0x3F215000), SDHCI/FAT12
-  (0x3F300000), PL011 UART0 (0x3F201000).
+  (0x3F300000), PL011 UART0 (0x3F201000), BCM2836 local interrupt
+  block (0x40000000, real IRQ delivery into the CPU).
 - 4-core SMP via per-core unicorn instances + host-arbitrated mailbox.
-- Guests: shell, sum, fib, smp, clock, gpio, fb, irq, mmu, dma, pwm, i2c,
-  spi, uart1, sd, uart0 (16 programs).
+- Guests: shell, sum, fib, smp, clock, gpio, fb, irq, lirq, mmu, dma,
+  pwm, i2c, spi, uart1, sd, uart0 (17 programs).
 - Scheduler: run-until-idle, 512-instruction slices (`runSlice` in
   src/main.js), devices synced before/after each slice.
 - IRQ delivery is host-assisted: slice-boundary delivery, `IRQ_RET` magic
@@ -119,13 +120,60 @@ Verified semantics (irqcore guest + probe, 13/13 PASS):
       CNTPCT save, eret, no re-entry after de-assert (13/13 PASS).
 - [x] Full `python3 build.py --release`, wired into build.sh.
 - [x] M1-M19 regression green with the rebuilt core.
-- [ ] Next: BCM2836 local interrupt block (Phase 2) drives the same
-      set_irq mechanism from the JS device layer.
+- [x] COMMITTED + pushed (c841098): fork patches, exports, build.sh,
+      irqcore guest, AGENTS.md. The fork source lives ONLY under
+      /tmp/opencode/unicornjs-src (ephemeral — /tmp gets wiped;
+      public/unicorn.js is the gitignored built artifact).
+- uc_arm64_debug sels: 0 interrupt_request, 1 daif, 2 uc_ext_irq,
+  3-6 uc_gt_irq[0..3] (CNTPNS/CNTV/CNTHP/CNTPS; local-block mapping:
+  bit0 CNTPS←13, bit1 CNTPNS←3, bit2 CNTHP←12, bit3 CNTV←11),
+  4 cntpct, 5 env.pc, 6/7 delivery counters, 8/9/10 last-TB ring.
+  NOTE: arm64_debug returns a BigInt — Number() it before comparisons.
+
+### Phase 2a — BCM2836 local interrupt block (DONE, uncommitted)
+
+- src/localint.js: window model at 0x40000000 (CONTROL/PRESCALER/
+  GPU_ROUTING/FIQ_ROUTING/CORE_TIMER_CTRL/MAILBOX_CTRL per core +
+  CORE_IRQ_SRC/CORE_FIQ_SRC at +0x60/+0x70); source bits 0 CNTPSIRQ,
+  1 CNTPNSIRQ, 2 CNTHPIRQ, 3 CNTVIRQ, 4-7 mailbox, 8 GPU, 9 PMU,
+  10 AXI, 11 local timer. Host line via `uc_arm64_set_irq` tracks
+  GPU/PMU/AXI/local-timer/mailbox ONLY — the four arch-timer bits are
+  reported in the source reg but never drive the host line (the gt
+  path asserts/de-asserts CPU_INTERRUPT_HARD internally in real time;
+  a host slice-boundary line would re-trigger after eret).
+- GPU line = (timer p1 & icEnabled1) | (p1 & icEnabledBasic) over
+  timer/UART/DMA lines (gpuLine() in main.js). Legacy IC basic IRQ 29
+  (system timer) → GPU bit 8 → real vector.
+- Real-time de-assert: TMR_CS write hook (HOOK_MEM_WRITE, range end
+  INCLUSIVE: TMR_CS..TMR_CS+3) re-derives the GPU line mid-slice and
+  clears the IRQ so a level IRQ doesn't re-trigger after eret.
+- Browser ticks the arch timer at the real rate during LIRQ_MODE:
+  `uc.arm64_timer_tick(floor(us * 19.2))` each slice (CNTFRQ 19.2 MHz)
+  — otherwise the CNTP counter stays 0 and Phase A never fires.
+- lirq guest: Phase A CNTPNS (gt path, handler reads CORE_IRQ_SRC
+  bit 1 = 0x2, disables CNTP_CTL), Phase B system-timer compare at
+  0x3F003014 (index 2 — see timer model convention below) → IC basic
+  29 → GPU line → local block bit 8 = 0x100; handler acks with a
+  `str wzr` to TMR_CS; SCRATCH[0..9]; uses the runtime's panic
+  handler. 32-bit MMIO accesses only (ldr w4/str wzr — a 64-bit load
+  reads the adjacent cell).
+- TIMER MODEL CONVENTION (host): compare register i ↔ CS bit i — NOT
+  real hardware (real C1@0x10 → CS bit 2). clock guest uses 0x10 (CS
+  bit 1), irq/lirq use 0x14 (CS bit 2 → IRQ 29). Fixing to the real
+  layout deferred to the Linux device rework.
+- index.html gained `<option value="lirq">` — the UI select rejects
+  values without a matching option (E2E "not an ELF file" was the
+  select resetting to "" → PROGRAMS[undefined]).
+- test/lirq-probe.mjs 14/14 PASS; browser E2E /tmp/opencode/
+  lirq-e2e.mjs prints "lirq: A and B delivered"; 19/19 regression.
+- COMMIT CHECKLIST (pending): programs/lirq/, src/localint.js,
+  src/main.js, index.html, test/lirq-probe.mjs, public/programs/
+  lirq.elf + irqcore.elf, build-programs.sh, programs/Cargo.toml/
+  Cargo.lock; README History M20 entry written; push.
 
 ### Phase 2 — real devices
 
-- BCM2836 local interrupt block at 0x40000000 (per-core IRQ sources,
-  GPU IRQ 25 routing to core 0).
+- [x] BCM2836 local interrupt block at 0x40000000 (Phase 2a above).
 - Rework existing models from window semantics to true MMIO IRQ
   semantics (PL011 RXIM/TXIM, system timer C1/C3, GPIO, SDHCI).
 - Slice loop changes: no run-until-idle (Linux never idles); fixed

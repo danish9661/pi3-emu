@@ -705,3 +705,29 @@ dist/                 production bundle
   re-executed the post-indexed load and skipped one byte per puts
   (first symptom: the irq banner lost its `:`); `uart0` program +
   probe + browser E2E
+- M20 — the Linux boot project begins. Phase 1 rebuilt the unicorn.js
+  fork (github.com/AlexAltea/unicorn.js @ 8028ec43, `python3 build.py
+  --release`) with real exception injection: `uc_arm64_set_irq` asserts/
+  de-asserts CPU_INTERRUPT_HARD, `uc_arm64_timer_tick` advances the ARM
+  generic timer (guest TVAL → CVAL, ISTATUS + IRQ at CNTFRQ 19.2 MHz),
+  `uc_arm64_debug` probes the IRQ lines/DAIF/PC; the delivery bug was
+  `arm_cpu_do_interrupt` taking the AArch32 entry path (SCR_EL3.RW
+  defaults 0) so PC never reached the vector — the A64 path is forced
+  under TARGET_AARCH64; the `irqcore` guest verifies 13/13 (vector
+  entry at VBAR+0x280, ELR_EL1/SPSR_EL1 saved, DAIF.I set, eret round
+  trip, level semantics: a still-high line re-triggers after eret).
+  Phase 2a: the BCM2836 local interrupt block (0x40000000) — CONTROL/
+  PRESCALER/GPU+FIQ routing/per-core CORE_* registers with the real
+  source layout (0 CNTPS, 1 CNTPNS, 2 CNTHP, 3 CNTV, 4-7 mailbox, 8 GPU,
+  9 PMU, 10 AXI, 11 local timer); arch-timer bits are *reported* in the
+  source register but never drive the host line (the gt path asserts/
+  de-asserts CPU_INTERRUPT_HARD internally in real time — a host-side
+  slice-boundary line would re-trigger after eret); the host line
+  tracks GPU/PMU/AXI/local-timer/mailbox, delivered through
+  `uc_arm64_set_irq` to a real vector; the `lirq` guest delivers
+  CNTPNS (gt path) and then a system-timer compare (IRQ 29 → legacy IC
+  → GPU line → local block bit 8 → real vector) whose `str wzr` TMR_CS
+  write is a real-time hook that de-asserts the line, so no re-entry;
+  the browser ticks the arch timer at the real 19.2 MHz rate during
+  lirq runs; `lirq` program + probe (14/14) + browser E2E, full
+  19-probe regression green
