@@ -1,8 +1,8 @@
 // BCM2837 UART0 — the PL011. This replaces the original "console slots"
 // window with the real register model: the guest configures IBRD/FBRD/
 // LCRH/CR like a real driver, polls FR for TX/RX flow control, reads and
-// writes DR, and RXINTR (IMSC bit 4) drives the interrupt controller's
-// IRQ 57 line (bank 1, bit 25).
+// writes DR, and RXINTR (IMSC bit 4) / TXINTR (IMSC bit 5) drive the
+// interrupt controller's IRQ 57 line (bank 2, bit 25).
 //
 // Model notes:
 //   - TX: a DR write is captured by a HOOK_MEM_WRITE and emitted at write
@@ -15,14 +15,16 @@
 //     runs a read hook *before* the CPU latches the read value, so a hook
 //     must never rewrite the register being read — writing the DR cell
 //     during a DR read would hand the guest the *next* byte (or 0).
-//   - Interrupts: RIS.RXINTR = FIFO non-empty; MIS = RIS & IMSC; the IC
-//     line derives from irqActive() and is re-derived in irqDeliver (a
-//     stale PENDING1 window must not re-deliver once the handler has
-//     drained the FIFO). TXINTR stays de-asserted — the TX FIFO never
-//     fills in this model, so a real TXINTR would be permanently asserted
-//     and would IRQ-storm the guest.
+//   - Interrupts: RIS.RXINTR = FIFO non-empty, RIS.TXINTR = 1 while the TX
+//     FIFO has room (always — it never fills in this model); MIS = RIS &
+//     IMSC; the IC line derives from irqActive(). The TX FIFO has no flow
+//     control, so a guest that arms TXIM and never clears it would storm —
+//     that is exactly what the uart0 guest demonstrates (arm TXIM, get the
+//     IRQ, de-arm it in the handler). Line changes assert/de-assert at
+//     slice boundaries, plus a real-time de-assert when a DR read drains
+//     the last RX byte (onIrqChange).
 
-export function createUart0(uc, ucMod, base, emit) {
+export function createUart0(uc, ucMod, base, emit, onIrqChange) {
   const DR = base + 0x00;
   const FR = base + 0x18;
   const ICR = base + 0x44;
@@ -33,6 +35,7 @@ export function createUart0(uc, ucMod, base, emit) {
   const FR_RXFF = 1 << 6;
   const FR_TXFE = 1 << 7;
   const RXIM = 1 << 4; // IMSC/RIS/MIS bit 4 = RX interrupt
+  const TXIM = 1 << 5; // IMSC/RIS/MIS bit 5 = TX interrupt
 
   const state = { cr: 0, lcrh: 0, ibrd: 0, fbrd: 0, imsc: 0, rx: [], cap: 16 };
 
@@ -49,7 +52,8 @@ export function createUart0(uc, ucMod, base, emit) {
 
   // Re-mirror the derived state into the guest-visible cells: the DR cell
   // carries the next RX byte (the byte the guest is about to read), FR
-  // shows TX ready + RX empty, RIS/MIS show the raw/masked RX status.
+  // shows TX ready + RX empty, RIS/MIS show the raw/masked interrupt
+  // status (RIS.TXINTR is always set — the TX FIFO never fills).
   // withDr=false refreshes only FR/RIS/MIS — for the DR read hook, which
   // must not rewrite the DR cell while the guest is reading it.
   const refresh = (withDr = true) => {
@@ -59,7 +63,7 @@ export function createUart0(uc, ucMod, base, emit) {
     if (state.rx.length === 0) fr |= FR_RXFE;
     if (state.rx.length >= state.cap) fr |= FR_RXFF;
     writeU32(uc, FR, fr);
-    const raw = state.rx.length > 0 ? RXIM : 0;
+    const raw = (state.rx.length > 0 ? RXIM : 0) | TXIM;
     writeU32(uc, RIS, raw);
     writeU32(uc, MIS, raw & state.imsc);
   };
@@ -101,6 +105,10 @@ export function createUart0(uc, ucMod, base, emit) {
       // must still hold the byte that was read.
       if (state.rx.length > 0) state.rx.shift();
       refresh(false);
+      // Real-time RXINTR de-assert: draining the last byte drops the line
+      // before the handler erets, so a stale high level cannot re-trigger
+      // delivery (the slice-boundary re-sync would be too late).
+      if (state.rx.length === 0 && onIrqChange) onIrqChange();
     },
     null,
     DR,
@@ -121,6 +129,7 @@ export function createUart0(uc, ucMod, base, emit) {
     if (imsc !== state.imsc) state.imsc = imsc;
     // ICR is write-1-to-clear: absorb it so reads see 0.
     if (readU32(uc, ICR) !== 0) writeU32(uc, ICR, 0);
+    if (onIrqChange) onIrqChange();
   };
 
   // Host key input: queued only while the guest has enabled RX.
@@ -130,9 +139,11 @@ export function createUart0(uc, ucMod, base, emit) {
     }
   };
 
-  // The IC's UART line (IRQ 57): RXINTR masked by IMSC.RXIM.
+  // The IC's UART line (IRQ 57, bank-2 bit 25): RXINTR/TXINTR masked by
+  // IMSC, gated on the UART being enabled.
   const irqActive = () =>
-    state.rx.length > 0 && (state.imsc & RXIM) !== 0 && (state.cr & (1 | (1 << 9))) !== 0;
+    ((state.rx.length > 0 && (state.imsc & RXIM) !== 0) || (state.imsc & TXIM) !== 0) &&
+    (state.cr & (1 | (1 << 9))) !== 0;
 
   return { state, syncOut: refresh, syncIn, push, irqActive };
 }

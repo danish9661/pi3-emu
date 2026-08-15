@@ -1,12 +1,13 @@
 #![no_std]
 #![no_main]
 
-//! Interrupt demo: the BCM2835 legacy interrupt controller (0x3F00B200).
-//! The guest arms the system timer compare register C1 (IRQ 29) and the
-//! PL011 UART0 RX line (IRQ 57, bank 1 bit 25 — RXINTR from the real
-//! register model), then spins with interrupts unmasked; the host
-//! delivers the IRQ at a slice boundary (ELR/SPSR saved, PC jumped to
-//! VBAR+0x280, DAIF.I set) and the handler clears the source and re-arms.
+//! Interrupt demo: the BCM2835 legacy interrupt controller (0x3F00B200),
+//! real 3-bank layout. The guest arms the system timer compare C1 (0x10 ->
+//! CS bit 1 -> bank-1 bit 1, GPU IRQ 1) and the PL011 UART0 RX line (bank-2
+//! bit 25 = IRQ 57 — RXINTR from the real register model), then spins with
+//! interrupts unmasked; the host delivers the IRQ at a slice boundary
+//! (ELR/SPSR saved, PC jumped to VBAR+0x280, DAIF.I set) and the handler
+//! clears the source and re-arms.
 //!
 //! Vector table lives in the `.vectors` section at 0x100000 (linker.ld).
 
@@ -24,14 +25,16 @@ const RXIM: u32 = 1 << 4;
 const TMR_BASE: u32 = 0x3F00_3000;
 const TMR_CS: u32 = TMR_BASE + 0x00;
 const TMR_CLO: u32 = TMR_BASE + 0x04;
-const TMR_C1: u32 = TMR_BASE + 0x14; // compare 1 (0x10 = compare 0!)
+const TMR_C1: u32 = TMR_BASE + 0x10; // real C1: compare register 1
 
 const IC_BASE: u32 = 0x3F00_B200;
-const IC_PENDING1: u32 = IC_BASE + 0x04;
+const IC_PENDING1: u32 = IC_BASE + 0x04; // bank 1: timer C0-C3 bits 0-3
+const IC_PENDING2: u32 = IC_BASE + 0x08; // bank 2: PL011 bit 25
 const IC_ENABLE_IRQS1: u32 = IC_BASE + 0x10;
+const IC_ENABLE_IRQS2: u32 = IC_BASE + 0x14;
 
-const IRQ_TIMER1: u32 = 1 << 29; // system timer compare 1
-const IRQ_UART: u32 = 1 << 25; // PL011 UART0 = IRQ 57 (bank 1, bit 25)
+const IRQ_TIMER1: u32 = 1 << 1; // system timer compare 1 (bank 1, bit 1)
+const IRQ_UART: u32 = 1 << 25; // PL011 UART0 = IRQ 57 (bank 2, bit 25)
 
 #[inline(always)]
 fn mmio_read(a: u32) -> u32 {
@@ -134,8 +137,9 @@ core::arch::global_asm!(
 
 #[no_mangle]
 pub extern "C" fn irq_handler_rust() {
-    let p = mmio_read(IC_PENDING1);
-    if p & IRQ_TIMER1 != 0 {
+    let p1 = mmio_read(IC_PENDING1);
+    let p2 = mmio_read(IC_PENDING2);
+    if p1 & IRQ_TIMER1 != 0 {
         mmio_write(TMR_CS, 0); // clear compare-1 match (host sees the change)
         unsafe {
             IRQ_COUNT += 1;
@@ -145,7 +149,7 @@ pub extern "C" fn irq_handler_rust() {
         }
         mmio_write(TMR_C1, mmio_read(TMR_CLO).wrapping_add(1_000_000)); // re-arm
     }
-    if p & IRQ_UART != 0 {
+    if p2 & IRQ_UART != 0 {
         // Read keys out of the PL011 RX FIFO until it empties (reading DR
         // pops it); the RXINTR line follows the FIFO, so draining it here
         // de-asserts the IRQ at the next slice boundary.
@@ -182,9 +186,10 @@ pub extern "C" fn rust_main() -> ! {
             options(nostack)
         );
         mmio_write(IMSC, RXIM); // arm the PL011 RXINTR
-        mmio_write(IC_ENABLE_IRQS1, IRQ_TIMER1 | IRQ_UART);
+        mmio_write(IC_ENABLE_IRQS1, IRQ_TIMER1); // timer C1 -> bank-1 bit 1
+        mmio_write(IC_ENABLE_IRQS2, IRQ_UART); // PL011 -> bank-2 bit 25
         mmio_write(TMR_C1, mmio_read(TMR_CLO).wrapping_add(1_000_000));
-        puts("irq: timer C1 + UART RX armed, IRQ enabled\r\n");
+        puts("irq: timer C1 (IRQ 1) + UART RX (IRQ 57) armed\r\n");
         loop {
             core::arch::asm!("msr daifclr, #2", options(nostack));
             core::hint::spin_loop();

@@ -36,6 +36,14 @@ const uart = Number(board.pi_uart_base());
 let chars = '';
 const uart0 = createUart0(uc, ucMod, uart, (b) => board.pi_cons_push(b));
 
+function writeU32(uc, addr, v) {
+  uc.mem_write(addr, [v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff]);
+}
+function readU32(uc, addr) {
+  const b = uc.mem_read(addr, 4);
+  return b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24);
+}
+
 function drain() {
   let out = '';
   for (;;) {
@@ -47,7 +55,7 @@ function drain() {
 }
 
 const sd = createSdhci(uc, ucMod, SD_BASE);
-const { state, syncOut, syncIn } = sd;
+const { state, syncOut, syncIn, irqActive } = sd;
 
 function slice() {
   const pc = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry;
@@ -93,5 +101,41 @@ if (!pass) {
   console.log('--- guest output ---');
   console.log(chars.replace(/\r/g, ''));
 }
+
+// Phase 2: the IRQ line semantics (IRPT_EN 0x34 / IRPT_MASK 0x38). The
+// guest is parked, so drive the window directly: a fresh command sets the
+// raw status; the line is (raw & IRPT_EN & IRPT_MASK).
+console.log('sd-probe IRQ model:');
+const IRPT_EN = SD_BASE + 0x34;
+const IRPT_MASK = SD_BASE + 0x38;
+const IRPT_CMD_COMPLETE = 1;
+const irqChecks = [];
+const irqCheck = (label, cond) => {
+  irqChecks.push(cond);
+  console.log('  ' + (cond ? 'ok ' : 'FAIL') + ' ' + label);
+};
+// Default: no enables -> no line even with raw status set.
+state.irq = IRPT_CMD_COMPLETE; // raw status via the model state
+irqCheck('line low with IRPT_EN=0 (raw set)', irqActive() === false);
+state.irq = 0;
+// Enable status + signal, then a fresh command raises the line.
+writeU32(uc, IRPT_EN, IRPT_CMD_COMPLETE);
+writeU32(uc, IRPT_MASK, IRPT_CMD_COMPLETE);
+syncIn(uc);
+sd.exec(7, 0); // a guest-style CMD7 write -> exec() (host mem_write does not
+// fire the write hook, so call the model directly)
+irqCheck('line high after CMD with EN|MASK set', irqActive() === true);
+syncOut(uc);
+irqCheck('INTERRUPT window shows CMD_COMPLETE', readU32(uc, SD_BASE + 0x30) & IRPT_CMD_COMPLETE);
+// W1C clears the raw bit -> line drops.
+sd.w1c(IRPT_CMD_COMPLETE);
+irqCheck('W1C clears the line', irqActive() === false);
+// Signal-enable off: status still latches but the line stays low.
+writeU32(uc, IRPT_MASK, 0);
+syncIn(uc);
+sd.exec(7, 0);
+irqCheck('line low when MASK=0 (status still set)', irqActive() === false);
+irqCheck('raw status still latched', (state.irq & IRPT_CMD_COMPLETE) !== 0);
+
 uc.close();
-process.exit(pass ? 0 : 1);
+process.exit(pass && irqChecks.every(Boolean) ? 0 : 1);

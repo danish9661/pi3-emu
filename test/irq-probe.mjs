@@ -8,6 +8,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const MUnicorn = require(join(__dirname, '..', 'public', 'unicorn.js'));
 const { parseElf, loadElf } = await import(join(__dirname, '..', 'src', 'elf.js'));
 const { createUart0 } = await import(join(__dirname, '..', 'src', 'uart0.js'));
+const { createIc } = await import(join(__dirname, '..', 'src', 'ic.js'));
 
 const UART_WINDOW = 0x1000;
 const RAM_SIZE = 0x400000;
@@ -20,12 +21,7 @@ const TMR_CLO = TMR_BASE + 0x04;
 const TMR_CMP = TMR_BASE + 0x0c;
 
 const IC_BASE = 0x3f00b200;
-const IC_PENDING1 = IC_BASE + 0x04;
-const IC_ENABLE_IRQS1 = IC_BASE + 0x10;
 const IC_IRQ_RET = IC_BASE + 0x2c;
-
-const IRQ_TIMER1 = 1 << 29;
-const IRQ_UART = 1 << 25; // PL011 UART0 = IRQ 57 (bank 1, bit 25)
 
 function writeU32(uc, addr, v) {
   uc.mem_write(addr, [v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff]);
@@ -60,7 +56,6 @@ async function main() {
   let tmrCompares = [0, 0, 0, 0];
   let tmrCrossed = [false, false, false, false];
   let tmrLastCS = 0;
-  let icEnabled1 = 0;
   let chars = '';
   let delivered = 0;
   let irqElr = 0;
@@ -91,19 +86,16 @@ async function main() {
     const cs = readU32(uc, TMR_CS);
     if (cs !== tmrLastCS) tmrPending &= cs & 0xf;
   };
-  const syncIcOut = () => {
-    let p1 = 0;
-    if (tmrPending & 4) p1 |= IRQ_TIMER1;
-    if (uart0.irqActive()) p1 |= IRQ_UART;
-    writeU32(uc, IC_PENDING1, p1);
-  };
-  const syncIcIn = () => {
-    const en = readU32(uc, IC_ENABLE_IRQS1);
-    if (en) {
-      icEnabled1 |= en;
-      writeU32(uc, IC_ENABLE_IRQS1, 0);
-    }
-  };
+  // The real 3-bank legacy IC (src/ic.js), fed by the probe's host state.
+  const ic = createIc(uc, ucMod, IC_BASE, () => ({
+    timer: tmrPending & 0xf,
+    dma0: false,
+    pl011: uart0.irqActive(),
+    sdhci: false,
+    gpio0: false,
+    gpio1: false,
+    aux: false,
+  }));
   const syncIrqRet = () => {
     const r = readU32(uc, IC_IRQ_RET);
     if (r !== 0) {
@@ -112,9 +104,11 @@ async function main() {
     }
   };
   const irqDeliver = () => {
-    let pending = readU32(uc, IC_PENDING1) & icEnabled1;
-    if (!uart0.irqActive()) pending &= ~IRQ_UART; // stale PENDING1 window
-    if (!pending || irqInFlight) return;
+    if (irqInFlight) return;
+    if (((Number(uc.arm64_debug(1)) >> 7) & 1) === 1) return; // DAIF.I set
+    // ic.pending() is derived fresh from the device lines on every call.
+    const p = ic.pending();
+    if ((p.b1 | p.b2 | p.basic) === 0) return;
     const pcNow = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC));
     irqElr = pcNow || elf.entry;
     irqInFlight = true;
@@ -139,11 +133,11 @@ async function main() {
     irqResume = 0;
     irqVector = 0;
     syncTmrOut();
-    syncIcOut();
+    ic.syncOut(uc);
     uart0.syncOut(uc);
     uc.emu_start(pc, 0, 0, SLICE_INSNS);
     syncTmrIn();
-    syncIcIn();
+    ic.syncIn(uc);
     syncIrqRet();
     uart0.syncIn(uc);
     const out = drain();
@@ -166,7 +160,7 @@ async function main() {
   const keySeen = chars.includes("[irq key: 'H']");
   const checks = [
     ['interrupt controller banner:', chars.includes('irq: BCM2835 interrupt controller')],
-    ['timer + UART armed:', chars.includes('irq: timer C1 + UART RX armed')],
+    ['timer + UART armed:', chars.includes('irq: timer C1 (IRQ 1) + UART RX (IRQ 57) armed')],
     ['timer IRQ delivered:', ticks >= 1],
     ['UART RX IRQ delivered:', keySeen],
     ['deliveries happened:', delivered >= 1],

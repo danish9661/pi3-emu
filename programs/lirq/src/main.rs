@@ -15,10 +15,11 @@
 //! the handler reads the source register (must show bit 1), records
 //! ELR/SPSR/CNTPCT, disables the timer (level de-assert) and eret's.
 //!
-//! Phase B — GPU: enable system-timer C1 in the legacy IC (basic bank bit
-//! 29), program CMP1 = CLO + 1s; the C1 match drives the IC line into the
-//! local block's GPU bit; the handler reads the source register (must show
-//! bit 8), acks by clearing TMR_CS, and eret's. No re-entry either phase.
+//! Phase B — GPU: enable system-timer C3 in the legacy IC (bank-1 bit 3 —
+//! the real compare Linux's bcm2835_timer uses), program C3 = CLO + 1s;
+//! the C3 match drives the IC line into the local block's GPU bit; the
+//! handler reads the source register (must show bit 8), acks by clearing
+//! TMR_CS, and eret's. No re-entry either phase.
 
 use pi_runtime::puts;
 
@@ -112,14 +113,12 @@ pub extern "C" fn _start() -> ! {
 }
 
 const IC_BASE: u32 = 0x3F00_B200;
-const IC_ENABLE_BASIC: u32 = IC_BASE + 0x18;
-const IRQ_TIMER1: u32 = 1 << 29; // system timer compare 1
+const IC_ENABLE_IRQS1: u32 = IC_BASE + 0x10;
+const IRQ_TIMER3: u32 = 1 << 3; // system timer compare 3 (bank 1, bit 3)
 const TMR_BASE: u32 = 0x3F00_3000;
 const TMR_CLO: u32 = TMR_BASE + 0x04;
-// The host timer model maps compare register i -> CS bit i (the irq guest's
-// C1 convention): the compare at +0x14 (index 2) drives CS bit 2, which is
-// the line main.js maps to IRQ 29 in the legacy IC.
-const TMR_C1: u32 = TMR_BASE + 0x14;
+// Real C3 at +0x18 (compare register 3 -> CS bit 3 -> bank-1 bit 3).
+const TMR_C3: u32 = TMR_BASE + 0x18;
 
 fn mmio_read(addr: u32) -> u32 {
     unsafe { core::ptr::read_volatile(addr as *const u32) }
@@ -153,9 +152,9 @@ pub extern "C" fn rust_main() -> ! {
         }
         // Phase B: enable the timer line in the legacy IC, program the
         // compare = CLO + 1s
-        mmio_write(IC_ENABLE_BASIC, IRQ_TIMER1);
+        mmio_write(IC_ENABLE_IRQS1, IRQ_TIMER3);
         let clo = mmio_read(TMR_CLO);
-        mmio_write(TMR_C1, clo + 0xF4240);
+        mmio_write(TMR_C3, clo + 0xF4240);
         while SCRATCH[9] != 2 {
             core::arch::asm!("msr daifclr, #2", options(nostack));
             core::hint::spin_loop();

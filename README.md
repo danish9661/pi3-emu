@@ -751,3 +751,37 @@ dist/                 production bundle
   `uc_arm64_timer_tick` i64 param needs `BigInt(cntpct)` (ccall
   'number' throws), restoring `lirq` 14/14; full 19-probe regression
   green
+- M22 — real legacy-IC IRQ semantics for the Linux-boot device set. A new
+  `src/ic.js` models the BCM2835 interrupt controller (0x3F00B200) as a
+  real 3-bank register file — IC_BASIC/IRQ1/IRQ2 pending, ENABLE_IRQS1/2
+  + DISABLE_IRQS1/2, per-bank lines derived *fresh* from the device
+  lines on every read (no stale windows) — with the real bank map: IRQ 1
+  = timer bit 0, IRQ 7 = DMA0 bit 6 (kept at 1<<16 → bank-1 bit 16,
+  host convention for our own DTB), IRQ 29 = system timer (bank-1 bit
+  28 = basic bit 29), IRQ 57 = PL011 (bank-2 bit 25), IRQ 62 = SDHCI
+  (bank-2 bit 30), IRQ 81/82 = GPIO banks 0/1 (bank-2 bits 17/18). The
+  system-timer convention is fixed to real hardware: C1@0x10 → CS bit 1
+  (the irq guest's timer line) and C3@0x18 → CS bit 3 (the lirq guest's
+  Phase B — Linux's bcm2835_timer uses C3/IRQ 29). `src/gpio.js` is a
+  full GPIO model — GPFSEL/GPSET/GPCLR W1S/W1C, host-driven GPLEV,
+  GPEDS W1C, GPREN/GPFEN/GPHEN/GPLEN/GPAREN/GPAFEN, GPPUD — with
+  host-side edge detection at slice boundaries and a bank IRQ line for
+  any event bit covered by an enable; the guest's W1C goes through a
+  write hook (a window pull would self-clear the host's own mirror —
+  the probe's ev0 came back 0x0 with 0 deliveries until the hook
+  handled it). PL011 gains TXIM (IRQ 57: TXINTR = TXFE&&TXIM, RXINTR =
+  RXNE&&RXIM, de-armed in the handler so no post-eret storm) and real-
+  time RX de-assert when the FIFO drains; SDHCI gains IRPT_EN/IRPT_MASK
+  with the real line = (raw & IRPT_EN & IRPT_MASK). Guests move to the
+  real offsets: irq = timer C1 (IRQ 1) + UART RX (IRQ 57), uart0 = RX
+  then TXIM phases, gpio = GPREN on BTN 29 → IRQ 81 with a full vector
+  + glue, lirq Phase B = C3@0x18 → IRQ 29. Delivery stays host-assisted
+  for the legacy-IC guests (irqDeliver gated on DAIF.I clear, irqElr
+  recorded at slice end, VBAR+0x280 vector, IRQ_RET magic at
+  0x3F00B22C) and real for lirq — a discovered regression: the local
+  block's `arm64_set_irq` line must fire only in LIRQ_MODE, because a
+  real mid-slice entry into a legacy-IC guest left the host machinery
+  without a resume point (`syncIrqRet resume 0`, the uart0 TX phase
+  died). GPIO button fix: `getBtn` must return the pin bitmask
+  (gpioBtn << 29). Verified: 20/20 probes + 9/9 browser E2E checks
+  (phase2b-e2e.mjs covers irq/uart0/lirq/gpio)

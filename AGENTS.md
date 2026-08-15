@@ -25,11 +25,13 @@ into guest memory before each slice, pull guest writes out after):
   block (0x40000000, real IRQ delivery into the CPU).
 - 4-core SMP via per-core unicorn instances + host-arbitrated mailbox.
 - Guests: shell, sum, fib, smp, clock, gpio, fb, irq, lirq, mmu, dma,
-  pwm, i2c, spi, uart1, sd, uart0 (17 programs).
+  pwm, i2c, spi, uart1, sd, uart0, mva (18 programs).
 - Scheduler: run-until-idle, 512-instruction slices (`runSlice` in
   src/main.js), devices synced before/after each slice.
-- IRQ delivery is host-assisted: slice-boundary delivery, `IRQ_RET` magic
-  at IC_BASE+0x2C, vector glue that saves the full register file.
+- IRQ delivery: host-assisted (slice-boundary delivery, `IRQ_RET` magic
+  at IC_BASE+0x2C, vector glue that saves the full register file) for
+  the legacy-IC guests (irq/uart0/gpio); real CPU_INTERRUPT_HARD entry
+  with native eret for the local-block guest (lirq).
 
 ## Verified core facts (unicorn.js 2.2.0 build in public/)
 
@@ -168,7 +170,7 @@ Verified semantics (irqcore guest + probe, 13/13 PASS):
 - test/lirq-probe.mjs 14/14 PASS; browser E2E /tmp/opencode/
   lirq-e2e.mjs prints "lirq: A and B delivered"; 19/19 regression.
 
-### Phase 2a-MMU — REAL MMU in the rebuilt core (DONE, uncommitted)
+### Phase 2a-MMU — REAL MMU in the rebuilt core (DONE, committed 52e230d)
 
 - mva guest (programs/mva/): enables SCTLR_EL1.M/C/I with real 4K-granule
   LPAE stage-1 tables — T0SZ=25 (39-bit VA), TTBR0_EL1 at 0x280000, MAIR
@@ -212,15 +214,88 @@ Verified semantics (irqcore guest + probe, 13/13 PASS):
   X to a BigInt") — pass BigInt(cntpct) like emu_start does.
 - Regression: 19/19 (branch csel clock dma fb gpio i2c instr irq mbox
   mmu pwm sd smp stats uart0 uart1 lirq mva), all exit 0.
-- COMMIT CHECKLIST (pending): programs/mva/, test/mva-probe.mjs,
-  public/programs/mva.elf, programs/Cargo.toml/Cargo.lock,
-  build-programs.sh, AGENTS.md; README History M21 entry; push.
+
+### Phase 2b — REAL legacy-IC IRQ semantics (DONE, commit pending)
+
+Real MMIO register layouts + genuine IRQ lines for the devices the Linux
+boot needs, replacing the old "window-arbitrated IRQ" conventions. The
+4 guests irq/uart0/lirq/gpio now use REAL offsets and full 3-bank IC
+semantics; delivery stays host-assisted (slice-boundary irqDeliver +
+IRQ_RET magic resume) for the legacy-IC guests, real (CPU_INTERRUPT_HARD)
+for lirq. Verified: 20/20 probes + 9/9 browser E2E checks.
+
+- NEW src/ic.js — the BCM2835 legacy interrupt controller (0x3F00B200)
+  as a real 3-bank model: basic IC_BASIC (0x00) + IRQ1 (0x04)/IRQ2 (0x08)
+  pending, ENABLE_IRQS1 (0x10)/ENABLE_IRQS2 (0x14) + DISABLE_IRQS1/2
+  (0x1C/0x20), per-bank lines derived FRESH from device lines each call
+  (ic.pending()/ic.line(), no stale windows). Source lines (icLines() in
+  main.js): timer (tmrPending & 0xf), dma0 (DMA_CS INT+ACTIVE), pl011,
+  sdhci, gpio0 (bank 0), gpio1 (bank 1), aux. Bank map: IRQ 1 = bit 0
+  (timer), IRQ 29 = bit 28 (system timer -> basic bit 29 too), IRQ 7 =
+  bit 6 (DMA0, kept 1<<16 -> bank-1 bit 16 — host convention, own DTB in
+  Phase 3), UART RX/TX = IRQ 57 = bank-2 bit 25 (real PL011), SDHCI =
+  IRQ 62 = bank-2 bit 30, GPIO 0/1 = IRQ 81/82 = bank-2 bits 17/18.
+- irqDeliver (main.js): gated on DAIF.I clear (uc_arm64_debug(1) bit 7,
+  the same mask real hardware checks); irqElr recorded at slice end,
+  next slice starts at VBAR+0x280, IRQ_RET magic at IC_BASE+0x2C resumes.
+- TIMER CONVENTION FIXED to real hardware: C1@0x10 -> CS bit 1 (irq
+  guest, was 0x14->bit 2), C3@0x18 -> CS bit 3 (lirq Phase B, was
+  C2@0x14->bit 2 — Linux's bcm2835_timer uses C3/IRQ 29 = basic bit 29).
+  clock guest still uses 0x10/CS bit 1 (now correct by accident); the old
+  register-i-to-CS-bit-i convention is gone.
+- NEW src/gpio.js — full GPIO layout (GPFSEL0.., GPSET/GPCLR W1S/W1C,
+  GPLEV host-driven inputs, GPEDS W1C via write hook, GPREN/GPFEN/GPHEN/
+  GPLEN/GPAREN/GPAFEN, GPPUD): edges detected host-side at slice
+  boundaries, GPEDS bit set iff covered by an event enable (the pin
+  level mirrors into GPEDS for enabled pins), bank IRQ lines = any
+  covered GPEDS bit. THE W1C SELF-CLEAR BUG: syncIn must NOT pull GPEDS
+  from the window and W1C state.ev — the host's own mirror write would
+  self-clear the events before the IRQ check (ev0=0x0, delivered=0 in
+  the probe); the guest's W1C store is handled by the write hook
+  (guest accesses only) which re-mirrors the cleared cell.
+- src/uart0.js: TXIM (IMSC bit 5) added — irqActive() = (MIS & IMSC) !=
+  0 where TXINTR = TXFE&&TXIM, RXINTR = RXNE&&RXIM; MIS/RIS mirrors;
+  real-time RXINTR de-assert when the guest drains the FIFO (DR reads);
+  syncIn pulls IMSC/ICR (W1C absorb), onIrqChange for the local line.
+- src/sdhci.js: IRPT_EN (0x34) + IRPT_MASK (0x38) real semantics — line
+  = (raw & intEn & sigEn) != 0; +0x30 window shows the RAW status so the
+  sd guest's poll keeps working (Linux programs both registers
+  explicitly); W1C via the write hook (guest-only) + exported w1c() for
+  probes (host mem_write does NOT fire hooks); CMD hook range extended
+  to INTERRUPT+3 (end INCLUSIVE) — a range to INTERRUPT+4 would also
+  hook IRPT_EN writes and execute them as commands.
+- uart0 guest: phases RX (IRQ 57) -> TXIM (IRQ 57, de-armed in the
+  handler — no storm after eret). irq guest: timer C1 (IRQ 1) +
+  UART RX (IRQ 57) via bank 2. gpio guest: full vector + glue (IRQ_RET
+  magic at 0x3F00B22C), GPREN on BTN 29 -> IRQ 81, GPEDS W1C in the
+  handler. lirq guest: Phase B now C3@0x18 -> CS bit 3 -> bank-1 bit 3
+  -> IRQ 29/basic 29 (Linux's real timer line).
+- The GPIO button bug in main.js: getBtn must return the PIN BITMASK
+  (gpioBtn << 29), not gpioBtn — the guest polls GPLEV0 & (1<<29).
+- CRITICAL mode gating: syncLocalOut/rearmGpuLine drive the real
+  CPU_INTERRUPT_HARD line ONLY in LIRQ_MODE — the legacy-IC guests rely
+  on host-assisted delivery (irqElr recorded at slice end), and a real
+  mid-slice entry there resumes at PC 0 (irqElr never set; first
+  symptom: 'DBG syncIrqRet resume 0' and the uart0 TX phase dying).
+  The lirq glue erets natively (real resume); irq/uart0/gpio glues use
+  the IRQ_RET magic + host resume.
+- Probe conventions: gpio-probe maps the IC window (the guest now writes
+  IC_ENABLE_IRQS2), presses the button via btn << 29, and the repress
+  must happen AFTER 'GPREN armed' (an armed edge needs the level change
+  while the enable is live — pressing once at boot just polls); uart0-
+  probe waits for all 3 phases; sd-probe drives the IRPT window directly
+  via exec()/w1c() (host mem_write does not fire hooks).
+- NOTE: the fork source (/tmp/opencode/unicornjs-src) was wiped by a
+  /tmp purge after M21 — public/unicorn.js (gitignored built artifact)
+  is intact and all probes/E2Es pass with it; a future rebuild must
+  re-clone AlexAltea/unicorn.js @ 8028ec43 and re-apply the patch list
+  below (documented; NOT yet in src/patches/).
 
 ### Phase 2 — real devices
 
 - [x] BCM2836 local interrupt block at 0x40000000 (Phase 2a above).
-- Rework existing models from window semantics to true MMIO IRQ
-  semantics (PL011 RXIM/TXIM, system timer C1/C3, GPIO, SDHCI).
+- [x] Real legacy-IC 3-bank semantics + PL011 RXIM/TXIM + GPIO event
+      registers + SDHCI IRPT_EN/IRPT_MASK (Phase 2b above).
 - Slice loop changes: no run-until-idle (Linux never idles); fixed
   budget + interrupt check between slices; inject when DAIF.I clear.
 
@@ -247,17 +322,17 @@ Verified semantics (irqcore guest + probe, 13/13 PASS):
   plan changes (fallback: evaluate qemu-wasm embed as a second mode).
 - IRQ delivery semantics must be exact (level vs edge, masking, DAIF.I).
 - SDHCI/DMA under Linux is much harder than the FAT12 demo.
-- Keep M1–M19 regression green: 18 probes + browser E2Es must not break.
+- Keep M1–M19 regression green: 20 probes + browser E2Es must not break.
 
 ## Working conventions
 
 - Build: `bash build.sh` (cargo board wasm + guest programs + copies
   unicorn.js), then `npx vite build` for production.
 - Regression: `for p in branch csel clock dma fb gpio i2c instr irq mbox
-  mmu pwm sd smp spi stats uart0 uart1; do node test/$p-probe.mjs; done`
+  mmu pwm sd smp spi stats uart0 uart1 lirq mva; do node test/$p-probe.mjs; done`
   (all must PASS).
-- Browser E2E: vite on :5173 + headless chrome CDP (e.g. :9353), scripts
-  in /tmp/opencode/*-e2e.mjs.
+- Browser E2E: vite on :5173 + headless chrome CDP (e.g. :9334), scripts
+  in /tmp/opencode/*-e2e.mjs (phase2b-e2e.mjs covers irq/uart0/lirq/gpio).
 - Commit style: one long descriptive message per milestone, push to
   master.
 - README.md has a per-milestone History section — keep it updated.

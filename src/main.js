@@ -9,6 +9,8 @@ import { createUart1 } from './uart1.js';
 import { createUart0 } from './uart0.js';
 import { createSdhci } from './sdhci.js';
 import { createLocalInt } from './localint.js';
+import { createIc } from './ic.js';
+import { createGpio } from './gpio.js';
 
 const UART_WINDOW = 0x1000;
 const RAM_BASE = 0x0;
@@ -40,15 +42,11 @@ const TMR_DONE = TMR_BASE + 0x20;
 const CLOCK_MODE = 'clock';
 const CLOCK_MAX_SLICES = 60000;
 
-// BCM2837 GPIO (real layout). Writes are host-arbitrated like the timer:
-// the host pulls GPSET/GPCLR out of the window after each slice to track
-// output levels, and refreshes GPLEV before each slice so input pins show
-// the UI button. The 8 LEDs live on pins 21..28, the button on pin 29.
+// BCM2837 GPIO (see src/gpio.js): the real register layout with event
+// registers and two IRQ lines. Output levels are tracked host-side, inputs
+// are host-driven (the UI button), edges are detected at slice boundaries.
+// The 8 LEDs live on pins 21..28, the button on pin 29.
 const GPIO_BASE = 0x3F200000;
-const GPIO_WINDOW = GPIO_BASE; // already 4K-aligned
-const GPSET0 = GPIO_BASE + 0x1C;
-const GPCLR0 = GPIO_BASE + 0x28;
-const GPLEV0 = GPIO_BASE + 0x34;
 const GPIO_LEDS = [21, 22, 23, 24, 25, 26, 27, 28];
 const GPIO_BTN = 29;
 const GPIO_MODE = 'gpio';
@@ -106,7 +104,6 @@ const DMA_CS = DMA_BASE + 0x00;
 const DMA_CONBLK = DMA_BASE + 0x04;
 const DMA_ENABLE = 0x3F00E050;
 const DMA_DONE = 0x3F00E054;
-const IRQ_DMA0 = 1 << 16;
 const DMA_MAX_SLICES = 30000;
 let dmaInt = false;
 let dmaEnd = false;
@@ -155,8 +152,9 @@ let uart1LineStart = true; // next UART1 char starts a line (add the [u1] tag)
 
 // PL011 UART0 (see uart0.js): the real BCM2837 register model at
 // 0x3F201000. TX is emitted by a DR write hook, RX keys are queued by the
-// host (uart0Push) and popped by the guest's DR reads, and RXINTR drives
-// the interrupt controller's IRQ 57 line (bank 1, bit 25).
+// host (uart0Push) and popped by the guest's DR reads, and RXINTR/TXINTR
+// (IMSC bits 4/5) drive the interrupt controller's IRQ 57 line (bank 2,
+// bit 25).
 let uart0SyncOut = null;
 let uart0SyncIn = null;
 let uart0State = null;
@@ -165,12 +163,14 @@ let uart0IrqActive = null;
 
 // Host-arbitrated SDHCI (EMMC) controller (see sdhci.js): a FAT12 microSD
 // card at 0x3F300000 with a DONE host extension at +0x54. Guest parks on
-// SD_DONE after printing HELLO.TXT.
+// SD_DONE after printing HELLO.TXT. IRPT_EN/IRPT_MASK (0x34/0x38) gate the
+// IRQ line (bank-2 bit 30, IRQ 62).
 const SD_BASE = 0x3F300000;
 const SD_MAX_SLICES = 30000;
 let sdSyncOut = null;
 let sdSyncIn = null;
 let sdState = null;
+let sdIrqActive = null;
 
 export const PROGRAMS = {
   shell: 'shell.elf',
@@ -221,9 +221,10 @@ let mbxLastWrite = 0; // last MAIL1_WRITE value the host mirrored
 let mbxPending = false; // a reply is ready in MAIL0_READ
 let mbxAddr = 0; // reply address | channel
 
-let gpioOut = 0; // guest-driven output levels (built from GPSET/GPCLR)
 let gpioBtn = 0; // host-driven input: button pin high while held
+let gpio = null; // src/gpio.js model instance
 let gpioLedEls = null; // DOM spans for the LED panel
+let ic = null; // src/ic.js legacy interrupt controller instance
 
 let stats = { steps: 0, insns: 0, emuMs: 0, chars: 0, wallStart: 0 };
 
@@ -265,10 +266,12 @@ function boot(ucMod, uc, board, elf) {
   uc.mem_map(UART1_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(SD_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(LOCAL_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  gpio = createGpio(uc, ucMod, GPIO_BASE, {
+    getBtn: () => gpioBtn << GPIO_BTN,
+    onIrqChange: () => rearmGpuLine(uc),
+  });
+  ic = createIc(uc, ucMod, IC_BASE, icLines);
   localInt = createLocalInt(uc, ucMod, LOCAL_BASE, localLines);
-  // Real-time GPU-line de-assert: a guest TMR_CS ack must drop the local
-  // block's line before the handler eret's, or the stale high level
-  // re-triggers delivery (see tmrCsHook).
   uc.hook_add(
     ucMod.HOOK_MEM_WRITE,
     (u, access, addr, size, value) => tmrCsHook(u, access, Number(addr), Number(size), value),
@@ -280,13 +283,19 @@ function boot(ucMod, uc, board, elf) {
   // The PL011 model (src/uart0.js): TX chars are emitted at DR-write time
   // (same hook trick as the mini UART, so UART0 and UART1 chars keep the
   // guest's exact write order), RX keys are queued by the host and popped
-  // by the guest's DR reads, and RXINTR drives the IC's IRQ 57 line.
+  // by the guest's DR reads, and RXINTR/TXINTR drive the IC's IRQ 57 line.
   uart0SyncOut = null;
   uart0SyncIn = null;
-  const uart0 = createUart0(uc, ucMod, uart, (b) => {
-    stats.chars++;
-    board.pi_cons_push(b);
-  });
+  const uart0 = createUart0(
+    uc,
+    ucMod,
+    uart,
+    (b) => {
+      stats.chars++;
+      board.pi_cons_push(b);
+    },
+    () => rearmGpuLine(uc)
+  );
   uart0SyncOut = uart0.syncOut;
   uart0SyncIn = uart0.syncIn;
   uart0State = uart0.state;
@@ -301,16 +310,12 @@ function boot(ucMod, uc, board, elf) {
   mbxLastWrite = 0;
   mbxPending = false;
   mbxAddr = 0;
-  gpioOut = 0;
   gpioBtn = 0;
   fbW = 0;
   fbH = 0;
   fbDepth = 0;
   fbPitch = 0;
   fbReady = false;
-  icEnabled1 = 0;
-  icEnabled2 = 0;
-  icEnabledBasic = 0;
   irqElr = 0;
   irqInFlight = false;
   irqVector = 0;
@@ -350,10 +355,11 @@ function boot(ucMod, uc, board, elf) {
   uart1SyncIn = uart1.syncIn;
   uart1LineStart = true;
 
-  const sd = createSdhci(uc, ucMod, SD_BASE);
+  const sd = createSdhci(uc, ucMod, SD_BASE, () => rearmGpuLine(uc));
   sdSyncOut = sd.syncOut;
   sdSyncIn = sd.syncIn;
   sdState = sd.state;
+  sdIrqActive = sd.irqActive;
 
   loadElf(uc, elf);
 }
@@ -454,75 +460,38 @@ function fbTag(uc, addr, off, id, tsize) {
   }
 }
 
-// ---- BCM2835 interrupt controller (0x3F00B200): the "basic" pending
-// register and pending 1 share the same 32 lines; we model pending-1 with
-// the timer (bit 29), the PL011 UART (bit 25 = IRQ 57, the real line) and
-// DMA (bit 16) sources driven by host state, plus enable/disable masks
-// the guest writes. ----
-
-const IC_BASE = 0x3F00B200;
-const IC_PENDING_BASIC = IC_BASE + 0x00;
-const IC_PENDING1 = IC_BASE + 0x04;
-const IC_PENDING2 = IC_BASE + 0x08;
-const IC_ENABLE_IRQS1 = IC_BASE + 0x10;
-const IC_ENABLE_IRQS2 = IC_BASE + 0x14;
-const IC_ENABLE_BASIC = IC_BASE + 0x18;
-const IC_DISABLE_IRQS1 = IC_BASE + 0x1C;
-const IC_DISABLE_IRQS2 = IC_BASE + 0x20;
-const IC_DISABLE_BASIC = IC_BASE + 0x24;
-const IC_IRQ_TIMER1 = 1 << 29; // system timer compare 1
-const IC_IRQ_UART = 1 << 25; // PL011 UART0 = IRQ 57 (bank 1, bit 25)
+// ---- BCM2835 interrupt controller (0x3F00B200): the real 3-bank layout
+// (src/ic.js) — bank 1 (0x04/0x10/0x1C): system timer C0-C3 bits 0-3,
+// DMA0 bit 16, AUX bit 29; bank 2 (0x08/0x14/0x20): GPIO bits 17/18,
+// PL011 bit 25, SDHCI bit 30; basic (0x00/0x18/0x24) with any-bank bits
+// 8/9 + shortcut mirrors 10-20. Pending windows show (line & enabled).
+// The GPU line into the local block is the OR of every gated line. ----
 
 // BCM2836 ARM-local interrupt controller: per-core IRQ source registers
 // (0x40000060+4n) reported through a window, with real delivery — the host
 // drives CPU_INTERRUPT_HARD via uc.arm64_set_irq (src/localint.js).
 const LOCAL_BASE = 0x40000000;
+const IC_BASE = 0x3F00B200;
 
 let localInt = null;
 
-let icEnabled1 = 0;
-let icEnabled2 = 0;
-let icEnabledBasic = 0;
+// Host device lines -> the legacy IC (see src/ic.js).
+function icLines() {
+  return {
+    timer: tmrPending & 0xf,
+    dma0: dmaInt && (dmaEnable & 1) !== 0,
+    pl011: uart0IrqActive ? uart0IrqActive() : false,
+    sdhci: sdIrqActive ? sdIrqActive() : false,
+    gpio0: gpio ? gpio.irqActive(0) : false,
+    gpio1: gpio ? gpio.irqActive(1) : false,
+    aux: false,
+  };
+}
 
-// Pending lines are derived from the device state before every slice, and
-// enable/disable writes are pulled out after it (write-mask semantics, like
-// the other host-arbitrated windows). The same derivation is the GPU IRQ
-// line into the local interrupt block: any pending-and-enabled legacy IC
-// bit raises it.
+// The GPU IRQ line into the local interrupt block: any pending-and-enabled
+// legacy IC bit raises it.
 function gpuLine() {
-  const p1 =
-    (tmrPending & 4 ? IC_IRQ_TIMER1 : 0) |
-    (uart0IrqActive && uart0IrqActive() ? IC_IRQ_UART : 0) |
-    (dmaInt && (dmaEnable & 1) ? IRQ_DMA0 : 0);
-  return ((p1 & icEnabled1) !== 0 || (p1 & icEnabledBasic) !== 0) ? 1 : 0;
-}
-
-function syncIcOut(uc) {
-  const p1 =
-    (tmrPending & 4 ? IC_IRQ_TIMER1 : 0) |
-    (uart0IrqActive && uart0IrqActive() ? IC_IRQ_UART : 0) |
-    (dmaInt && (dmaEnable & 1) ? IRQ_DMA0 : 0);
-  writeU32(uc, IC_PENDING_BASIC, p1);
-  writeU32(uc, IC_PENDING1, p1);
-  writeU32(uc, IC_PENDING2, 0);
-}
-
-function syncIcIn(uc) {
-  const en = readU32(uc, IC_ENABLE_IRQS1);
-  const dis = readU32(uc, IC_DISABLE_IRQS1);
-  if (en) writeU32(uc, IC_ENABLE_IRQS1, 0);
-  if (dis) writeU32(uc, IC_DISABLE_IRQS1, 0);
-  icEnabled1 = (icEnabled1 | en) & ~dis;
-  const en2 = readU32(uc, IC_ENABLE_IRQS2);
-  const dis2 = readU32(uc, IC_DISABLE_IRQS2);
-  if (en2) writeU32(uc, IC_ENABLE_IRQS2, 0);
-  if (dis2) writeU32(uc, IC_DISABLE_IRQS2, 0);
-  icEnabled2 = (icEnabled2 | en2) & ~dis2;
-  const enB = readU32(uc, IC_ENABLE_BASIC);
-  const disB = readU32(uc, IC_DISABLE_BASIC);
-  if (enB) writeU32(uc, IC_ENABLE_BASIC, 0);
-  if (disB) writeU32(uc, IC_DISABLE_BASIC, 0);
-  icEnabledBasic = (icEnabledBasic | enB) & ~disB;
+  return ic ? ic.line() : 0;
 }
 
 // The local interrupt block's source lines: arch-timer bits come straight
@@ -545,7 +514,11 @@ function localLines() {
 function syncLocalOut(uc) {
   if (!localInt) return;
   localInt.syncOut(uc);
-  localInt.syncIrq(uc, (level) => uc.arm64_set_irq(level));
+  // Only LIRQ_MODE drives the real CPU_INTERRUPT_HARD line: the legacy-IC
+  // modes deliver host-assisted at slice boundaries (irqDeliver records
+  // irqElr for the magic-resume glue) and a real mid-slice entry there
+  // would resume at PC 0 (no irqElr).
+  if (mode === LIRQ_MODE) localInt.syncIrq(uc, (level) => uc.arm64_set_irq(level));
 }
 
 function syncLocalIn(uc) {
@@ -553,36 +526,49 @@ function syncLocalIn(uc) {
   localInt.syncIn(uc);
 }
 
+// Real-time IRQ de-assert: a guest ack (TMR_CS, GPEDS W1C, PL011 RX drain,
+// SDHCI W1C) must drop the local block's line before the handler eret's, or
+// the stale high level re-triggers delivery (the next slice-boundary sync
+// would be too late). Only LIRQ_MODE drives the real CPU_INTERRUPT_HARD
+// line: in the legacy-IC modes (IRQ_MODE/uart0/gpio) delivery is host-
+// assisted at slice boundaries (irqDeliver records irqElr), and a real
+// mid-slice entry would leave that machinery with no resume point.
+function rearmGpuLine(uc) {
+  if (localInt && mode === LIRQ_MODE) localInt.syncIrq(uc, (level) => uc.arm64_set_irq(level));
+}
+
 // A TMR_CS ack (or any CS write) from the guest re-derives the GPU line in
-// real time, so a level that dropped mid-slice cannot re-trigger after the
-// handler's eret (the next slice-boundary sync would be too late).
+// real time.
 function tmrCsHook(uc, access, addr, size, value) {
   tmrPending &= Number(value) & 0xf;
-  if (localInt) localInt.syncIrq(uc, (level) => uc.arm64_set_irq(level));
+  rearmGpuLine(uc);
 }
 
 // Deliver a pending, enabled IRQ at a slice boundary. reg_write(PC/ELR) is a
 // no-op in this unicorn build, so the delivery is host-assisted: the next
 // slice *starts* at the IRQ vector (VBAR + 0x280), and the vector stub
 // signals IRQ_RET when the handler is done — the host then resumes the guest
-// at the saved PC. While a handler is in flight no further delivery happens
-// (the DAIF.I mask is not observable through this build's PSTATE).
-const IC_IRQ_RET = IC_BASE + 0x2C;
+// at the saved PC. While a handler is in flight no further delivery happens.
+// Delivery is gated on DAIF.I being clear (uc_arm64_debug(1), bit 7) — the
+// same mask the real hardware checks — so a guest with interrupts masked is
+// never entered at the vector.
+const IC_IRQ_RET = 0x3F00B22C;
 let irqElr = 0;
 let irqInFlight = false;
 let irqVector = 0;
 let irqResume = 0;
 
+function daifI() {
+  return ((Number(uc.arm64_debug(1)) >> 7) & 1) === 1;
+}
+
 function irqDeliver(uc) {
-  let pending = readU32(uc, IC_PENDING1) & icEnabled1;
-  // The PENDING1 window is refreshed before each slice, so it can still hold
-  // device bits after the guest has cleared the source. Re-derive each line
-  // from host state: DMA0 once CS.INT is cleared, and the UART line once the
-  // handler has drained the RX FIFO (RXINTR follows the FIFO).
-  if (!(dmaInt && (dmaEnable & 1))) pending &= ~IRQ_DMA0;
-  if (uart0IrqActive && !uart0IrqActive()) pending &= ~IC_IRQ_UART;
-  if (!pending || irqInFlight) return;
-  if (mode === SMP_MODE) return;
+  if (irqInFlight || mode === SMP_MODE) return;
+  if (!ic || daifI()) return;
+  // ic.pending() is derived fresh from the device lines on every call (the
+  // pending windows are refreshed pre-slice, so they are already gated).
+  const p = ic.pending();
+  if ((p.b1 | p.b2 | p.basic) === 0) return;
   irqElr = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || uc.entry;
   irqInFlight = true;
   const vbar = Number(uc.reg_read_i32(ucMod.ARM64_REG_VBAR_EL1)) || 0x100000;
@@ -619,26 +605,9 @@ function syncMailboxIn(uc) {
   }
 }
 
-// GPIO: refresh input levels (GPLEV = guest outputs + host button) before a
-// slice, then pull GPSET/GPCLR out after it. GPSET/GPCLR stay set in the
-// window (real semantics: write-1 registers), so level tracking is monotone:
-// a bit set in GPSET latches the output high, a bit set in GPCLR latches low.
-function syncGpioOut(uc) {
-  const host = gpioBtn ? (1 << GPIO_BTN) : 0;
-  writeU32(uc, GPLEV0, (gpioOut & ~(1 << GPIO_BTN)) | host);
-  writeU32(uc, GPLEV0 + 4, 0); // pins 32..53 stay low
-}
-
-function syncGpioIn(uc) {
-  const set = readU32(uc, GPSET0);
-  const clr = readU32(uc, GPCLR0);
-  gpioOut = (gpioOut | set) & ~clr;
-  updateGpioPanel();
-}
-
 // The 8 LED dots mirror the guest-driven levels (red = on).
 function updateGpioPanel() {
-  if (mode !== GPIO_MODE || !gpioPanel) return;
+  if (mode !== GPIO_MODE || !gpioPanel || !gpio) return;
   if (!gpioLedEls) {
     gpioLedEls = [];
     for (const p of GPIO_LEDS) {
@@ -649,8 +618,9 @@ function updateGpioPanel() {
       gpioLedEls.push(el);
     }
   }
+  const out = gpio.state.out;
   for (let i = 0; i < GPIO_LEDS.length; i++) {
-    gpioLedEls[i].classList.toggle('on', (gpioOut & (1 << GPIO_LEDS[i])) !== 0);
+    gpioLedEls[i].classList.toggle('on', (out & (1 << GPIO_LEDS[i])) !== 0);
   }
 }
 
@@ -924,8 +894,8 @@ function runSlice(count) {
   irqVector = 0;
   syncTimerOut(uc);
   syncMailboxOut(uc);
-  syncGpioOut(uc);
-  syncIcOut(uc);
+  if (gpio) gpio.syncOut(uc);
+  if (ic) ic.syncOut(uc);
   syncLocalOut(uc);
   if (mode === LIRQ_MODE) {
     // The lirq guest's Phase A arms CNTP and waits for the host to advance
@@ -948,8 +918,11 @@ function runSlice(count) {
   stats.insns += count;
   syncTimerIn(uc);
   syncMailboxIn(uc);
-  syncGpioIn(uc);
-  syncIcIn(uc);
+  if (gpio) {
+    gpio.syncIn(uc);
+    updateGpioPanel();
+  }
+  if (ic) ic.syncIn(uc);
   syncLocalIn(uc);
   syncIrqRet(uc);
   syncMmuIn(uc);
@@ -1407,6 +1380,9 @@ function pressGpioBtn(down) {
   if (!uc || runBtn.disabled || mode !== GPIO_MODE) return;
   gpioBtn = down ? 1 : 0;
   gpioBtnEl.classList.toggle('held', !!down);
+  // The button level reaches the guest at the next slice; re-arm the local
+  // block line in case the level change set a GPIO event bit.
+  rearmGpuLine(uc);
   if (!gpioLoopActive) draw(runUntilIdle());
 }
 

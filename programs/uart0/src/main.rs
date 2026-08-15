@@ -5,8 +5,13 @@
 //! real hardware. The guest writes the baud divisors and line control,
 //! enables UARTEN|TXE|RXE, verifies the configuration read-back, prints
 //! with FR.TXFF pacing (never full in this model), then arms RXINTR
-//! (IMSC bit 4) — which drives the real PL011 IRQ line 57 (bank 1, bit
+//! (IMSC bit 4) — which drives the real PL011 IRQ line 57 (bank 2, bit
 //! 25) — and echoes every key the host sends, reporting MIS.
+//!
+//! Phase 3: TXIM (IMSC bit 5). The TX FIFO always has room in this model,
+//! so arming TXIM asserts the line immediately — the handler reads MIS,
+//! recognizes TXINTR, and de-arms TXIM so the line drops (a real driver's
+//! TX-empty drain). No storm: after the de-arm the IRQ line stays low.
 //!
 //! Vector table lives in the `.vectors` section at 0x100000 (linker.ld).
 
@@ -24,13 +29,16 @@ const MIS: u32 = UART0 + 0x40;
 const ICR: u32 = UART0 + 0x44;
 
 const IC_BASE: u32 = 0x3F00_B200;
-const IC_PENDING1: u32 = IC_BASE + 0x04;
-const IC_ENABLE_IRQS1: u32 = IC_BASE + 0x10;
+const IC_PENDING2: u32 = IC_BASE + 0x08;
+const IC_ENABLE_IRQS2: u32 = IC_BASE + 0x14;
 
-const IRQ_UART: u32 = 1 << 25; // PL011 UART0 = IRQ 57 (bank 1, bit 25)
+const IRQ_UART: u32 = 1 << 25; // PL011 UART0 = IRQ 57 (bank 2, bit 25)
 
 const FR_RXFE: u32 = 1 << 4;
 const RXIM: u32 = 1 << 4; // IMSC/MIS bit 4
+const TXIM: u32 = 1 << 5; // IMSC/MIS bit 5
+
+static mut PHASE: u32 = 0; // 0 = RX phase, 1 = TXIM phase, 2 = done
 
 #[inline(always)]
 fn mmio_read(a: u32) -> u32 {
@@ -92,18 +100,30 @@ core::arch::global_asm!(
 
 #[no_mangle]
 pub extern "C" fn irq_handler_rust() {
-    let p = mmio_read(IC_PENDING1);
-    if p & IRQ_UART != 0 {
-        puts("uart0: RXINTR fired (MIS 0x");
-        putx(mmio_read(MIS) as u64);
-        puts(")\r\n");
-        while mmio_read(FR) & FR_RXFE == 0 {
-            let ch = (mmio_read(DR) & 0xff) as u8; // reading DR pops the FIFO
-            puts("uart0: [rx '");
-            putc(ch);
-            puts("']\r\n");
+    let p2 = mmio_read(IC_PENDING2);
+    if p2 & IRQ_UART != 0 {
+        let mis = mmio_read(MIS);
+        if mis & TXIM != 0 {
+            puts("uart0: TXINTR fired (MIS 0x");
+            putx(mis as u64);
+            puts(")\r\n");
+            mmio_write(IMSC, RXIM); // de-arm TXIM: the line drops, no storm
+            puts("uart0: TXIM de-armed\r\n");
+            unsafe { PHASE = 2; }
         }
-        mmio_write(ICR, RXIM); // W1C: absorb (the line follows the FIFO)
+        if mis & RXIM != 0 {
+            puts("uart0: RXINTR fired (MIS 0x");
+            putx(mis as u64);
+            puts(")\r\n");
+            while mmio_read(FR) & FR_RXFE == 0 {
+                let ch = (mmio_read(DR) & 0xff) as u8; // reading DR pops the FIFO
+                puts("uart0: [rx '");
+                putc(ch);
+                puts("']\r\n");
+            }
+            mmio_write(ICR, RXIM); // W1C: absorb (the line follows the FIFO)
+            unsafe { PHASE = 1; }
+        }
     }
 }
 
@@ -155,8 +175,21 @@ pub extern "C" fn rust_main() -> ! {
             options(nostack)
         );
         mmio_write(IMSC, RXIM); // arm RXINTR
-        mmio_write(IC_ENABLE_IRQS1, IRQ_UART); // enable line 57
+        mmio_write(IC_ENABLE_IRQS2, IRQ_UART); // enable line 57 (bank 2)
         puts("uart0: RXINTR armed (IMSC bit 4) -> IRQ 57 — type a key\r\n");
+        while PHASE != 1 {
+            core::arch::asm!("msr daifclr, #2", options(nostack));
+            core::hint::spin_loop();
+        }
+        // Phase 3: arm TXIM — the TX FIFO always has room, so the line
+        // asserts immediately and the handler de-arms it.
+        mmio_write(IMSC, RXIM | TXIM);
+        puts("uart0: TXIM armed (IMSC bit 5)\r\n");
+        while PHASE != 2 {
+            core::arch::asm!("msr daifclr, #2", options(nostack));
+            core::hint::spin_loop();
+        }
+        puts("uart0: TX phase done - no IRQ storm after the de-arm\r\n");
         loop {
             core::arch::asm!("msr daifclr, #2", options(nostack));
             core::hint::spin_loop();

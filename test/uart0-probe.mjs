@@ -8,6 +8,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const MUnicorn = require(join(__dirname, '..', 'public', 'unicorn.js'));
 const { parseElf, loadElf } = await import(join(__dirname, '..', 'src', 'elf.js'));
 const { createUart0 } = await import(join(__dirname, '..', 'src', 'uart0.js'));
+const { createIc } = await import(join(__dirname, '..', 'src', 'ic.js'));
 
 const RAM_SIZE = 0x400000;
 const SLICE_INSNS = 512;
@@ -15,11 +16,7 @@ const UART_WINDOW = 0x1000;
 const PROG = join(__dirname, '..', 'public', 'programs', 'uart0.elf');
 
 const IC_BASE = 0x3f00b200;
-const IC_PENDING1 = IC_BASE + 0x04;
-const IC_ENABLE_IRQS1 = IC_BASE + 0x10;
 const IC_IRQ_RET = IC_BASE + 0x2c;
-
-const IRQ_UART = 1 << 25; // PL011 UART0 = IRQ 57 (bank 1, bit 25)
 
 function writeU32(uc, addr, v) {
   uc.mem_write(addr, [v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff]);
@@ -49,7 +46,6 @@ async function main() {
   const uart0 = createUart0(uc, ucMod, uart, (b) => board.pi_cons_push(b));
   const { state, syncOut, syncIn, push, irqActive } = uart0;
 
-  let icEnabled1 = 0;
   let chars = '';
   let delivered = 0;
   let irqElr = 0;
@@ -57,17 +53,16 @@ async function main() {
   let irqVector = 0;
   let irqResume = 0;
 
-
-  const syncIcOut = () => {
-    writeU32(uc, IC_PENDING1, irqActive() ? IRQ_UART : 0);
-  };
-  const syncIcIn = () => {
-    const en = readU32(uc, IC_ENABLE_IRQS1);
-    if (en) {
-      icEnabled1 |= en;
-      writeU32(uc, IC_ENABLE_IRQS1, 0);
-    }
-  };
+  // The real 3-bank legacy IC (src/ic.js), fed by the PL011's line.
+  const ic = createIc(uc, ucMod, IC_BASE, () => ({
+    timer: 0,
+    dma0: false,
+    pl011: irqActive(),
+    sdhci: false,
+    gpio0: false,
+    gpio1: false,
+    aux: false,
+  }));
   const syncIrqRet = () => {
     const r = readU32(uc, IC_IRQ_RET);
     if (r !== 0) {
@@ -76,9 +71,10 @@ async function main() {
     }
   };
   const irqDeliver = () => {
-    let pending = readU32(uc, IC_PENDING1) & icEnabled1;
-    if (!irqActive()) pending &= ~IRQ_UART; // stale PENDING1 window
-    if (!pending || irqInFlight) return;
+    if (irqInFlight) return;
+    if (((Number(uc.arm64_debug(1)) >> 7) & 1) === 1) return; // DAIF.I set
+    const p = ic.pending();
+    if ((p.b1 | p.b2 | p.basic) === 0) return;
     irqElr = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || elf.entry;
     irqInFlight = true;
     const vbar = Number(uc.reg_read_i32(ucMod.ARM64_REG_VBAR_EL1)) || 0x100000;
@@ -99,10 +95,10 @@ async function main() {
     if (irqResume) irqInFlight = false;
     irqResume = 0;
     irqVector = 0;
-    syncIcOut();
+    ic.syncOut(uc);
     syncOut(uc);
     uc.emu_start(pc, 0, 0, SLICE_INSNS);
-    syncIcIn();
+    ic.syncIn(uc);
     syncIrqRet();
     syncIn(uc);
     const out = drain();
@@ -118,6 +114,11 @@ async function main() {
   push(0x48); // 'H' into the PL011 RX FIFO
   for (let i = 0; i < 30000 && !chars.includes("[rx 'H']"); i++) chars += slice();
 
+  // Phase 3: the guest arms TXIM -> the line asserts immediately (TXFE
+  // always set) -> the handler de-arms it -> no storm after the de-arm.
+  for (let i = 0; i < 30000 && !chars.includes('TX phase done'); i++) chars += slice();
+
+  const txFired = (chars.match(/TXINTR fired/g) || []).length;
   const checks = [
     ['PL011 banner:', chars.includes('uart0: BCM2837 PL011 @ 0x3F201000')],
     ['config latched (IBRD 1, FBRD 40, LCRH 0x70, CR 0x301):', chars.includes('IBRD 1 FBRD 28 (115200 @ 3 MHz), LCRH 0x70, CR 0x301')],
@@ -126,6 +127,11 @@ async function main() {
     ['RXINTR fired with MIS 0x10:', chars.includes('RXINTR fired (MIS 0x10)')],
     ['key echoed via DR read:', chars.includes("[rx 'H']")],
     ['IRQ delivered through the IC:', delivered >= 1],
+    ['TXIM armed:', chars.includes('TXIM armed (IMSC bit 5)')],
+    ['TXINTR fired (MIS 0x20):', chars.includes('TXINTR fired (MIS 0x20)')],
+    ['TXIM de-armed by the handler:', chars.includes('TXIM de-armed')],
+    ['TX phase completed:', chars.includes('TX phase done - no IRQ storm after the de-arm')],
+    ['TXINTR fired exactly once (no storm):', txFired === 1],
   ];
   for (const [name, ok] of checks) console.log(ok ? 'PASS' : 'FAIL', '-', name);
   console.log('deliveries:', delivered, '| config:', JSON.stringify(state));

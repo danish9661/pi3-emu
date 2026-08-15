@@ -3,6 +3,7 @@ import { readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { createLocalInt } from '../src/localint.js';
+import { createIc } from '../src/ic.js';
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -18,11 +19,6 @@ const TMR_CS = TMR_BASE + 0x00;
 const TMR_CLO = TMR_BASE + 0x04;
 const TMR_CMP = TMR_BASE + 0x0c;
 const IC_BASE = 0x3f00b200;
-const IC_PENDING_BASIC = IC_BASE + 0x00;
-const IC_PENDING1 = IC_BASE + 0x04;
-const IC_ENABLE_IRQS1 = IC_BASE + 0x10;
-const IC_ENABLE_BASIC = IC_BASE + 0x18;
-const IC_IRQ_TIMER1 = 1 << 29;
 const LOCAL_BASE = 0x40000000;
 const LOCAL_IRQ_SRC = LOCAL_BASE + 0x60;
 
@@ -88,8 +84,6 @@ async function main() {
   let tmrLastCS = 0;
   let tmrCompares = [0, 0, 0, 0];
   let tmrCrossed = [false, false, false, false];
-  let icEnabled1 = 0;
-  let icEnabledBasic = 0;
 
   function syncTimerOut() {
     writeU32(uc, TMR_CLO, clo);
@@ -115,23 +109,17 @@ async function main() {
     if (cs !== tmrLastCS) tmrPending &= cs & 0xf;
   }
 
-  const p1 = () =>
-    (tmrPending & 4 ? IC_IRQ_TIMER1 : 0);
-  const gpuLine = () => ((p1() & icEnabled1) !== 0 || (p1() & icEnabledBasic) !== 0) ? 1 : 0;
-
-  function syncIcOut() {
-    writeU32(uc, IC_PENDING_BASIC, p1());
-    writeU32(uc, IC_PENDING1, p1());
-  }
-
-  function syncIcIn() {
-    const en = readU32(uc, IC_ENABLE_IRQS1);
-    if (en) writeU32(uc, IC_ENABLE_IRQS1, 0);
-    icEnabled1 |= en;
-    const enB = readU32(uc, IC_ENABLE_BASIC);
-    if (enB) writeU32(uc, IC_ENABLE_BASIC, 0);
-    icEnabledBasic |= enB;
-  }
+  // The real 3-bank legacy IC: Phase B enables C3 (bank-1 bit 3).
+  const ic = createIc(uc, ucMod, IC_BASE, () => ({
+    timer: tmrPending & 0xf,
+    dma0: false,
+    pl011: false,
+    sdhci: false,
+    gpio0: false,
+    gpio1: false,
+    aux: false,
+  }));
+  const gpuLine = () => ic.line();
 
   const local = createLocalInt(uc, ucMod, LOCAL_BASE, () => ({
     cntps: uc.arm64_debug(13) ? 1 : 0,
@@ -161,14 +149,14 @@ async function main() {
 
   function runSlice(count = 512) {
     syncTimerOut();
-    syncIcOut();
+    ic.syncOut(uc);
     local.syncOut(uc);
     local.syncIrq(uc, setLine);
     let pc = Number(uc.reg_read_i64(ucMod.ARM64_REG_PC));
     if (!pc) pc = uc.entry;
     uc.emu_start(pc, 0, 0, count);
     syncTimerIn();
-    syncIcIn();
+    ic.syncIn(uc);
     local.syncIn(uc);
   }
 
@@ -191,9 +179,9 @@ async function main() {
   check('timer disabled in handler: no re-entry', readU64(uc, scratch + 32) === 1n);
 
   // ---------------- Phase B: GPU (local source bit 8) ----------------
-  console.log('Phase B: system timer C1 -> IC -> GPU line -> local bit 8');
+  console.log('Phase B: system timer C3 -> IC -> GPU line -> local bit 8');
   runSlice(2048); // guest enables the line in the IC and programs the compare
-  const cmp = tmrCompares[2];
+  const cmp = tmrCompares[3];
   check('guest programmed the compare', cmp !== 0, 'cmp=0x' + cmp.toString(16));
   clo = cmp + 0x10000; // jump the clock past the compare
   runSlice(4096); // match fires -> GPU line -> delivery
@@ -201,10 +189,10 @@ async function main() {
     'flag=0x' + readU64(uc, scratch + 72).toString(16));
   check('local source reg shows GPU bit 8', readU64(uc, scratch + 56) === 0x100n,
     'src=0x' + readU64(uc, scratch + 56).toString(16));
-  check('TMR_CS showed the C1 match pending', (readU64(uc, scratch + 64) & 4n) !== 0n,
+  check('TMR_CS showed the C3 match pending', (readU64(uc, scratch + 64) & 8n) !== 0n,
     'cs=0x' + readU64(uc, scratch + 64).toString(16));
   runSlice(512);
-  check('ack cleared C1: no re-entry', readU64(uc, scratch + 72) === 2n);
+  check('ack cleared C3: no re-entry', readU64(uc, scratch + 72) === 2n);
   check('GPU line de-asserted', Number(uc.arm64_debug(2)) === 0);
   check('ext IRQ line clean', (Number(uc.arm64_debug(0)) & 2) === 0);
 

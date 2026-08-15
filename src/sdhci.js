@@ -14,6 +14,13 @@
 //   +0x20 DATA         real SDHCI position; unused here (see +0x100)
 //   +0x30 INTERRUPT    CMD_COMPLETE bit 0, BUFFER_READ_READY bit 5;
 //                      the guest clears by writing 1 (write-1-to-clear)
+//   +0x34 IRPT_EN      interrupt status enable (R/W): raw bits are shown in
+//                      the +0x30 window AND drive the IRQ line only while
+//                      enabled here (real SDHCI semantics; the +0x30 window
+//                      shows the raw status so the sd guest's poll keeps
+//                      working — Linux programs both registers explicitly)
+//   +0x38 IRPT_MASK    interrupt signal enable (R/W): the IRQ line is
+//                      (raw & IRPT_EN & IRPT_MASK) != 0
 //   +0x54 DONE         host extension: the guest writes 1 when finished
 //   +0x100 BLOCK       512-byte block buffer (model detail: the real
 //                      controller pops the data FIFO at +0x20 on every
@@ -82,11 +89,13 @@ function makeDisk() {
   return s;
 }
 
-export function createSdhci(uc, ucMod, base) {
+export function createSdhci(uc, ucMod, base, onIrqChange) {
   const ARG = base + 0x00;
   const CMD = base + 0x04;
   const BLOCK = base + 0x100;
   const INTERRUPT = base + 0x30;
+  const IRPT_EN = base + 0x34;
+  const IRPT_MASK = base + 0x38;
   const DONE = base + 0x54;
 
   const IRPT_CMD_COMPLETE = 1;
@@ -102,6 +111,8 @@ export function createSdhci(uc, ucMod, base) {
     blockDirty: false,
     commands: [], // executed [index, arg] pairs (probe/status)
     done: false,
+    intEn: 0,
+    sigEn: 0,
   };
 
   function setResp(...w) {
@@ -150,11 +161,17 @@ export function createSdhci(uc, ucMod, base) {
   uc.hook_add(
     ucMod.HOOK_MEM_WRITE,
     (u, access, addr, size, value) => {
-      exec(Number(value) & 0x3f, readU32(uc, ARG));
+      const a = Number(addr);
+      if (a >= INTERRUPT && a < INTERRUPT + 4) {
+        w1c(Number(value));
+      } else {
+        exec(Number(value) & 0x3f, readU32(uc, ARG));
+      }
+      if (onIrqChange) onIrqChange();
     },
     null,
     CMD,
-    CMD + 4
+    INTERRUPT + 3
   );
 
   function syncOut(uc) {
@@ -162,20 +179,34 @@ export function createSdhci(uc, ucMod, base) {
       writeU32(uc, base + 0x10 + i * 4, state.resp[i]);
     }
     writeU32(uc, INTERRUPT, state.irq);
+    writeU32(uc, IRPT_EN, state.intEn);
+    writeU32(uc, IRPT_MASK, state.sigEn);
     if (state.blockDirty) {
       uc.mem_write(BLOCK, state.block);
       state.blockDirty = false;
     }
   }
 
-  function syncIn(uc) {
-    // Write-1-to-clear on INTERRUPT.
-    const w = readU32(uc, INTERRUPT);
-    if (w & state.irq) state.irq &= ~w;
-    if (readU32(uc, DONE) !== 0) state.done = true;
+  // Write-1-to-clear on the raw status (state-only: guest hook + probes).
+  function w1c(mask) {
+    const w = mask & state.irq;
+    if (w) state.irq &= ~w;
   }
 
-  return { state, syncOut, syncIn };
+  function syncIn(uc) {
+    // The INTERRUPT W1C happens in the write hook (guest accesses only) —
+    // a window pull here would self-clear the host's own mirror write.
+    state.intEn = readU32(uc, IRPT_EN);
+    state.sigEn = readU32(uc, IRPT_MASK);
+    if (readU32(uc, DONE) !== 0) state.done = true;
+    if (onIrqChange) onIrqChange();
+  }
+
+  // The IRQ line into the legacy IC bank-2 bit 30 (GPU IRQ 62): raw bits
+  // must be both status-enabled and signal-enabled (real SDHCI semantics).
+  const irqActive = () => (state.irq & state.intEn & state.sigEn) !== 0;
+
+  return { state, syncOut, syncIn, irqActive, exec, w1c };
 }
 
 function writeU32(uc, addr, v) {
