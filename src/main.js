@@ -18,9 +18,9 @@ const RAM_SIZE = 0x400000;
 const SLICE_INSNS = 512;
 const MAX_SLICES = 5000;
 
-// Linux boot (M23): a real arm64 kernel Image loaded at 0x80000 (the entry
+// Linux boot (M23): a real arm64 kernel Image loaded at 0x200000 (the entry
 // is base + the Image header's text_offset), the stock bcm2837-rpi-3-b DTB
-// at 0x2000000 (x0 = dtb, x1..x3 = 0, MMU off — the arm64 boot protocol).
+// at 0x3000000 (x0 = dtb, x1..x3 = 0, MMU off — the arm64 boot protocol).
 // RAM grows to 128 MB, and every peripheral address we don't model gets a
 // zero-return "black hole" map so stray driver probes fail gracefully
 // instead of taking a data abort. The arch timer counter is ticked at the
@@ -29,8 +29,15 @@ const MAX_SLICES = 5000;
 // vectors/eret) like LIRQ_MODE.
 const LINUX_MODE = 'linux';
 const LINUX_RAM_SIZE = 0x8000000;
-const LINUX_IMAGE = 0x80000;
-const LINUX_DTB = 0x2000000;
+// The arm64 boot protocol wants a 2M-aligned base (text_offset=0). The fork
+// cannot fetch at pc 0 (a TB-gen quirk), so the image goes at 0x200000: the
+// kernel's tables map VA KIMAGE+X -> phys 0x200000+X, and the fork's
+// truncated fetches of KIMAGE VAs (0x08000000+X) resolve through the
+// pre-seeded idmap aliases (seedIdmapAliases). The old 0x80000 load made
+// the kernel's own mapping run 0x80000 off — everything faulted at slice
+// 4243 (see test/linux-probe.mjs).
+const LINUX_IMAGE = 0x200000;
+const LINUX_DTB = 0x3000000;
 
 // SMP mailbox window (host-arbitrated device shared by all cores):
 //   +0x00 START_ENTRY[3]  core 0 writes entry addresses for cores 1..3
@@ -400,14 +407,17 @@ function boot(ucMod, uc, board, elf, opts = {}) {
         [I2C_BASE, 0x1000],
       ]
     );
-    const { image, dtb } = opts.linux;
+    const { image, dtb: dtbRaw } = opts.linux;
+    const dtb = new Uint8Array(dtbRaw);
+    patchDtbRam(dtb); // memory@0 size -> 128 MB (we only mapped 128 MB)
     const textOffset = Number(
       BigInt(image[8] | (image[9] << 8) | (image[10] << 16) | (image[11] << 24)) |
         ((BigInt(image[12]) | (BigInt(image[13]) << 8n) | (BigInt(image[14]) << 16n) | (BigInt(image[15]) << 24n)) << 32n)
     );
     const entry = LINUX_IMAGE + textOffset;
     writeAll(uc, LINUX_IMAGE, image);
-    writeAll(uc, LINUX_DTB, dtb);
+    seedIdmapAliases(uc); // fork fetch aliases for the truncated KIMAGE VAs
+    writeAll(uc, LINUX_DTB, patchDtbChosen(dtb)); // earlycon + console bootargs
     uc.entry = entry;
     uc.reg_write(ucMod.ARM64_REG_SP, ramSize - 0x10000);
     uc.reg_write(ucMod.ARM64_REG_X0, LINUX_DTB);
@@ -436,6 +446,93 @@ function mapBlackHole(uc, ucMod, lo, hi, skip) {
     if (e > cur) cur = e;
   }
   if (hi > cur) uc.mem_map(cur, hi - cur, ucMod.PROT_READ | ucMod.PROT_WRITE);
+}
+
+// Patch the DTB's memory@0 reg size (offset of the <0 0x40000000> size cell)
+// to 128 MB so the kernel only touches RAM we actually mapped.
+function patchDtbRam(dtb) {
+  const pat = [0x40, 0x00, 0x00, 0x00];
+  for (let i = 0; i + 8 <= dtb.length; i++) {
+    if (dtb[i] === 0 && dtb[i + 1] === 0 && dtb[i + 2] === 0 && dtb[i + 3] === 0 &&
+        dtb[i + 4] === pat[0] && dtb[i + 5] === pat[1] && dtb[i + 6] === pat[2] && dtb[i + 7] === pat[3]) {
+      dtb[i + 4] = 0x08; // 0x08000000
+      return true;
+    }
+  }
+  return false;
+}
+
+// Insert a "bootargs" property into the /chosen node and rebuild the FDT
+// (append the new string to the strings block). Returns the new buffer.
+function patchDtbChosen(dtb) {
+  const be32 = (o) => (((dtb[o] << 24) | (dtb[o + 1] << 16) | (dtb[o + 2] << 8) | dtb[o + 3]) >>> 0);
+  const put32 = (b, o, v) => {
+    b[o] = (v >>> 24) & 0xff; b[o + 1] = (v >>> 16) & 0xff; b[o + 2] = (v >>> 8) & 0xff; b[o + 3] = v & 0xff;
+  };
+  const offStruct = be32(8), offStrings = be32(12), sizeStruct = be32(36), sizeStrings = be32(32);
+  const bootargs = 'earlycon=pl011,0x3f201000 console=ttyAMA0,115200';
+  const val = new Uint8Array(bootargs.length + 1);
+  for (let i = 0; i < bootargs.length; i++) val[i] = bootargs.charCodeAt(i);
+  const propPad = (4 - (val.length % 4)) % 4;
+  let o = offStruct, chosenEnd = -1;
+  const stack = [];
+  while (o < offStruct + sizeStruct) {
+    const t = be32(o);
+    if (t === 1) {
+      let i = o + 4; while (dtb[i] !== 0) i++;
+      stack.push(String.fromCharCode(...dtb.subarray(o + 4, i)));
+      o = i + 1 + ((4 - ((i - o - 4 + 1) % 4)) % 4);
+    } else if (t === 2) {
+      if (stack.length && stack[stack.length - 1] === 'chosen') chosenEnd = o;
+      stack.pop();
+      o += 4;
+    } else if (t === 3) {
+      const len = be32(o + 4);
+      o += 12 + len + ((4 - (len % 4)) % 4);
+    } else break;
+  }
+  if (chosenEnd < 0) return dtb;
+  const strOff = sizeStrings;
+  const prop = new Uint8Array(12 + val.length + propPad);
+  put32(prop, 0, 3); // FDT_PROP
+  put32(prop, 4, val.length);
+  put32(prop, 8, strOff);
+  prop.set(val, 12);
+  const nbuf = new Uint8Array(dtb.length + prop.length + 9);
+  nbuf.set(dtb.subarray(0, chosenEnd));
+  nbuf.set(prop, chosenEnd);
+  nbuf.set(dtb.subarray(chosenEnd, offStrings), chosenEnd + prop.length);
+  nbuf.set(dtb.subarray(offStrings, offStrings + sizeStrings), offStrings + prop.length);
+  for (let i = 0; i < 8; i++) nbuf[offStrings + prop.length + sizeStrings + i] = 'bootargs\0'.charCodeAt(i);
+  nbuf[offStrings + prop.length + sizeStrings + 8] = 0;
+  nbuf[0] = 0xd0; nbuf[1] = 0x0d; nbuf[2] = 0xfe; nbuf[3] = 0xed;
+  put32(nbuf, 4, nbuf.length); // totalsize
+  put32(nbuf, 8, offStruct); // off_dt_struct (unchanged)
+  put32(nbuf, 12, offStrings + prop.length); // off_dt_strings (shifted)
+  put32(nbuf, 32, sizeStrings + 9); // size_dt_strings
+  put32(nbuf, 36, sizeStruct + prop.length); // size_dt_struct
+  return nbuf;
+}
+
+// The fork's fetch path truncates VAs to 32 bits and walks them through
+// TTBR0 (the idmap). The kernel's own create_idmap only fills the idmap L2
+// entries for phys [0, 0x2866000) (blocks 0..0x14), so pre-seed the idmap
+// L2 (phys 0x19e2000 = base 0x200000 + init_idmap_pg_dir image offset
+// 0x17e0000 + 0x2000, per System.map) with:
+//   [0x40..0x51] = 2M blocks mapping truncated KIMAGE VAs back to image phys
+//   [0x80]       = a table pointer to an L3 page for the KPTI trampoline
+// The L3 page is the reserved_pg_dir page @0x1908000 (the kernel loads it as
+// the empty early ttbr1 and never writes it) with the trampoline's 3 pages
+// (phys 0x1902000..0x1905000, not 2M-aligned) as 4K entries.
+function seedIdmapAliases(uc) {
+  const BASE = LINUX_IMAGE;
+  const u64le = (v) => [v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff, 0, 0, 0, 0];
+  const idmapL2 = BASE + 0x17e2000;
+  const blocks = [];
+  for (let i = 0x40; i <= 0x51; i++) blocks.push(...u64le((BASE + ((i - 0x40) << 21)) | 0x701));
+  uc.mem_write(idmapL2 + 0x40 * 8, blocks);
+  uc.mem_write(idmapL2 + 0x80 * 8, u64le(BASE + 0x1708003));
+  uc.mem_write(BASE + 0x1708000, [...u64le(BASE + 0x1702003), ...u64le(BASE + 0x1703003), ...u64le(BASE + 0x1704003)]);
 }
 
 // The "VideoCore": answers a property-tags request buffer the guest wrote
@@ -1471,7 +1568,7 @@ async function run() {
       });
       linuxRun(); // async: rAF-paced slices, real IRQs via the local block
       setStatus(
-        `booted — running linux — arm64 Image @ 0x80000, DTB @ 0x2000000, 128 MB RAM — press Reboot to re-run`
+        `booted — running linux — arm64 Image @ 0x200000, DTB @ 0x3000000, 128 MB RAM — press Reboot to re-run`
       );
     } else {
       mode = 'single';
