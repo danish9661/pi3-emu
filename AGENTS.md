@@ -291,6 +291,150 @@ for lirq. Verified: 20/20 probes + 9/9 browser E2E checks.
   re-clone AlexAltea/unicorn.js @ 8028ec43 and re-apply the patch list
   below (documented; NOT yet in src/patches/).
 
+### Linux 6.1.182 boot crash — CURRENT WORK (fork-internal abort, traced)
+
+Crash: Linux 6.1.182 boot aborts inside the rebuilt core (public/
+unicorn.js wasm) at pc 0xffff8000097342d8 (= -0x7ffff68cbd28,
+early_security_init first fetch), lr 0x9710a14, sp 0x9e23e30,
+mmu_idx 8, ttbr 0x24ed000, walk_ret 0, fill_count 0x3b78,
+ptw_count 0xb235, slice 6484 — deterministic across runs. The stock
+(fork) wasm OOBs; the 1GB-patched build aborts internally instead.
+
+Root cause (PINNED by marker instrumentation, ~18 runs):
+- The abort is the fork's assert wrapper $202 (WAT $202 = binary
+  func 231, call opcode `10 e7 01`; in the .wat text $N = binary
+  N+29; call $293 = binary 322 = `10 c2 02` — CAREFUL: `10 42 02`
+  is call 66 + block, NOT call 322).
+- Chain: $1745 (12-param i64 helper, elem-table idx 586, called
+  via call_indirect — 372 call_indirect sites, not statically
+  traceable) → $293 (error helper: if msg!=0 log via $126 then
+  abort via $202) → $202 (assert wrapper) → $429(msg,len) → $605
+  (stores msg,len at 144952/144956 ONLY if 144952==0, first
+  abort wins) → abort import. Marker hits: 202 (run4), 3002=$293
+  (run5), 3105=$1745 (run6).
+- $1745 body (fired path): return 0 if $2!=0; return 0 if
+  [S+25064] (signed i32) >= 0 where S=[env+224]; then
+  [env+11412]==1 → reload S; [S+16692]=0; [env+12274]!=1 →
+  $293(S, load(144968)) [FIRED — so the msg cell 144968 reads 0];
+  else [env+12274]=0, $202(S).
+- $202 body: $2=[S+16684]=env backptr; $1=[env+11412]; if $1==1
+  reload; [S+16676]=1; msg = env + $1*156 + 1272; call $429(msg,1).
+  C-msg observed ptr=0 len=1 (computed msg ≡ 0 mod 2^32 — still
+  unexplained).
+- $1745 is a TCG-style helper checking an invariant on struct S:
+  S = 38256-byte struct allocated in $1417 (WAT line 435434) via
+  $325(16,38256)+memory.fill zero: [S+16684]=env backptr,
+  [S+16688]=S+38160 (register-ID table: 11,12,12,12,13,14,15,16,
+  17,39,40,41,42,43,44,45,46,47,48,49,50… — UC-reg-enum-like),
+  [env+224]=S. So env+224 → S, S+16684 → env (2-cycle).
+- Field [S+25064]: written ONLY via 16-bit stores ($726 line
+  200605: store16 25064 = load16(25064) + (x-y); $4436 line
+  854818: store16 0 at 25066; $4436 line 856376: i64.store16
+  saturating at 25064). $4436 also loops `br_if while i32.load
+  25064 < 0` (a saturating/repair loop). With zero-init + 16-bit
+  writes, an i32 signed load at 25064 should be ≥ 0 — so the
+  abort means either S/env+224 is stale/garbage or an overlapping
+  32/64-bit store exists (not found by WAT text grep).
+- [env+12274] flag: set to 1 in $1392 (line 431223) during
+  exception handling, cleared after (line 431253); $1745 aborts
+  via $293 (log path) when != 1 — fired means the flag was 0.
+- [S+16680] reason field set before abort by OTHER sites: -1
+  ($721), 65536=0x10000 ($724), 65538=0x10002 ($4436), 65540=
+  0x10004 ($925), 65541=0x10005 ($600). Fired path sets
+  [S+16692]=0 (not 16680).
+- Sibling string "sve_ldffsdu_le_zss" at data offset 3717 and
+  $4436's field family (25064/16672/16680/16692) suggest $1745 is
+  an SVE/vector helper assert wrapper.
+
+Tooling (rebuildable, all under /tmp/opencode/ltest — /tmp is
+WIPED REPEATEDLY, redo from scratch each time):
+- extract-wasm.mjs: pull wasm bytes out of public/unicorn.js
+  (js-string at ~3361+14); wasm-dis → uc2.wat (~867k lines).
+- patchbin3.js: binary patcher (top-down rebuild; MUST update code
+  section size LEB: 1158787 + SITES.length*10; memory min-pages
+  LEB `84 02` at 0x161d → `ff 7f`; Buffer.concat needs Buffers —
+  wrap writeUleb output in Buffer.from; verify each site's bytes).
+- Marker insn (10 B): i32.const 145000; i32.const ID;
+  i32.store align=2 — `41 c8 8d 08 41 ID 36 02`. Cells: 145000
+  marker, unfired = 0xffffffff (kernel overwrites guest 0x23668).
+- embed.mjs: embed uc-patched.wasm base64 into unicorn-diag.js
+  (NUL as `\x00` not `\0`), then `node --check unicorn-diag.js`.
+- diag9.mjs: boots Image+DTB via embedded wasm; onAbort reads
+  DataView cells 144952/144956 (msg,len)/145000/145004 (markers)
+  — ccall arm64_debug/reg_read THROW post-Aborted(), only DataView
+  reads work. Logs: diag9-run4.log (202), diag9-run5.log (3002),
+  diag9-run6.log (3105).
+- wasm-as is BROKEN for this WAT; llvm-objdump is ground truth
+  (~/emsdk/upstream/bin).
+
+NEXT (in progress): instrument value dump before the fired call
+at 0xb1f2f ($1745): [S+25064] i32, S, [env+11412], [env+12274],
+[144968] → cells 145008..145024; interpret why [S+25064] < 0;
+then map to fork C (SVE/vector assert), fix or work around,
+continue boot toward cgroup_init_subsys+0x154 (cgroup.c:6052).
+
+### Linux 6.1.21 boot — QEMU-wasm feasibility demo (DONE: busybox shell!)
+
+Separate parallel track in /tmp/opencode/raspi-demo (ephemeral): real
+qemu-system-aarch64 compiled to wasm (qemu-system-aarch64.wasm + patched
+out-patched.js/load.js harness, raspi3ap machine), kernel8.img = rpi
+6.1.21-v8 (22.4MB Image from the raspberrypi 6.1 branch), fixed
+bcm2710-rpi-3-b-plus.dtb, initramfs.cpio.gz (busybox). Verdict: the
+kernel+DTB+initrd path is FULLY functional — reached a working busybox
+sh prompt ("~ #") under TCG. Everything below was learned the hard way;
+re-apply when porting to the unicorn.js core.
+
+- THE initrd blocker (fixed): the initramfs's /init symlink pointed at
+  "busybox" (resolves to /busybox) while busybox lives at bin/busybox —
+  DANGLING. The rpi kernel's PATCHED kernel_init_freeable (init/main.c:
+  wait_for_initramfs(); if (init_eaccess(rdinit)!=0) { rdinit=NULL;
+  prepare_namespace(); }) then fell back to prepare_namespace →
+  mount_root → "VFS: Unable to mount root fs on unknown-block(0,0)"
+  panic (no root=). Fix: /init -> bin/busybox. This ALSO explains the
+  earlier "kernel never unpacks / no Trying to unpack" misdiagnosis —
+  the unpack ALWAYS succeeded; only the /init access check failed.
+- rpi initrd mechanics confirmed: do_populate_rootfs is ASYNC
+  (async_schedule_domain, wait_for_initramfs()); arm64_memblock_init
+  sets initrd_start = __phys_to_virt(0x08000000) = 0xffffff8008000000
+  (VA_BITS=39! not 48) + initrd_end = ...+0x11c578; success prints
+  "Trying to unpack rootfs image as initramfs..." then
+  "Freeing initrd memory: 1136K"; initrdmem=0x08000000,0x11C578 and
+  DTB linux,initrd-start/end both work (the reserve_initrd_mem
+  "INITRD: ... is not a memory region" patch in rpi initramfs.c is
+  DEAD CODE — no callers).
+- Harness gotcha (invalidated many early scans): without the
+  Module['TTY'].stream_ops.poll override (return (0|4) when no stdin),
+  the chardev TX buffer fills and the GUEST STALLS mid-UART-write at
+  ~6.8s (last ring msg "bcm2835-mbox 3f00b880.mailbox: mailbox
+  enabled") — the boot never reaches initcalls. With the override the
+  boot runs to the panic in ~34s. ALWAYS include it in boot harnesses.
+- The console (pty) DROPS message batches (cmdline→cp15_barrier window
+  incl. Memory:/rcu:/smp:, and the Trying-to-unpack batch) while the
+  printk ring has EVERYTHING — the ring text region is guest
+  phys 0x177a000 (heap 0x21aad000, right past kernel image end),
+  records are plain ASCII with the last 2 chars duplicated per record
+  ("enableded", "B+B+"). NEVER trust the pty alone; scan RAM.
+- Misc: kernel8.img loads at guest 0x20000 (not 0x80000); fixed DTB at
+  guest 0x8200000; initrd at 0x08000000 (gzip verified byte-for-byte);
+  initrd region persisted post-panic (reserved or just untouched —
+  NOT proof of reservation); "Freeing unused kernel memory"/"Run /init"
+  never print in the panic path (panic hits inside prepare_namespace).
+- cpio with device nodes: mknod needs root; build newc entries by hand
+  in Node (build-cpio.mjs) — header = "070701" + 13 u32-hex fields,
+  S_IFCHR 0x2000|0666, rdev major/minor fields, TRAILER!!! entry.
+- Shell polish: etc/inittab (::respawn:/bin/sh), etc/init.d/rcS
+  (mount proc/sys), dev/console+dev/tty+dev/null nodes → boots to
+  "/bin/sh: can't access tty; job control turned off" + "~ #".
+  Interactive stdin (preloaded typed bytes) was NOT consumed by sh in
+  the harness (chardev RX plumbing pending) — E2E input needs work.
+- Harmless noise: mmc1 "Timeout waiting for hardware interrupt" every
+  ~10s (sdhci IRQ never fires — no card; the rpi bcm2835-sdhost uses
+  IRQ 62 = bank-2 bit 30 — matches the Phase 2b host mapping).
+- Porting checklist for the unicorn.js core: initrd -> /init symlink
+  fix, TTY poll override, expect VA_BITS=39 linear map
+  (0xffffff8000000000 PAGE_OFFSET — uc_arm64_debug walk tools must
+  use TTBR/TCR-derived vabits, not hardcoded 48).
+
 ### Phase 2 — real devices
 
 - [x] BCM2836 local interrupt block at 0x40000000 (Phase 2a above).

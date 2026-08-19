@@ -72,7 +72,11 @@ export function createUart0(uc, ucMod, base, emit, onIrqChange) {
     ucMod.HOOK_MEM_WRITE,
     (u, access, addr, size, value) => {
       const b = Number(value) & 0xff;
-      if (b !== 0 && txEnabled()) emit(b);
+      // No CR.UARTEN gate here: Linux's earlycon=pl011 writes DR blindly
+      // without ever configuring CR, and real firmware leaves the UART
+      // enabled — so emit any non-zero byte. The guests configure CR
+      // properly anyway; the IRQ path (irqActive) keeps its own gating.
+      if (b !== 0) emit(b);
     },
     null,
     DR,

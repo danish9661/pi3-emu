@@ -785,3 +785,31 @@ dist/                 production bundle
   died). GPIO button fix: `getBtn` must return the pin bitmask
   (gpioBtn << 29). Verified: 20/20 probes + 9/9 browser E2E checks
   (phase2b-e2e.mjs covers irq/uart0/lirq/gpio)
+- M23 — the Linux boot lands in the emulator itself (WIP: boot crashes
+  inside the rebuilt core, fully instrumented). A new `linux` mode
+  (`src/main.js`) loads a real arm64 kernel Image + stock
+  bcm2837-rpi-3-b.dtb: RAM grows to 128 MB, the kernel boots per the
+  arm64 protocol (x0 = DTB, x1..x3 = 0, MMU off, entry = base +
+  header `text_offset`), every unmodeled peripheral window becomes a
+  zero-return "black hole" map so stray driver probes fail gracefully
+  instead of data-aboring, and the arch timer is ticked at the real
+  19.2 MHz rate every slice with native IRQ delivery
+  (CPU_INTERRUPT_HARD via the local block, like LIRQ_MODE) — the
+  kernel never idles, so a fixed-budget rAF loop (`linuxRun`) replaces
+  run-until-idle. PL011 gains a real earlycon fix: `DR` writes emit
+  unconditionally (Linux's earlycon=pl011 writes the char without ever
+  configuring CR.UARTEN), and the local block splits FIQ_ROUTING into
+  the real PM_ROUTING_SET/PM_ROUTING_CLR pair. `test/linux-probe.mjs`
+  boots the Image at the 2M-aligned 0x200000 (the old 0x80000 load
+  made the kernel's mapping run 0x80000 off — everything faulted at
+  slice 4243) with pre-seeded idmap aliases for the fork's 32-bit-
+  truncated fetches. Status: the boot now reaches `early_security_init`
+  (~slice 6484) where the rebuilt fork core aborts on an SVE/vector
+  assert — the whole abort chain (call_indirect helper $1745 → assert
+  wrapper $202, marker-instrumented across ~18 runs) is traced in
+  AGENTS.md. Parallel proof-of-feasibility: a separate QEMU-wasm build
+  (raspi3ap, same kernel 6.1.21-v8 + DTB + busybox initramfs) boots to
+  a working busybox `~ #` shell under TCG — the root cause there was a
+  dangling `/init -> busybox` symlink (busybox lives at bin/busybox)
+  that tripped the rpi kernel's `init_eaccess` check and panicked in
+  `prepare_namespace`; fixed initramfs boots to the shell.

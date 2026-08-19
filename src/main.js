@@ -18,6 +18,20 @@ const RAM_SIZE = 0x400000;
 const SLICE_INSNS = 512;
 const MAX_SLICES = 5000;
 
+// Linux boot (M23): a real arm64 kernel Image loaded at 0x80000 (the entry
+// is base + the Image header's text_offset), the stock bcm2837-rpi-3-b DTB
+// at 0x2000000 (x0 = dtb, x1..x3 = 0, MMU off — the arm64 boot protocol).
+// RAM grows to 128 MB, and every peripheral address we don't model gets a
+// zero-return "black hole" map so stray driver probes fail gracefully
+// instead of taking a data abort. The arch timer counter is ticked at the
+// real 19.2 MHz rate every slice (Linux reads CNTPCT for timekeeping), and
+// IRQ delivery is real (CPU_INTERRUPT_HARD via the local block, native
+// vectors/eret) like LIRQ_MODE.
+const LINUX_MODE = 'linux';
+const LINUX_RAM_SIZE = 0x8000000;
+const LINUX_IMAGE = 0x80000;
+const LINUX_DTB = 0x2000000;
+
 // SMP mailbox window (host-arbitrated device shared by all cores):
 //   +0x00 START_ENTRY[3]  core 0 writes entry addresses for cores 1..3
 //   +0x10 GO              core 0 releases the secondaries
@@ -249,10 +263,11 @@ async function loadBoard() {
 // and the guest's own _start sets SP, so the host never touches registers.
 // After that the guest runs freely: each slice is SLICE_INSNS of real
 // AArch64 instructions, resuming from the current PC.
-function boot(ucMod, uc, board, elf) {
+function boot(ucMod, uc, board, elf, opts = {}) {
   const uart = Number(board.pi_uart_base());
+  const ramSize = opts.ramSize || RAM_SIZE;
 
-  uc.mem_map(RAM_BASE, RAM_SIZE, ucMod.PROT_ALL);
+  uc.mem_map(RAM_BASE, ramSize, ucMod.PROT_ALL);
   uc.mem_map(uart, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(TMR_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(MBOX_WINDOW, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
@@ -361,7 +376,66 @@ function boot(ucMod, uc, board, elf) {
   sdState = sd.state;
   sdIrqActive = sd.irqActive;
 
-  loadElf(uc, elf);
+  if (opts.linux) {
+    // Map every peripheral address outside the modeled windows as plain
+    // zeroed RAM — a driver probing an unmodeled device reads 0 and fails
+    // gracefully instead of taking a data abort on unmapped memory.
+    mapBlackHole(
+      uc,
+      ucMod,
+      0x3f000000,
+      0x3fa00000,
+      [
+        [TMR_BASE, 0x1000],
+        [DMA_BASE, 0x1000],
+        [MBOX_WINDOW, 0x1000],
+        [MMU_CTL, 0x1000],
+        [0x3f00e000, 0x1000],
+        [GPIO_BASE, 0x1000],
+        [uart, 0x1000],
+        [SPI_BASE, 0x1000],
+        [PWM_BASE, 0x1000],
+        [UART1_BASE, 0x1000],
+        [SD_BASE, 0x1000],
+        [I2C_BASE, 0x1000],
+      ]
+    );
+    const { image, dtb } = opts.linux;
+    const textOffset = Number(
+      BigInt(image[8] | (image[9] << 8) | (image[10] << 16) | (image[11] << 24)) |
+        ((BigInt(image[12]) | (BigInt(image[13]) << 8n) | (BigInt(image[14]) << 16n) | (BigInt(image[15]) << 24n)) << 32n)
+    );
+    const entry = LINUX_IMAGE + textOffset;
+    writeAll(uc, LINUX_IMAGE, image);
+    writeAll(uc, LINUX_DTB, dtb);
+    uc.entry = entry;
+    uc.reg_write(ucMod.ARM64_REG_SP, ramSize - 0x10000);
+    uc.reg_write(ucMod.ARM64_REG_X0, LINUX_DTB);
+    uc.reg_write(ucMod.ARM64_REG_X1, 0);
+    uc.reg_write(ucMod.ARM64_REG_X2, 0);
+    uc.reg_write(ucMod.ARM64_REG_X3, 0);
+  } else {
+    loadElf(uc, elf);
+  }
+}
+
+// Map every address in [lo, hi) not covered by one of the modeled windows
+// (base,size pairs) as plain RAM, in the smallest number of contiguous maps.
+// unicorn.js mem_write truncates large payloads (~16 MB); chunk the write.
+function writeAll(uc, addr, bytes) {
+  const CHUNK = 0x100000;
+  for (let off = 0; off < bytes.length; off += CHUNK) {
+    uc.mem_write(addr + off, Array.from(bytes.subarray(off, off + CHUNK)));
+  }
+}
+function mapBlackHole(uc, ucMod, lo, hi, skip) {
+  const runs = skip.map(([b, s]) => [b, b + s]).sort((a, b) => a[0] - b[0]);
+  let cur = lo;
+  for (const [b, e] of runs) {
+    if (b > cur) uc.mem_map(cur, b - cur, ucMod.PROT_READ | ucMod.PROT_WRITE);
+    if (e > cur) cur = e;
+  }
+  if (hi > cur) uc.mem_map(cur, hi - cur, ucMod.PROT_READ | ucMod.PROT_WRITE);
 }
 
 // The "VideoCore": answers a property-tags request buffer the guest wrote
@@ -518,7 +592,7 @@ function syncLocalOut(uc) {
   // modes deliver host-assisted at slice boundaries (irqDeliver records
   // irqElr for the magic-resume glue) and a real mid-slice entry there
   // would resume at PC 0 (no irqElr).
-  if (mode === LIRQ_MODE) localInt.syncIrq(uc, (level) => uc.arm64_set_irq(level));
+  if (mode === LIRQ_MODE || mode === LINUX_MODE) localInt.syncIrq(uc, (level) => uc.arm64_set_irq(level));
 }
 
 function syncLocalIn(uc) {
@@ -534,7 +608,7 @@ function syncLocalIn(uc) {
 // assisted at slice boundaries (irqDeliver records irqElr), and a real
 // mid-slice entry would leave that machinery with no resume point.
 function rearmGpuLine(uc) {
-  if (localInt && mode === LIRQ_MODE) localInt.syncIrq(uc, (level) => uc.arm64_set_irq(level));
+  if (localInt && (mode === LIRQ_MODE || mode === LINUX_MODE)) localInt.syncIrq(uc, (level) => uc.arm64_set_irq(level));
 }
 
 // A TMR_CS ack (or any CS write) from the guest re-derives the GPU line in
@@ -563,7 +637,7 @@ function daifI() {
 }
 
 function irqDeliver(uc) {
-  if (irqInFlight || mode === SMP_MODE) return;
+  if (irqInFlight || mode === SMP_MODE || mode === LINUX_MODE) return;
   if (!ic || daifI()) return;
   // ic.pending() is derived fresh from the device lines on every call (the
   // pending windows are refreshed pre-slice, so they are already gated).
@@ -897,9 +971,10 @@ function runSlice(count) {
   if (gpio) gpio.syncOut(uc);
   if (ic) ic.syncOut(uc);
   syncLocalOut(uc);
-  if (mode === LIRQ_MODE) {
-    // The lirq guest's Phase A arms CNTP and waits for the host to advance
-    // the arch timer counter; run it at the real 19.2 MHz rate (CNTFRQ).
+  if (mode === LIRQ_MODE || mode === LINUX_MODE) {
+    // The arch timer counter runs at the real 19.2 MHz rate (CNTFRQ):
+    // LIRQ_MODE ticks it so Phase A's CNTP_CTL compare can fire, and Linux
+    // reads CNTPCT for timekeeping (the clockevent needs it to advance too).
     const us = (performance.now() - tmrWall0) * 1000;
     uc.arm64_timer_tick(Math.floor(us * 19.2));
   }
@@ -1160,6 +1235,27 @@ function irqRun() {
   irqFrame = requestAnimationFrame(frame);
 }
 
+// Linux never idles, so it runs with the same fixed-budget frame loop as
+// the IRQ guests; IRQs are delivered natively (CPU_INTERRUPT_HARD via the
+// local block, real vectors, real eret) with the arch timer ticked per
+// slice, exactly like LIRQ_MODE. The boot runs until the user reboots.
+let linuxFrame = 0;
+function linuxRun() {
+  let out = '';
+  const frame = () => {
+    if (mode !== LINUX_MODE) return;
+    const t0 = performance.now();
+    do {
+      out += runSlice(SLICE_INSNS);
+    } while (performance.now() - t0 < 16);
+    draw(out);
+    out = '';
+    updateStats();
+    linuxFrame = requestAnimationFrame(frame);
+  };
+  linuxFrame = requestAnimationFrame(frame);
+}
+
 // The guest drives itself: it prints to the UART TX slots (one char per
 // slice) and parks in getc until a key arrives. Run slices until the guest
 // has gone quiet for two consecutive slices — i.e. it is back waiting for
@@ -1242,6 +1338,7 @@ async function run() {
   cancelAnimationFrame(gpioFrame);
   cancelAnimationFrame(fbFrame);
   cancelAnimationFrame(irqFrame);
+  cancelAnimationFrame(linuxFrame);
   gpioLoopActive = false;
   runBtn.disabled = true;
   term.textContent = '';
@@ -1355,6 +1452,26 @@ async function run() {
       draw(runUntilSdDone()); // FAT12 card: boot sector, root dir, HELLO.TXT
       setStatus(
         `booted — running sd — BCM2835 SDHCI (EMMC) @ 0x3F300000 — FAT12 card, HELLO.TXT read — press Reboot to re-run`
+      );
+    } else if (progSel.value === LINUX_MODE) {
+      mode = LINUX_MODE;
+      const [imgResp, dtbResp] = await Promise.all([
+        fetch('./linux/Image'),
+        fetch('./linux/bcm2837-rpi-3-b.dtb'),
+      ]);
+      if (!imgResp.ok || !dtbResp.ok) throw new Error('cannot fetch ./linux/Image or dtb');
+      const image = new Uint8Array(await imgResp.arrayBuffer());
+      const dtb = new Uint8Array(await dtbResp.arrayBuffer());
+      if (dtb[0] !== 0xd0 || dtb[1] !== 0x0d || dtb[2] !== 0xfe || dtb[3] !== 0xed) {
+        throw new Error('bad DTB magic');
+      }
+      boot(ucMod, uc, board, null, {
+        ramSize: LINUX_RAM_SIZE,
+        linux: { image, dtb },
+      });
+      linuxRun(); // async: rAF-paced slices, real IRQs via the local block
+      setStatus(
+        `booted — running linux — arm64 Image @ 0x80000, DTB @ 0x2000000, 128 MB RAM — press Reboot to re-run`
       );
     } else {
       mode = 'single';

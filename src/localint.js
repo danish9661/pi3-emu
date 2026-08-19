@@ -33,7 +33,8 @@ export function createLocalInt(uc, ucMod, base, getLines) {
   const CONTROL = base + 0x00;
   const PRESCALER = base + 0x08;
   const GPU_ROUTING = base + 0x0c;
-  const FIQ_ROUTING = base + 0x10;
+  const PM_ROUTING_SET = base + 0x10;
+  const PM_ROUTING_CLR = base + 0x14;
   const CORE_TIMER_CTRL = base + 0x40;
   const MAILBOX_CTRL = base + 0x50;
   const CORE_IRQ_SRC = base + 0x60;
@@ -53,7 +54,8 @@ export function createLocalInt(uc, ucMod, base, getLines) {
     control: 0,
     prescaler: 0,
     gpuRouting: 0,
-    fiqRouting: 0,
+    pmRoutingSet: 0,
+    pmRoutingClr: 0,
     coreTimer: [0, 0, 0, 0],
     mailbox: [0, 0, 0, 0],
     ltimer: [0, 0, 0, 0],
@@ -102,7 +104,8 @@ export function createLocalInt(uc, ucMod, base, getLines) {
     writeU32(uc, CONTROL, state.control);
     writeU32(uc, PRESCALER, state.prescaler);
     writeU32(uc, GPU_ROUTING, state.gpuRouting);
-    writeU32(uc, FIQ_ROUTING, state.fiqRouting);
+    writeU32(uc, PM_ROUTING_SET, state.pmRoutingSet);
+    writeU32(uc, PM_ROUTING_CLR, state.pmRoutingClr);
   }
 
   function syncIn(uc) {
@@ -113,7 +116,8 @@ export function createLocalInt(uc, ucMod, base, getLines) {
     state.control = control & ~0xf; // W1C bits do not read back
     state.prescaler = readU32(uc, PRESCALER);
     state.gpuRouting = readU32(uc, GPU_ROUTING);
-    state.fiqRouting = readU32(uc, FIQ_ROUTING);
+    state.pmRoutingSet = readU32(uc, PM_ROUTING_SET);
+    state.pmRoutingClr = readU32(uc, PM_ROUTING_CLR);
     for (let i = 0; i < 4; i++) {
       state.coreTimer[i] = readU32(uc, CORE_TIMER_CTRL + i * 4);
       state.mailbox[i] = readU32(uc, MAILBOX_CTRL + i * 4);
