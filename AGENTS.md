@@ -407,6 +407,29 @@ bare-metal guests; its Linux (TCG) path is now dead code, superseded by
 qemu-wasm. The `unicorn.js` fork rebuild (`/tmp/opencode/unicornjs-src`)
 remains the historical record for the bare-metal MMIO/slice work.
 
+M24/M25 polish (committed + pushed): xterm + xterm-pty are vendored locally
+under `public/linux/vendor/` (xterm UMD → global `Terminal`, xterm-pty UMD
+→ global `openpty`) so the console works **offline** (no CDN). The console
+auto-activates: `index.html` watches `.xterm-rows` for the getty's
+"Please press Enter to activate this console." and injects `xterm.paste("\r")`,
+so the user lands straight at the `~ #` shell. Accel is **MTTCG**
+(`-accel tcg,tb-size=500,thread=multi -smp 4,sockets=4`) — this is the
+working config for ktock's pthread build; single-thread triggers a
+`start is not a function` pthread-worker race. Needs cross-origin isolation
+(`coi-serviceworker.js`); the harness shows a one-time "establishing COI"
+splash and reloads. Verified headless Chrome (puppeteer-core +
+/usr/bin/google-chrome-stable): boots to `~ #` with no page errors, and
+typing `echo ...` round-trips. Tests: `test/linux-boot-vendored.mjs`,
+`test/linux-shell-interactive.mjs`.
+
+**FROM-SOURCE BUILD:** `scripts/build-linux.sh` rebuilds qemu-wasm + the
+raspi3ap kernel/rootfs from `ktock/qemu-wasm` via podman (faithful to that
+repo's README) into `public/linux/`. NOTE: this checkout lacks
+`PROXY_TO_PTHREAD`/pthread support, so a from-source build here yields a
+*single-thread* qemu (no worker.js) — do NOT swap it over the verified
+prebuilt pthread/MTTCG artifacts unless you confirm it still boots. The
+prebuilt demo binary (from `ktock/qemu-wasm-demo-images`) is the live one.
+
 Tooling (rebuildable, all under /tmp/opencode/ltest — /tmp is
 WIPED REPEATEDLY, redo from scratch each time):
 - extract-wasm.mjs: pull wasm bytes out of public/unicorn.js

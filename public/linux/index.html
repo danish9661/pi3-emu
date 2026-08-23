@@ -4,48 +4,75 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Raspberry Pi 3 (BCM2837) — Linux on QEMU Wasm</title>
+    <link rel="icon" href="data:," />
     <link rel="stylesheet" href="./vendor/xterm.css" />
     <style>
-      body { background: #111; color: #eee; font-family: system-ui, sans-serif; margin: 0; padding: 12px; }
-      h1 { font-size: 16px; font-weight: 600; }
-      #terminal { height: 70vh; }
-      .hint { color: #888; font-size: 12px; margin-top: 8px; }
+      html, body { margin: 0; height: 100%; background: #0c0c0c; color: #ddd;
+        font-family: system-ui, sans-serif; }
+      #app { display: flex; flex-direction: column; height: 100vh; }
+      header { padding: 6px 10px; font-size: 13px; background: #161616;
+        border-bottom: 1px solid #2a2a2a; display: flex; gap: 10px; align-items: center; }
+      header b { color: #fff; font-weight: 600; }
+      header .hint { color: #888; font-size: 12px; }
+      #terminal { flex: 1 1 auto; padding: 6px; }
+      #terminal .xterm { height: 100%; }
+      #coi { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+        background: #0c0c0c; color: #aaa; font-size: 14px; z-index: 10; }
+      #coi.hidden { display: none; }
     </style>
   </head>
   <body>
-    <h1>Raspberry Pi 3 (aarch64) — Linux boot via QEMU Wasm</h1>
-    <div id="terminal"></div>
-    <p class="hint">It can take some time to load and start the VM. Serial console → xterm.</p>
+    <div id="app">
+      <header>
+        <b>Raspberry Pi 3 (BCM2837)</b>
+        <span class="hint">Linux on QEMU Wasm · raspi3ap · 4× Cortex-A53 · 512 MB — serial console</span>
+      </header>
+      <div id="terminal"></div>
+    </div>
+    <div id="coi">Establishing cross-origin isolation (threads) — one-time reload…</div>
 
     <script src="./coi-serviceworker.js"></script>
+    <script src="./vendor/xterm.js"></script>
+    <script src="./vendor/xterm-pty.js"></script>
     <script src="./module.js"></script>
     <script src="./load.js"></script>
     <script type="module">
-      import 'https://unpkg.com/xterm@5.3.0/lib/xterm.js';
-      import 'https://unpkg.com/xterm-pty/index.js';
-      import './module.js';
       import initEmscriptenModule from './out.js';
-
-      const xterm = new Terminal();
+      const xterm = new Terminal({ fontSize: 13, cursorBlink: true });
       xterm.open(document.getElementById("terminal"));
+      xterm.focus();
 
       const { master, slave } = openpty();
-
       xterm.loadAddon(master);
-
       Module.pty = slave;
-      Module['mainScriptUrlOrBlob'] = location.href.replace(/index\.html$/, '') + 'out.js';
-      (async () => {
-          const instance = await initEmscriptenModule(Module);
+      Module["mainScriptUrlOrBlob"] = location.href.replace(/index\.html$/, "") + "out.js";
 
-          var oldPoll = Module['TTY'].stream_ops.poll;
-          var pty = Module['pty'];
-          Module['TTY'].stream_ops.poll = function(stream, timeout){
-              if (!pty.readable) {
-                  return (pty.readable ? 1 : 0) | (pty.writable ? 4 : 0);
-              }
-              return oldPoll.call(stream, timeout);
+      // hide the COI splash once isolated
+      const coiEl = document.getElementById("coi");
+      const hideCoi = () => { if (window.crossOriginIsolated) coiEl.classList.add("hidden"); };
+      hideCoi();
+      const coiIv = setInterval(hideCoi, 500);
+
+      (async () => {
+        await initEmscriptenModule(Module);
+
+        var oldPoll = Module["TTY"].stream_ops.poll;
+        var pty = Module["pty"];
+        Module["TTY"].stream_ops.poll = function (stream, timeout) {
+          if (!pty.readable) return (pty.readable ? 1 : 0) | (pty.writable ? 4 : 0);
+          return oldPoll.call(stream, timeout);
+        };
+
+        // Auto-activate the console: the getty prints "Please press Enter to
+        // activate this console." and waits. Inject a CR so the user lands
+        // straight at the shell without having to press a key.
+        var activated = false;
+        var iv = setInterval(function () {
+          var rows = document.querySelector(".xterm-rows");
+          if (rows && /Please press Enter to activate this console\./.test(rows.innerText)) {
+            if (!activated) { activated = true; xterm.paste("\r"); }
           }
+        }, 1000);
       })();
     </script>
   </body>

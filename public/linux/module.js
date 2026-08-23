@@ -5,9 +5,11 @@ Module['arguments'] = [
     '-nic', 'none',
     '-M', 'raspi3ap', '-nographic',
     '-m', '512M',
-    '-accel', 'tcg,tb-size=500', '-smp', '4',
-    //Use the following to enable MTTCG
-    //'-accel', 'tcg,tb-size=500,thread=multi', '-smp', '4,sockets=4',
+    // MTTCG: JIT-compiled TBs run on worker threads. This is the working config
+    // for ktock/qemu-wasm's pthread build — the vCPU threads keep the pthread
+    // worker machinery warm (single-thread triggers a 'start is not a function'
+    // worker race). Needs cross-origin isolation (COI service worker).
+    '-accel', 'tcg,tb-size=500,thread=multi', '-smp', '4,sockets=4',
     '-dtb', '/pack/bcm2710-rpi-3-b-plus.dtb',
     '-kernel', '/pack/kernel8.img',
     '-drive', 'file=/pack/rootfs.bin,format=raw,if=sd',
