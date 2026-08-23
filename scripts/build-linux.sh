@@ -50,10 +50,20 @@ if $DOCKER ps -a --format '{{.Names}}' | grep -qx "$CTN"; then
   $DOCKER rm -f "$CTN" >/dev/null
 fi
 echo "[*] starting build container $CTN"
-$DOCKER run --rm -d --name "$CTN" -v "$SRC":/qemu/:ro "$IMG" sleep infinity
+$DOCKER run --rm -d --name "$CTN" "$IMG" sleep infinity
 
 cleanup() { $DOCKER rm -f "$CTN" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
+
+# Bring the qemu-wasm source into the container's own filesystem. Host bind
+# mounts can be noexec under rootless podman (breaks executing /qemu/configure).
+if [ -n "$SRC" ]; then
+  echo "[*] copying source into container at /qemu"
+  $DOCKER cp "$SRC"/. "$CTN:/qemu"
+else
+  echo "[*] cloning ktock/qemu-wasm into container at /qemu"
+  $DOCKER exec -it "$CTN" git clone --depth 1 https://github.com/ktock/qemu-wasm /qemu
+fi
 
 # 3) configure + make qemu-system-aarch64 (the long step)
 echo "[*] configuring qemu (aarch64-softmmu, wasm32)"
