@@ -29,8 +29,8 @@ const { createIc } = await import(join(__dirname, '..', 'src', 'ic.js'));
 const { createLocalInt } = await import(join(__dirname, '..', 'src', 'localint.js'));
 const { createSdhci } = await import(join(__dirname, '..', 'src', 'sdhci.js'));
 
-const SLICE_INSNS = 512;
-const LINUX_RAM_SIZE = 0x8000000;
+const SLICE_INSNS = 4096;
+const LINUX_RAM_SIZE = process.env.LINUX_RAM_SIZE ? Number(process.env.LINUX_RAM_SIZE) : 0x8000000;
 // The arm64 boot protocol wants a 2M-aligned base (text_offset=0). The fork
 // cannot fetch at pc 0 (a TB-gen quirk), so the image goes at 0x200000: the
 // kernel's tables map VA KIMAGE+X -> phys 0x200000+X, and the fork's
@@ -83,6 +83,25 @@ function seedIdmapAliases(uc, ucMod) {
 
 // Patch the DTB's memory@0 reg size (offset of the <0 0x40000000> size cell)
 // to 128 MB so the kernel only touches RAM we actually mapped.
+// Real Pi firmware rewrites the DTB's VideoCore peripheral addresses
+// (0x7e000000 region) to the ARM-physical view (0x3f000000 region) that
+// the emulated memory map actually uses. Without this, the kernel ioremaps
+// devices at 0x7e… which never lands on our 0x3f… device windows.
+// Convert any 4-byte BE value in [0x7e000000,0x7effffff] -> [0x3f000000,0x3fffffff].
+function patchDtbVcToArm(dtb) {
+  const be = (o) => (dtb[o] << 24) | (dtb[o + 1] << 16) | (dtb[o + 2] << 8) | dtb[o + 3];
+  let n = 0;
+  for (let i = 0; i + 4 <= dtb.length; i++) {
+    const v = be(i);
+    if ((v & 0xff000000) === 0x7e000000) {
+      dtb[i] = 0x3f;
+      n++;
+    }
+  }
+  if (n) console.log('patched', n, 'VC->ARM peripheral address(es)');
+  return dtb;
+}
+
 function patchDtbRam(dtb) {
   // Walk the FDT structure block looking for the "memory@0" node and its
   // "reg" property. Minimal approach: scan for the 8-byte pattern
@@ -92,7 +111,7 @@ function patchDtbRam(dtb) {
   for (let i = 0; i + 8 <= dtb.length; i++) {
     if (dtb[i] === 0 && dtb[i + 1] === 0 && dtb[i + 2] === 0 && dtb[i + 3] === 0 &&
         dtb[i + 4] === pat[0] && dtb[i + 5] === pat[1] && dtb[i + 6] === pat[2] && dtb[i + 7] === pat[3]) {
-      dtb[i + 4] = 0x08; // 0x08000000
+      dtb[i + 4] = (LINUX_RAM_SIZE >> 24) & 0xff; // size cell high byte
       return true;
     }
   }
@@ -107,7 +126,7 @@ function patchDtbChosen(dtb) {
     b[o] = (v >>> 24) & 0xff; b[o + 1] = (v >>> 16) & 0xff; b[o + 2] = (v >>> 8) & 0xff; b[o + 3] = v & 0xff;
   };
   const offStruct = be32(8), offStrings = be32(12), sizeStruct = be32(36), sizeStrings = be32(32);
-  const bootargs = 'earlycon=pl011,0x3f201000 console=ttyAMA0,115200';
+  const bootargs = 'earlycon=pl011,0x3f201000 console=ttyAMA0,115200 maxcpus=1 nr_cpus=1 mem=512M';
   const val = new Uint8Array(bootargs.length + 1);
   for (let i = 0; i < bootargs.length; i++) val[i] = bootargs.charCodeAt(i);
   const propPad = (4 - (val.length % 4)) % 4;
@@ -176,6 +195,7 @@ async function main() {
     )
   ).instance.exports;
   const uart = Number(board.pi_uart_base());
+  console.error('UART base = 0x' + uart.toString(16));
   const image = new Uint8Array(readFileSync(IMAGE));
   const dtbRaw = new Uint8Array(readFileSync(DTB));
   const dtb = new Uint8Array(dtbRaw);
@@ -192,7 +212,22 @@ async function main() {
   console.log('Image:', IMAGE.split('/').pop(), image.length, 'bytes | entry 0x' + entry.toString(16), '| dtb', dtb.length, 'bytes');
 
   const uc = new ucMod.Unicorn(ucMod.ARCH_ARM64, ucMod.MODE_LITTLE_ENDIAN);
+
+  // Test: use cortex-a72 instead of A53 to see if the snprintf loop is model-specific.
+  if (typeof uc.ctl_set_cpu_model === 'function') {
+    const A72 = 2; // UC_CPU_ARM64_A72
+    try { uc.ctl_set_cpu_model(A72); console.log('[cpu] ctl_set_cpu_model(A72) called'); }
+    catch (e) { console.log('[cpu] ctl_set_cpu_model failed:', String(e).slice(0, 100)); }
+    try { console.log('[cpu] model now =', uc.ctl_get_cpu_model && uc.ctl_get_cpu_model()); } catch(e) { console.log('[cpu] ctl_get_cpu_model err', e.message); }
+  } else { console.log('[cpu] no ctl_set_cpu_model available'); }
+
+  const DELIVER = process.env.DELIVER !== '0';
+  if (DELIVER && typeof uc.arm64_deliver_exceptions === 'function') {
+    uc.arm64_deliver_exceptions(1);   // let the kernel run its own exception handlers
+  }
+  const MARK = (s) => { console.error('MARK', s); try { uc.reg_read_i32(ucMod.ARM64_REG_PC); } catch (e) { console.error('  RDERR', e.message); } };
   uc.mem_map(0, LINUX_RAM_SIZE, ucMod.PROT_ALL);
+  MARK('after mem_map RAM');
   // Only the windows modeled below are excluded from the black hole; every
   // other peripheral address stays zero-filled RAM.
   mapBlackHole(uc, ucMod, 0x3f000000, 0x3fa00000, [
@@ -202,8 +237,44 @@ async function main() {
   uc.mem_map(uart, 0x1000, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(0x3f300000, 0x1000, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(0x40000000, 0x1000, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  MARK('after device maps');
 
+  // Apply R_AARCH64_RELATIVE relocations to the loaded Image.
+  // The fork does not correctly execute the kernel's self-relocation loop in
+  // head.S (__relocate_kernel), so absolute data pointers (e.g.
+  // console_sem.wait_list, init_task self-refs) stay 0 and the kernel oopses
+  // at the first printk. We apply them here with delta=0 (kernel loaded at its
+  // link base), exactly what __relocate_kernel does when loaded in place.
+  {
+    const KIMAGE = 0xffff800008000000n;
+    const relaStart = 0x1896260; // __rela_start VA 0xffff800009896260 - KIMAGE
+    const relaEnd = 0x1e198c8;   // __rela_end
+    const rd64 = (off) => { let v = 0n; for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(image[off + i]); return v; };
+    const wr64 = (off, val) => { const v = BigInt.asUintN(64, val); for (let i = 0; i < 8; i++) image[off + i] = Number((v >> BigInt(i * 8)) & 0xffn); };
+    let n = 0;
+    for (let o = relaStart; o + 24 <= relaEnd; o += 24) {
+      const r_offset = rd64(o);
+      const r_info = rd64(o + 8);
+      const r_addend = rd64(o + 16);
+      if ((r_info & 0xffffffn) === 1027n) { // R_AARCH64_RELATIVE
+        const loc = Number(BigInt.asUintN(64, r_offset - KIMAGE));
+        if (loc >= 0 && loc + 8 <= image.length) { wr64(loc, r_addend); n++; }
+      }
+    }
+    console.log('[reloc] applied', n, 'R_AARCH64_RELATIVE relocations to Image');
+  }
   writeAll(uc, LINUX_IMAGE, image);
+  // Skip the kernel's self-relocation loop: __relocate_kernel is a redundant
+  // no-op here because we already applied the R_AARCH64_RELATIVE relocations
+  // host-side (delta=0), which matches the kernel's x23=0 identity relocations
+  // (head.S sets x23 = KERNEL_START & MIN_KIMG_ALIGN-1 | kaslr; observed 0).
+  // Patching its entry to 'ret' saves ~150k iterations through the fork's slow
+  // MMU-on page walks and lets early boot proceed immediately.
+  const RELD_PC_VA = 0xffff800008e46438n; // __relocate_kernel (System.map)
+  const reldPa = Number(RELD_PC_VA - 0xffff800008000000n) + LINUX_IMAGE;
+  uc.mem_write(reldPa, Buffer.from([0xc0, 0x03, 0x5f, 0xd6])); // ret (0xD65F03C0)
+  console.log('[reloc] skipped __relocate_kernel (entry -> ret) at pa 0x' + reldPa.toString(16));
+  MARK('after writeAll Image');
   // The fork's fetch path truncates VAs to 32 bits and walks them through
   // TTBR0 (the idmap). Seed the idmap L2 (init_idmap_pg_dir = phys 0x17e0000
   // with base=0; L1 @0x17e1000, L2 @0x17e2000 — System.map) with alias
@@ -212,15 +283,29 @@ async function main() {
   // KPTI trampoline alias 0x10000000 -> phys 0x1702000 via a 4K L3 table in
   // the (never written by the kernel) reserved_pg_dir page @0x1708000.
   seedIdmapAliases(uc, ucMod);
+  MARK('after seedIdmapAliases');
   writeAll(uc, LINUX_DTB, patchDtbChosen(dtb));
+  MARK('after writeAll DTB');
   uc.entry = entry;
-  uc.reg_write(ucMod.ARM64_REG_SP, LINUX_RAM_SIZE - 0x10000);
-  uc.reg_write(ucMod.ARM64_REG_X0, LINUX_DTB);
-  uc.reg_write(ucMod.ARM64_REG_X1, 0);
-  uc.reg_write(ucMod.ARM64_REG_X2, 0);
-  uc.reg_write(ucMod.ARM64_REG_X3, 0);
+  uc.reg_write_i64(ucMod.ARM64_REG_SP, BigInt(LINUX_RAM_SIZE - 0x10000));
+  uc.reg_write_i64(ucMod.ARM64_REG_X0, BigInt(LINUX_DTB));
+  uc.reg_write_i64(ucMod.ARM64_REG_X1, 0n);
+  uc.reg_write_i64(ucMod.ARM64_REG_X2, 0n);
+  uc.reg_write_i64(ucMod.ARM64_REG_X3, 0n);
 
-  const uart0 = createUart0(uc, ucMod, uart, (b) => board.pi_cons_push(b));
+  let emitted = 0;
+  const txBuf = [];
+  const uart0 = createUart0(uc, ucMod, uart, (b) => {
+    if (emitted < 256) { process.stderr.write('TX<' + String.fromCharCode(b)); emitted++; }
+    txBuf.push(b);
+    board.pi_cons_push(b);
+  });
+   let uartWrites = 0;
+   let lastMem = { addr: 0, size: 0, type: '?' };
+    uc.hook_add(ucMod.HOOK_MEM_WRITE, (u, access, addr, size, value) => {
+     lastMem = { addr: Number(addr), size: Number(size), type: 'W' };
+     if (uartWrites < 16) { process.stderr.write(`UARTWR @0x${Number(addr).toString(16)} sz${Number(size)} v0x${Number(value).toString(16)}\n`); uartWrites++; }
+   }, null, uart, uart + 0x1000);
   const ic = createIc(uc, ucMod, 0x3f00b200, () => ({
     timer: 0, dma0: false, pl011: uart0.irqActive(), sdhci: false,
     gpio0: false, gpio1: false, aux: false,
@@ -241,39 +326,67 @@ async function main() {
   let steps = 0;
   // A ring of the last instructions before the exception, so the path into
   // the fault is visible (register reads are unreliable in this build).
-  const trace = [];
-  let inAlt = false;
-  let lastPc = -1n;
-  let straight = 0;
-  const ALT0 = BigInt('0xffff800009793c84'), ALT1 = BigInt('0xffff8000097e5000');
-  uc.hook_add(ucMod.HOOK_CODE, (u, addr, size) => {
-    const a64 = BigInt.asUintN(64, BigInt(addr));
-    const isAlt = a64 >= ALT0 && a64 < ALT1;
-    if (isAlt && !inAlt) {
-      trace.push('>>ALT ' + a64.toString(16));
-      inAlt = true;
+    // (per-instruction HOOK_CODE tracing removed: it fired a JS callback for
+    // EVERY instruction and made the boot ~100x too slow. The up()/__up()/
+    // wake_q_add path was already verified correct via narrow single-PC
+    // hooks: &console_sem arrives 64-bit in up(), list_empty reads correctly,
+    // and the empty-list path returns without calling __up.)
+
+
+   const VSNPRINTF = BigInt('0xffff800008e0ea00');
+  let vsnHits = 0;
+  // Generic AArch64 page-table walk: root = PA of level-0 table, shifts[] = index bit positions per level.
+  const readU64 = (pa) => { const b = uc.mem_read(Number(BigInt.asUintN(64, pa) & 0xffffffffn), 8); let v = 0n; for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(b[i]); return v; };
+  const walkVA = (vaBig, root, shifts) => {
+    const va = BigInt.asUintN(64, vaBig);
+    let table = root & 0x0000FFFFFFFFF000n;
+    for (const sh of shifts) {
+      const idx = (va >> sh) & 0x1ffn;
+      const desc = readU64(table + idx * 8n);
+      const type = desc & 3n;
+      if (type === 3n) { table = desc & 0x0000FFFFFFFFF000n; continue; }
+      if (type === 1n) { const mask = (1n << sh) - 1n; return (desc & 0x0000FFFFFFFFF000n) | (va & mask); }
+      return null;
     }
-    if (!isAlt) inAlt = false;
-    const seq = a64 === lastPc + 4n;
-    if (seq) {
-      straight++;
-    } else {
-      if (straight) trace.push('+[' + straight + ']');
-      trace.push('0x' + a64.toString(16));
-      straight = 0;
-    }
-    lastPc = a64;
-    if (trace.length > 96) trace.shift();
-  });
+    return null;
+  };
+  const readStr = (pa, n=32) => {
+    const b = uc.mem_read(Number(BigInt.asUintN(64, pa) & 0xffffffffn), n);
+    let s=''; for (const c of b) { if (c===0) break; if (c>=32&&c<127) s+=String.fromCharCode(c); else s+='\\x'+c.toString(16).padStart(2,'0'); }
+    return s;
+  };
+   // (VSNPRINTF HOOK_CODE removed: also fired a JS callback per instruction.)
+
+  let unmappedHits = 0;
+  const unmappedSeen = {};
   for (const [kind, type] of [
     ['FETCH', ucMod.HOOK_MEM_FETCH_UNMAPPED],
     ['READ', ucMod.HOOK_MEM_READ_UNMAPPED],
     ['WRITE', ucMod.HOOK_MEM_WRITE_UNMAPPED],
   ]) {
     uc.hook_add(type, (u, access, addr, size, value) => {
-      console.log(`UNMAPPED ${kind} @ 0x${Number(addr).toString(16)} pc 0x${(Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || 0).toString(16)} size ${Number(size)}`);
+      const a = Number(addr);
+      // Cap logging: report each distinct address a few times, then stop, so a
+      // tight spin on an unmapped MMIO reg doesn't flood the log / slow the run.
+      const key = kind + '@' + a.toString(16);
+      const seen = unmappedSeen[key] || 0;
+      if (seen < 3 && unmappedHits < 60) {
+        unmappedSeen[key] = seen + 1;
+        unmappedHits++;
+        let pc = 0;
+        try { pc = Number(uc.arm64_debug(5)); } catch (e) {}
+        const val = (type === ucMod.HOOK_MEM_WRITE_UNMAPPED) ? ' v=0x' + Number(value).toString(16) : '';
+        console.log(`UNMAPPED ${kind} @ 0x${a.toString(16)} pc 0x${pc.toString(16)} size ${Number(size)}${val}`);
+      }
     });
   }
+  // Trace where the kernel writes the idmap page tables (PA 0x19e0000..0x19e3000).
+  uc.hook_add(ucMod.HOOK_MEM_WRITE, (u, access, addr, size, value) => {
+    const a = Number(addr);
+    if (a >= 0x19e0000 && a < 0x19e3000) {
+      console.log(`IDMAP-PA-WRITE @0x${a.toString(16)} = 0x${Number(value).toString(16)} size ${Number(size)}`);
+    }
+  }, 0x19e0000, 0x19e3000);
   const drain = () => {
     let out = '';
     for (;;) {
@@ -281,24 +394,223 @@ async function main() {
       if (ch === -1 || ch === 0xffffffff) break;
       out += String.fromCharCode(ch);
     }
+    while (txBuf.length) out += String.fromCharCode(txBuf.shift());
     return out;
   };
+  let gTtbr1 = 0n, gTcr = 0n, gTtbr0 = 0n;
+  let aborted = false;
+  const blockRing = [];
+  try {
+    uc.hook_add(ucMod.HOOK_BLOCK, (u, addr, size) => {
+      blockRing.push(BigInt(addr));
+      if (blockRing.length > 24) blockRing.shift();
+    });
+    console.log('HOOK_BLOCK installed');
+  } catch (e) { console.log('HOOK_BLOCK err', e.message); }
   const slice = () => {
-    const pc = Number(uc.reg_read_i32(ucMod.ARM64_REG_PC)) || entry;
-    localInt.syncOut(uc);
-    ic.syncOut(uc);
-    uart0.syncOut(uc);
+    let lastPc = 0n;
+    // reg_read_i32(ARM64_REG_PC) is deprecated (id 0) in this fork and returns 0,
+    // which would force emu_start to restart at the physical entry every slice and
+    // trap the kernel in head.S. Use arm64_debug(5) (env.pc) for the real PC.
+    let pc = uc.arm64_debug(5);
+    if (!pc) pc = BigInt(entry);
+    lastPc = pc;
+    // Capture the kernel page-table roots before emu_start (wasm state valid here).
+    try { gTtbr1 = BigInt.asUintN(64, uc.reg_read_i64(ucMod.ARM64_REG_TTBR1_EL1)); } catch (_) {}
+    try { gTtbr0 = BigInt.asUintN(64, uc.reg_read_i64(ucMod.ARM64_REG_TTBR0_EL1)); } catch (_) {}
+    try { gTcr = BigInt.asUintN(64, uc.reg_read_i64(ucMod.ARM64_REG_TCR_EL1)); } catch (_) {}
+    try { localInt.syncOut(uc); } catch (e) { console.log('SYNCOUT localInt THREW:', String(e).slice(0,120)); throw e; }
+    try { ic.syncOut(uc); } catch (e) { console.log('SYNCOUT ic THREW:', String(e).slice(0,120)); throw e; }
+    try { uart0.syncOut(uc); } catch (e) { console.log('SYNCOUT uart0 THREW:', String(e).slice(0,120)); throw e; }
     // arch timer at the real 19.2 MHz rate
-    uc.arm64_timer_tick(BigInt(Math.floor((performance.now() - tmrWall0) * 1000 * 19.2)));
+    try { uc.arm64_timer_tick(BigInt(Math.floor((performance.now() - tmrWall0) * 1000 * 19.2))); } catch (e) { console.log('TIMER_TICK THREW:', String(e).slice(0,120)); throw e; }
     try {
-      uc.emu_start(pc, 0, 0, SLICE_INSNS);
+      const insns = SLICE_INSNS;
+      uc.emu_start(pc, 0, 0, insns);
     } catch (e) {
-      const dbgPc = Number(uc.arm64_debug(5));
-      const daif = Number(uc.arm64_debug(1));
-      console.log('EXC at slice', steps, ': pc 0x' + dbgPc.toString(16), 'daif', daif.toString(16),
-        '| elr', (Number(uc.reg_read_i32(ucMod.ARM64_REG_ELR_EL1)) || 0).toString(16),
-        '| spsr', (Number(uc.reg_read_i32(ucMod.ARM64_REG_SPSR_EL1)) || 0).toString(16),
-        '| sp 0x' + (Number(uc.reg_read_i32(ucMod.ARM64_REG_SP)) || 0).toString(16));
+      console.log('EXC-INNER at slice', steps, ': ', String(e && e.message || e).slice(0, 200));
+      aborted = true;
+      if (e && e.stack) console.log('STACK:\n' + String(e.stack).slice(0, 2500));
+      let faultPc = 0n;
+      try { faultPc = BigInt(uc.arm64_debug(5)); } catch (_) { console.log('  arm64_debug(5) failed'); }
+      console.log('  fault pc (full 64b)=0x' + faultPc.toString(16) + ' | lastPc(before emu_start)=0x' + (lastPc||0).toString(16));
+      console.log('  begin PC (emu_start arg)=0x' + pc.toString(16));
+      console.log('  BLOCK RING (last executed blocks): ' + blockRing.map(x => x.toString(16)).join(' '));
+      try {
+        const names = ['x0','x1','x2','x3','x4','x5','x6','x7','x8','x9','x10','x11','x12','x13','x14','x15','x16','x17','x18','x19','x20','x21','x22','x23','x24','x25','x26','x27','x28','x29','x30','sp'];
+        let line = '';
+        for (const nm of names) {
+          const id = ucMod['ARM64_REG_' + nm.toUpperCase()];
+          if (id === undefined) { line += ` ${nm}=?`; continue; }
+          const b = uc.reg_read(id, 8); let v = 0n; for (let j = 7; j >= 0; j--) v = (v << 8n) | BigInt(b[j]);
+          line += ` ${nm}=0x${BigInt.asUintN(64, v).toString(16)}`;
+        }
+        console.log('  REGS AT FAULT:' + line + ' pc=0x' + faultPc.toString(16));
+        try {
+          const b = uc.reg_read(ucMod.ARM64_REG_SP_EL0, 8); let v = 0n; for (let j = 7; j >= 0; j--) v = (v << 8n) | BigInt(b[j]);
+          console.log('  SP_EL0 AT FAULT = 0x' + BigInt.asUintN(64, v).toString(16));
+        } catch (e3) { console.log('  SP_EL0 read err: ' + e3.message); }
+      } catch (e2) { console.log('  REGS dump err: ' + e2.message); }
+      try { console.log('  EXC-INDEX=' + Number(uc.arm64_debug(6)) + ' ESR_EL1=0x' + Number(uc.arm64_debug(7)).toString(16) + ' FAR_EL1=0x' + Number(uc.arm64_debug(70)).toString(16) + ' SCTLR_EL1=0x' + Number(uc.arm64_debug(71)).toString(16) + ' HCR_EL2=0x' + Number(uc.arm64_debug(72)).toString(16)); } catch (e4) {}
+      try {
+        // tcg_abort now records its site in a fork global read via
+        // arm64_debug(90)=magic, arm64_debug(91)=caller RA.
+        const m0 = Number(uc.arm64_debug(90));
+        const m1 = Number(uc.arm64_debug(91));
+        console.log('  TCG_ABORT MARKER: magic=0x' + m0.toString(16) + ' RA=0x' + m1.toString(16));
+        try { const tpc = Number(uc.arm64_debug(92)); console.log('  TCG_ABORT translated PC (g_tcg_pc)=0x' + (tpc>>>0).toString(16) + ' / full=' + tpc.toString(16)); } catch (e6) { console.log('  tcg_pc read err: ' + e6.message); }
+      } catch (e5) { console.log('  marker read err: ' + e5.message); }
+      console.log('  LAST MEM ACCESS before abort: ' + lastMem.type + ' addr=0x' + lastMem.addr.toString(16) + ' size=' + lastMem.size);
+       console.log('  TRACE tail: (per-instruction trace disabled for performance)');
+      // Page-walk the faulting fetch VA using the REAL TCR (arm64_debug(60)
+      // returns env->cp15.tcr_el[1].raw_tcr; the captured gTcr reg_read fails
+      // and returns 0, which corrupts the walk). Kernel uses TTBR1 for high
+      // VAs like 0xffff8000...
+      try {
+         const faultVaFull = faultPc;   // now accurate (env->pc synced per-instruction)
+        const faultVa32 = faultVaFull & 0xffffffffn; // fork may truncate to 32b
+        const tryWalk = (label, faultVa) => {
+        const readU64 = (pa) => {
+          const b = uc.mem_read(Number(pa), 8);
+          let v = 0n; for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(b[i]);
+          return v;
+        };
+        const tcr = BigInt(Number(uc.arm64_debug(60)));
+        const t1sz = Number((tcr >> 16n) & 0x3fn);
+        const tg1 = Number((tcr >> 30n) & 0x3n);
+        const gran = (tg1 === 2) ? 12 : (tg1 === 1 ? 16 : 14); // TG1: 0b10=4K 0b01=64K 0b11=16K
+        const ttbr1 = gTtbr1;
+        const base0 = (ttbr1 >> 12n) << 12n;
+        const inputsize = 64 - t1sz;
+        const numLevels = Math.ceil((inputsize - gran) / 9);
+        const startLevel = 4 - numLevels;
+        console.log('  [' + label + '] walk: ttbr1=0x' + ttbr1.toString(16) + ' tcr=0x' + tcr.toString(16) +
+                    ' T1SZ=' + t1sz + ' TG1=' + tg1 + ' gran=' + gran +
+                    ' inputsize=' + inputsize + ' numLevels=' + numLevels + ' startLevel=' + startLevel);
+        let table = base0; let pa = 0n; let ok = false; let lastLvl = -1;
+        for (let lvl = startLevel; lvl <= 3; lvl++) {
+          const shift = inputsize - 9 * (1 + (lvl - startLevel));
+          const idx = (faultVa >> BigInt(shift)) & 0x1ffn;
+          const ent = readU64(table + idx * 8n);
+          const type = Number(ent & 0x3n);
+          console.log('   L' + lvl + ' shift=' + shift + ' idx=' + idx + ' ent=0x' + ent.toString(16) + ' type=' + type);
+          if (type === 0) break;            // invalid
+          if (type === 1) {                 // block / page
+            const mask = (1n << BigInt(shift)) - 1n;
+            pa = (ent & ~mask & 0x0000FFFFFFFFF000n) | (faultVa & mask);
+            ok = true; lastLvl = lvl; break;
+          }
+          if (type === 2 || type === 3) {   // table descriptor (this fork uses type 3)
+            table = (ent >> 12n) << 12n;
+            continue;
+          }
+          break;
+        }
+        if (ok) {
+          console.log('  [' + label + '] -> fault PA = 0x' + pa.toString(16) + ' (L' + lastLvl + ')');
+          const b = uc.mem_read(Number(pa), 16);
+          const hex = Array.from(b).map((x) => x.toString(16).padStart(2, '0')).join('');
+          console.log('  [' + label + '] insn bytes: ' + hex);
+          const words = [];
+          for (let i = 0; i < 16; i += 4) {
+            const w = (b[i] | (b[i+1]<<8) | (b[i+2]<<16) | (b[i+3]<<24)) >>> 0;
+            words.push('0x' + w.toString(16));
+          }
+          console.log('  [' + label + '] insn words: ' + words.join(' '));
+        } else { console.log('  [' + label + '] walk failed (invalid descriptor)'); }
+        };
+        try { tryWalk('full-va', faultVaFull); } catch (e2) { console.log('  full-va walk failed:', String(e2).slice(0,120)); }
+        try { tryWalk('trunc-32', faultVa32); } catch (e2) { console.log('  trunc-32 walk failed:', String(e2).slice(0,120)); }
+        return; // (skip the rest of the stale diagnostics)
+        const readU64 = (pa) => {
+          const b = uc.mem_read(Number(pa), 8);
+          let v = 0n; for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(b[i]);
+          return v;
+        };
+        const tcr = BigInt(Number(uc.arm64_debug(60)));
+        const t1sz = Number((tcr >> 16n) & 0x3fn);
+        const tg1 = Number((tcr >> 30n) & 0x3n);
+        const gran = (tg1 === 2) ? 12 : (tg1 === 1 ? 16 : 14); // TG1: 0b10=4K 0b01=64K 0b11=16K
+        const ttbr1 = gTtbr1;
+        const base0 = (ttbr1 >> 12n) << 12n;
+        const inputsize = 64 - t1sz;
+        const numLevels = Math.ceil((inputsize - gran) / 9);
+        const startLevel = 4 - numLevels;
+        console.log('  walk: ttbr1=0x' + ttbr1.toString(16) + ' tcr=0x' + tcr.toString(16) +
+                    ' T1SZ=' + t1sz + ' TG1=' + tg1 + ' gran=' + gran +
+                    ' inputsize=' + inputsize + ' numLevels=' + numLevels + ' startLevel=' + startLevel);
+        let table = base0; let pa = 0n; let ok = false; let lastLvl = -1;
+        for (let lvl = startLevel; lvl <= 3; lvl++) {
+          const shift = inputsize - 9 * (1 + (lvl - startLevel));
+          const idx = (faultVa >> BigInt(shift)) & 0x1ffn;
+          const ent = readU64(table + idx * 8n);
+          const type = Number(ent & 0x3n);
+          console.log('   L' + lvl + ' shift=' + shift + ' idx=' + idx + ' ent=0x' + ent.toString(16) + ' type=' + type);
+          if (type === 0) break;            // invalid
+          if (type === 1) {                 // block / page
+            const mask = (1n << BigInt(shift)) - 1n;
+            pa = (ent & ~mask & 0x0000FFFFFFFFF000n) | (faultVa & mask);
+            ok = true; lastLvl = lvl; break;
+          }
+          if (type === 2 || type === 3) {   // table descriptor (this fork uses type 3)
+            table = (ent >> 12n) << 12n;
+            continue;
+          }
+          break;
+        }
+        if (ok) {
+          console.log('  -> fault PA = 0x' + pa.toString(16) + ' (L' + lastLvl + ')');
+          const b = uc.mem_read(Number(pa), 16);
+          const hex = Array.from(b).map((x) => x.toString(16).padStart(2, '0')).join('');
+          console.log('  insn bytes: ' + hex);
+          const words = [];
+          for (let i = 0; i < 16; i += 4) {
+            const w = (b[i] | (b[i+1]<<8) | (b[i+2]<<16) | (b[i+3]<<24)) >>> 0;
+            words.push('0x' + w.toString(16));
+          }
+          console.log('  insn words: ' + words.join(' '));
+        } else { console.log('  walk failed (invalid descriptor)'); }
+      } catch (e2) { console.log('  walk/insn read failed:', String(e2).slice(0, 120)); }
+      throw e;
+      // Walk the CRASH VA through BOTH TTBRs to decide fork-MMU-bug vs kernel-layout.
+      try {
+        const rdU64b = (reg) => { const b = uc.reg_read(reg, 8); let v = 0n; for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(b[i]); return v; };
+        const crashVa = BigInt(Number(uc.arm64_debug(5)) >>> 0);
+        const tcr1 = Number(uc.arm64_debug(60));
+        const walkTTBR = (label, ttbrReg, nsz, va) => {
+          const TTBR = rdU64b(ttbrReg);
+          console.log(`  [${label}] TTBR=0x${TTBR.toString(16)} TNSZ=${nsz} va=0x${va.toString(16)}`);
+          let base = TTBR & 0x0000FFFFFFFFF000n;
+          for (let lvl = 0; lvl < 4; lvl++) {
+            const sh = 9 * (4 - lvl);
+            const idx = Number((va >> BigInt(sh)) & 0x1ffn);
+            const descAddr = base + BigInt(idx * 8);
+            let desc = 0n;
+            try { const b = uc.mem_read(descAddr, 8); for (let j = 7; j >= 0; j--) desc = (desc << 8n) | BigInt(b[j]); }
+            catch (e) { console.log(`    L${lvl} OOB @0x${descAddr.toString(16)} idx ${idx} (base 0x${base.toString(16)})`); break; }
+            const type = Number(desc & 3n);
+            const pa = desc & 0x0000FFFFFFFFF000n;
+            console.log(`    L${lvl} [${idx}] @0x${descAddr.toString(16)} desc 0x${desc.toString(16)} type ${type} pa 0x${pa.toString(16)}`);
+            if (type === 3) { base = pa; continue; }
+            if (type === 1) { const off = va & ((1n << BigInt(9 * (4 - lvl))) - 1n); console.log(`    L${lvl} BLOCK -> pa 0x${(pa + off).toString(16)}`); break; }
+            console.log(`    L${lvl} INVALID`); break;
+          }
+        };
+        walkTTBR('TTBR0/crashVA', ucMod.ARM64_REG_TTBR0_EL1, tcr1 & 0x3f, crashVa);
+        walkTTBR('TTBR1/crashVA', ucMod.ARM64_REG_TTBR1_EL1, (tcr1 >> 16) & 0x3f, crashVa);
+      } catch (e) { console.log('  crash-va walk failed:', String(e).slice(0, 120)); }
+      // Decode the LAST executed instruction + branch-target registers.
+      try {
+        const lastPc = 0x9723540n;
+        const b = uc.mem_read(Number(lastPc), 4);
+        console.log('  last-insn @0x' + lastPc.toString(16) + ': ' + Array.from(b).map((x) => x.toString(16).padStart(2, '0')).join(''));
+      } catch (e) { console.log('  last-insn read failed:', String(e).slice(0, 80)); }
+      try {
+        const Hr = (r) => BigInt.asUintN(64, uc.reg_read_i64(r));
+        for (const [n, r] of [['x9', ucMod.ARM64_REG_X9], ['x10', ucMod.ARM64_REG_X10], ['x11', ucMod.ARM64_REG_X11], ['x12', ucMod.ARM64_REG_X12], ['x13', ucMod.ARM64_REG_X13], ['x15', ucMod.ARM64_REG_X15], ['x16', ucMod.ARM64_REG_X16], ['x17', ucMod.ARM64_REG_X17], ['x18', ucMod.ARM64_REG_X18], ['x19', ucMod.ARM64_REG_X19], ['x20', ucMod.ARM64_REG_X20], ['x21', ucMod.ARM64_REG_X21], ['x22', ucMod.ARM64_REG_X22], ['x30/lr', ucMod.ARM64_REG_LR]]) {
+          console.log('    ' + n + ' = 0x' + Hr(r).toString(16));
+        }
+      } catch (e) { console.log('  reg dump failed:', String(e).slice(0, 80)); }
       console.log('trace:', trace.join(' '));
       // DECISIVE: force ONE walk at a time and dump the fork's own walk
       // results + the bytes it resolved to, for each candidate VA form.
@@ -342,22 +654,181 @@ async function main() {
       } catch (e2) {
         console.log('pc-lo32 0x' + pcU.toString(16), 'unmapped');
       }
+      // DECISIVE manual 4-level A64 walk of the FULL crash VA via TTBR1.
+      try {
+        const rdU64 = (reg) => {
+          const b = uc.reg_read(reg, 8);
+          let v = 0n;
+          for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(b[i]);
+          return v;
+        };
+        const TTBR = rdU64(ucMod.ARM64_REG_TTBR1_EL1);
+        const tcr1 = Number(uc.arm64_debug(60));
+        const tcr0 = Number(uc.arm64_debug(61));
+        const insize = Number(uc.arm64_debug(62));
+        const t1sz = (tcr1 >> 16) & 0x3f;
+        const t0sz = tcr1 & 0x3f;
+        console.log('  TCR_EL1 raw=0x' + tcr1.toString(16) + ' TCR_EL0 raw=0x' + tcr0.toString(16) +
+          ' | T1SZ=' + t1sz + ' T0SZ=' + t0sz + ' | computed inputsize(TTBR1)=' + insize);
+        const va = 0xffff8000097342d8n;
+        console.log('  TTBR1_EL1 = 0x' + TTBR.toString(16) +
+          ' | RAM top = 0x08000000 | VA = 0x' + va.toString(16));
+        let base = TTBR & 0x0000FFFFFFFFF000n;
+        const shifts = [39, 30, 21, 12];
+        for (let lvl = 0; lvl < 4; lvl++) {
+          const i = Number((va >> BigInt(shifts[lvl])) & 0x1ffn);
+          const descAddr = base + BigInt(i * 8);
+          let desc = 0n;
+          try {
+            const b = uc.mem_read(descAddr, 8);
+            for (let j = 7; j >= 0; j--) desc = (desc << 8n) | BigInt(b[j]);
+          } catch (e3) {
+            console.log('  L' + lvl + ' OOB read @0x' + descAddr.toString(16) +
+              ' (base 0x' + base.toString(16) + ' idx ' + i + ')  <-- walk goes out of bounds here');
+            break;
+          }
+          const type = Number(desc & 3n);
+          const pa = desc & 0x0000FFFFFFFFF000n;
+          console.log('  L' + lvl + ' [' + i + '] @0x' + descAddr.toString(16) +
+            ' desc 0x' + desc.toString(16) + ' type ' + type + ' pa 0x' + pa.toString(16));
+          if (type === 3) { base = pa; continue; }
+          if (type === 1) {
+            const off = va & ((1n << BigInt(shifts[lvl])) - 1n);
+            console.log('  L' + lvl + ' BLOCK -> pa 0x' + (pa + off).toString(16));
+            break;
+          }
+          console.log('  L' + lvl + ' INVALID descriptor (fault)');
+          break;
+        }
+      } catch (e4) {
+        console.log('  walk dump failed:', String(e4).slice(0, 120));
+      }
+      // Also walk with the VA TRUNCATED to 32 bits (what the fork would do
+      // if it truncates the address before the walk).
+      try {
+        const rdU64b = (reg) => {
+          const b = uc.reg_read(reg, 8);
+          let v = 0n;
+          for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(b[i]);
+          return v;
+        };
+        const TTBR = rdU64b(ucMod.ARM64_REG_TTBR1_EL1);
+        const vaFull = 0xffff8000097342d8n;
+        const va32 = vaFull & 0xffffffffn;
+        // QEMU-exact index: shift = 9*(4-level), mask = (1<<12)-1 after a table.
+        const walkExact = (label, va) => {
+          console.log('  [' + label + '] va 0x' + va.toString(16));
+          let base = TTBR & 0x0000FFFFFFFFF000n;
+          let oob = false;
+          for (let lvl = 0; lvl < 4 && !oob; lvl++) {
+            const sh = 9 * (4 - lvl);
+            const idx = Number((va >> BigInt(sh)) & 0xfffn);
+            const descAddr = base + BigInt(idx * 8);
+            let desc = 0n;
+            try {
+              const b = uc.mem_read(descAddr, 8);
+              for (let j = 7; j >= 0; j--) desc = (desc << 8n) | BigInt(b[j]);
+            } catch (e5) {
+              console.log('    L' + lvl + ' OOB @0x' + descAddr.toString(16) +
+                ' idx ' + idx + ' (base 0x' + base.toString(16) + ')');
+              oob = true;
+              break;
+            }
+            const type = Number(desc & 3n);
+            const pa = desc & 0x0000FFFFFFFFF000n;
+            console.log('    L' + lvl + ' [' + idx + '] @0x' + descAddr.toString(16) +
+              ' desc 0x' + desc.toString(16) + ' type ' + type + ' pa 0x' + pa.toString(16));
+            if (type === 3) { base = pa; continue; }
+            if (type === 1) { console.log('    L' + lvl + ' BLOCK ok'); break; }
+            console.log('    L' + lvl + ' INVALID'); break;
+          }
+        };
+        walkExact('full-va', vaFull);
+        walkExact('trunc-32', va32);
+      } catch (e6) {
+        console.log('  exact walk failed:', String(e6).slice(0, 120));
+      }
+      // Dump the KERNEL's real init_idmap_pg_dir (PA 0x19e0000) and walk the
+      // kernel _text VA 0xffff800008000000 with BOTH the ARM-correct formula
+      // (shift 39/30/21/12, mask 9) and the fork's original (shift 36/27/18/9,
+      // mask 12) to see which one finds the kernel's real descriptors.
+      try {
+        const IDMAP = 0x19e0000n;
+        const readU64 = (pa) => {
+          const b = uc.mem_read(Number(pa), 8);
+          let v = 0n;
+          for (let j = 7; j >= 0; j--) v = (v << 8n) | BigInt(b[j]);
+          return v;
+        };
+        const walkIdmap = (label, shifts, mask, vaT) => {
+          console.log('  idmap ' + label + ' VA 0x' + vaT.toString(16) + ':');
+          let base = IDMAP & 0x0000FFFFFFFFF000n;
+          for (let lvl = 0; lvl < 4; lvl++) {
+            const idx = Number((vaT >> BigInt(shifts[lvl])) & mask);
+            const descAddr = base + BigInt(idx * 8);
+            let desc = 0n;
+            try { desc = readU64(descAddr); }
+            catch (e7) { console.log('    L' + lvl + ' OOB @0x' + descAddr.toString(16)); break; }
+            const type = Number(desc & 3n);
+            const pa = desc & 0x0000FFFFFFFFF000n;
+            console.log('    L' + lvl + ' [' + idx + '] @0x' + descAddr.toString(16) +
+              ' desc 0x' + desc.toString(16) + ' type ' + type + ' pa 0x' + pa.toString(16));
+            if (type === 3) { base = pa; continue; }
+            if (type === 1) { console.log('    L' + lvl + ' BLOCK -> 0x' + (pa + (vaT & ((1n << BigInt(shifts[lvl])) - 1n))).toString(16)); break; }
+            console.log('    L' + lvl + ' INVALID'); break;
+          }
+        };
+        console.log('  init_idmap_pg_dir PA=0x' + IDMAP.toString(16) + ' (TTBR0 early, identity map of PHYSICAL VA)');
+        walkIdmap('ARM-correct', [39, 30, 21, 12], 0x1ffn, 0x200000n);
+        walkIdmap('fork-orig', [36, 27, 18, 9], 0xfffn, 0x200000n);
+        // Dump the swapper (TTBR1) for the KIMAGE VA 0xffff800008000000.
+        try {
+          const SWAP = 0x1909000n;
+          const walkSwap = (label, shifts, mask) => {
+            const vaT = 0xffff800008000000n;
+            console.log('  swapper ' + label + ' VA 0x' + vaT.toString(16) + ' (PA 0x' + SWAP.toString(16) + '):');
+            let base = SWAP & 0x0000FFFFFFFFF000n;
+            for (let lvl = 0; lvl < 4; lvl++) {
+              const idx = Number((vaT >> BigInt(shifts[lvl])) & mask);
+              const descAddr = base + BigInt(idx * 8);
+              let desc = 0n;
+              try { desc = readU64(descAddr); }
+              catch (e7) { console.log('    L' + lvl + ' OOB @0x' + descAddr.toString(16)); break; }
+              const type = Number(desc & 3n);
+              const pa = desc & 0x0000FFFFFFFFF000n;
+              console.log('    L' + lvl + ' [' + idx + '] @0x' + descAddr.toString(16) +
+                ' desc 0x' + desc.toString(16) + ' type ' + type + ' pa 0x' + pa.toString(16));
+              if (type === 3) { base = pa; continue; }
+              if (type === 1) { console.log('    L' + lvl + ' BLOCK -> 0x' + (pa + (vaT & ((1n << BigInt(shifts[lvl])) - 1n))).toString(16)); break; }
+              console.log('    L' + lvl + ' INVALID'); break;
+            }
+          };
+          console.log('  swapper_pg_dir PA=0x' + SWAP.toString(16));
+          walkSwap('ARM-correct', [39, 30, 21, 12], 0x1ffn);
+          walkSwap('fork-orig', [36, 27, 18, 9], 0xfffn);
+        } catch (e9) {
+          console.log('  swapper dump failed:', String(e9).slice(0, 120));
+        }
+      } catch (e8) {
+        console.log('  idmap dump failed:', String(e8).slice(0, 120));
+      }
       console.log('--- console so far (' + chars.length + ' chars) ---');
       console.log(chars.slice(-1500));
       console.log('---');
       throw e;
     }
-    localInt.syncIn(uc);
-    ic.syncIn(uc);
-    uart0.syncIn(uc);
-    localInt.syncIrq(uc, (l) => uc.arm64_set_irq(l));
+    try { localInt.syncIn(uc); } catch (e) { console.log('SYNCIN localInt THREW:', String(e).slice(0,150)); throw e; }
+    try { ic.syncIn(uc); } catch (e) { console.log('SYNCIN ic THREW:', String(e).slice(0,150)); throw e; }
+    try { uart0.syncIn(uc); } catch (e) { console.log('SYNCIN uart0 THREW:', String(e).slice(0,150)); throw e; }
+    try { localInt.syncIrq(uc, (l) => uc.arm64_set_irq(l)); } catch (e) { console.log('SYNCIRQ localInt THREW:', String(e).slice(0,150)); throw e; }
     steps++;
     return drain();
   };
 
   const t0 = Date.now();
   let sliced = 0;
-  let lastPtw = 0n;
+   let lastPtw = 0n;
+   let spEl0Prev = -1n;
   const walkProbe = (label) => {
     const mk = (s) => Number(uc.arm64_debug(s)).toString(16);
     const pc = Number(uc.arm64_debug(5)).toString(16);
@@ -370,11 +841,110 @@ async function main() {
   walkProbe('boot');
   for (; sliced < MAX_SLICES; sliced++) {
     chars += slice();
+    if (aborted) { console.log('STOP after first abort'); break; }
+    if (sliced % 100 === 0) {
+      try {
+        const pc = Number(uc.arm64_debug(5)).toString(16);
+        const lastTB = Number(uc.arm64_debug(8)).toString(16);
+        const rdX = (r) => { const b = uc.reg_read(r, 8); let v = 0n; for (let j = 7; j >= 0; j--) v = (v << 8n) | BigInt(b[j]); return BigInt.asUintN(64, v).toString(16); };
+        const x9 = rdX(ucMod.ARM64_REG_X9), x10 = rdX(ucMod.ARM64_REG_X10), x23 = rdX(ucMod.ARM64_REG_X23);
+        console.log(`   [hang] slice ${sliced} pc=0x${pc} lastTB=0x${lastTB} x9=0x${x9} x10=0x${x10} x23=0x${x23} chars=${chars.length}`);
+      } catch (e) {}
+    }
+    if (sliced % 50 === 0) {
+      try {
+        const b = uc.reg_read(ucMod.ARM64_REG_SP_EL0, 8); let v = 0n; for (let j = 7; j >= 0; j--) v = (v << 8n) | BigInt(b[j]);
+        if (v !== spEl0Prev) {
+          console.log(`   [spel0] slice ${sliced} sp_el0=0x${BigInt.asUintN(64, v).toString(16)} pc=0x${Number(uc.arm64_debug(5)).toString(16)}`);
+          spEl0Prev = v;
+        }
+      } catch (e) {}
+    }
     if (sliced % 1000 === 0 && sliced > 0) walkProbe('s' + sliced);
     if (sliced === 4200) walkProbe('pre-crash');
     if (sliced % 5000 === 0 && sliced > 0) {
       const mips = ((sliced * SLICE_INSNS) / ((Date.now() - t0) / 1000) / 1e6).toFixed(2);
-      process.stdout.write(`\r${sliced} slices | ${mips} MIPS | ${chars.length} chars`);
+      const pc = Number(uc.arm64_debug(5)).toString(16);
+      process.stdout.write(`\r${sliced} slices | ${mips} MIPS | ${chars.length} chars | pc 0x${pc}`);
+    }
+    if (sliced === 10 || sliced === 50 || sliced === 100 || sliced === 500 || sliced === 600 || sliced === 700 || sliced === 800 || sliced === 900 || sliced === 1000 || sliced === 1500 || sliced === 2000 || sliced === 5000 || sliced === 20000 || sliced === 50000 || sliced === 100000 || sliced === 200000 || sliced === 400000 || sliced === 600000) {
+      try {
+        const csPA = 0x203e650n;
+        const buf = uc.mem_read(Number(csPA), 32);
+        const csw = [];
+        for (let i = 0; i < 32; i += 8) { let v = 0n; for (let j = 7; j >= 0; j--) v = (v << 8n) | BigInt(buf[i + j]); csw.push('0x' + BigInt.asUintN(64, v).toString(16)); }
+        console.log('   console_sem@' + csPA.toString(16) + ': ' + csw.join(' '));
+        try {
+          const SP0 = ucMod.ARM64_REG_SP_EL0;
+          if (SP0 !== undefined) {
+            const b = uc.reg_read(SP0, 8); let v = 0n; for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(b[i]);
+            console.log('   SP_EL0 = 0x' + BigInt.asUintN(64, v).toString(16));
+          } else { console.log('   ARM64_REG_SP_EL0 undefined in binding'); }
+        } catch (e) { console.log('   SP_EL0 read err: ' + e.message); }
+        try {
+          const itPA = 0x202d100n;
+          const ib = uc.mem_read(Number(itPA), 128);
+          const itw = [];
+          for (let i = 0; i < 128; i += 8) { let v = 0n; for (let j = 7; j >= 0; j--) v = (v << 8n) | BigInt(ib[i + j]); const vs = '0x' + BigInt.asUintN(64, v).toString(16); itw.push(vs); }
+          console.log('   init_task@' + itPA.toString(16) + ': ' + itw.join(' '));
+        } catch (e) { console.log('   init_task ERR: ' + e.message); }
+       } catch (e) { console.log('   console_sem ERR: ' + e.message); }
+       if (sliced === 20000) {
+         try {
+           const NEEDLE = '4e200000730';
+           let found = -1, fpa = 0n;
+           for (let pa = 0x200000n; pa < 0x8000000n && found < 0; pa += 0x10000n) {
+             const b = uc.mem_read(Number(pa), 0x10000);
+             const s = String.fromCharCode(...b).replace(/[^\x20-\x7e\n\r\t]/g, '.');
+             const i = s.indexOf(NEEDLE);
+             if (i >= 0) { found = i; fpa = pa + BigInt(i); }
+           }
+           if (found >= 0) {
+              const b = uc.mem_read(Number(fpa - 0x200n), 0x4000);
+             let out = '';
+             for (let i = 0; i < b.length; i++) { const c = b[i]; out += (c >= 0x20 && c < 0x7f) ? String.fromCharCode(c) : (c === 0x0a ? '\n' : '.'); }
+             console.log('--- RING BUFFER OOPS @0x' + fpa.toString(16) + ' ---\n' + out + '\n--- END OOPS ---');
+           } else { console.log('   [oops-scan] "Unable to handle" not found in RAM 0x200000..0x4000000'); }
+          } catch (e) { console.log('   oops-scan ERR: ' + e.message); }
+     }
+     }
+     if (sliced === 100000 || sliced === 200000 || sliced === 400000 || sliced === 600000) {
+      try {
+        const SHIFTS = [39n,30n,21n,12n], ROOT = 0x24ed000n;
+        const rd = (id) => { const b = uc.reg_read(id, 8); let v = 0n; for (let i = 7; i >= 0; i--) v = (v << 8n) | BigInt(b[i]); return v; };
+        const pcN = Number(uc.arm64_debug(5));
+        const lr = rd(ucMod.ARM64_REG_LR);
+        const sp = rd(ucMod.ARM64_REG_SP);
+        const spPA = walkVA(BigInt.asUintN(64, sp), ROOT, SHIFTS);
+        const frames = [];
+        for (let i = 0; i < 24; i++) {
+          const v = readU64(spPA + BigInt(i * 8));
+          frames.push('0x' + BigInt.asUintN(64, v).toString(16));
+        }
+        console.log(`[unwind] slice ${sliced}: pc=0x${pcN.toString(16)} lr=0x${BigInt.asUintN(64,lr).toString(16)} sp=0x${BigInt.asUintN(64,sp).toString(16)} spPA=0x${spPA?spPA.toString(16):'NULL'}`);
+        console.log('   stack: ' + frames.join(' '));
+        try {
+          const RB = 0xffff800009e3e5e0n;
+          const rbPA = walkVA(RB, ROOT, SHIFTS);
+          const rbw = [];
+          for (let i = 0; i < 256; i += 8) rbw.push('0x' + BigInt.asUintN(64, readU64(rbPA + BigInt(i))).toString(16));
+          console.log('   rb@' + rbPA.toString(16) + ': ' + rbw.join(' '));
+          try {
+            const dataVA = 0xffff80000a26f518n;
+            const dPA = walkVA(dataVA, ROOT, SHIFTS);
+            const buf = uc.mem_read(Number(dPA), 131072);
+            let run = '', runs = [];
+            for (let i = 0; i < buf.length; i++) {
+              const c = buf[i];
+              if (c >= 32 && c < 127) { run += String.fromCharCode(c); }
+              else { if (run.length >= 5) runs.push(run); run = ''; }
+            }
+            if (run.length >= 5) runs.push(run);
+            console.log('   RING TEXT (' + runs.length + ' runs):');
+            for (const r of runs) console.log('     |' + r.replace(/\n/g, '\\n').slice(0, 200));
+          } catch (e) { console.log('   ring scan ERR: ' + e.message); }
+        } catch (e) { console.log('   rb ERR: ' + e.message); }
+      } catch (e) { console.log('[unwind] slice ' + sliced + ' ERR: ' + e.message); }
     }
     if (chars.includes('Kernel panic')) break;
     if (chars.includes('Unable to mount root fs')) break;
@@ -403,5 +973,6 @@ async function main() {
 
 main().catch((e) => {
   console.error('FATAL', String(e && e.message || e).slice(0, 300));
+  if (e && e.stack) console.error('STACK:\n' + e.stack.split('\n').slice(0, 12).join('\n'));
   process.exit(1);
 });

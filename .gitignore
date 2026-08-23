@@ -3,3 +3,9 @@ target/
 dist/
 public/pi_board.wasm
 public/unicorn.js
+# qemu-wasm Linux-boot artifacts (prebuilt from ktock/qemu-wasm; fetched via scripts/fetch-linux.sh)
+public/linux/qemu-system-aarch64.wasm
+public/linux/qemu-system-aarch64.data
+public/linux/qemu-system-aarch64.worker.js
+public/linux/out.js
+public/linux/load.js

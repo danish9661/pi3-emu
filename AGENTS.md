@@ -60,6 +60,35 @@ ethernet, or GPU graphics in scope.
 
 Viability: 26.5 MIPS → ~20s Linux boot, usable-but-slow shell. OK.
 
+### PIVOT (2026-08-23): qemu-wasm is now the Linux engine
+
+The Unicorn-fork approach (Phase 1/2a/2b below) was **abandoned for the
+Linux boot**: its TCI interpreter cannot translate the NEON/SIMD ops an
+aarch64 kernel requires — TCI has zero vector-op handlers (confirmed
+against upstream QEMU `tci.c` too). Instead we now boot Linux with
+**ktock/qemu-wasm** (`github.com/ktock/qemu-wasm`), which adds a real
+TCG→Wasm backend (hot TBs JIT-compiled to WebAssembly, cold TBs via TCI),
+so it handles vectors and boots the kernel.
+
+- Machine: `raspi3ap` (BCM2837 / Pi 3 B+, 4× Cortex-A53, 512 MB).
+- Assets (gitignored, fetched by `scripts/fetch-linux.sh` from
+  `ktock/qemu-wasm-demo-images`): `qemu-system-aarch64.wasm`, `.data`
+  (packs `kernel8.img` = raspberrypi/linux tag `1.20230405` +
+  `bcm2710-rpi-3-b-plus.dtb` + busybox `rootfs.bin`), `out.js`,
+  `.worker.js`, `load.js`.
+- Harness (committed, in `public/linux/`): `index.html`, `module.js`
+  (qemu args + `locateFile`/`mainScriptUrlOrBlob`), `coi-serviceworker.js`
+  (cross-origin isolation required by the pthread / `PROXY_TO_PTHREAD`
+  build), `vendor/xterm.css`. The xterm terminal is wired to the emulated
+  PL011 via `xterm-pty` (`openpty`).
+- **STATUS: WORKING.** Verified headless (Chrome): the kernel boots to a
+  busybox shell (`~ #`) on the serial console. The pi3-emu "linux" program
+  option now launches this inside an iframe (`runLinux()` in `src/main.js`)
+  instead of the dead Unicorn `linuxRun()` path.
+
+The Unicorn-fork notes below remain as the historical reconstruction
+record for the bare-metal MMIO / slice work still used by the M1–M19 guests.
+
 ### Patched unicorn.js (the Phase 1 core work)
 
 Source: `github.com/AlexAltea/unicorn.js` (npm `@alexaltea/unicorn-js`
@@ -77,8 +106,20 @@ unicorn`, applied directly — NOT in src/patches/ yet):
   cntpct)` — advances the ARM generic timer counter (drives CNTP_CTL
   ISTATUS + IRQ via gt_recalc_timer); `uc_arm64_debug(uc, sel)` — host
   debug reads (sel: 0=interrupt_request, 1=daif, 2=uc_ext_irq,
-  3=uc_gt_irq[0], 4=uc_cntpct, 5=env.pc, 6/7=delivery counters,
-  8/9/10=last-TB ring {addr,count,reset}).
+  3=uc_gt_irq[0] (CNTPNS), 4=uc_cntpct, 5=env.pc, 6=exception_index,
+  7=ESR_EL1, 11=uc_gt_irq[1] (CNTV), 12=uc_gt_irq[2] (CNTHP),
+  13=uc_gt_irq[3] (CNTPS), 70=FAR_EL1, 71=SCTLR_EL1, 72=HCR_EL2;
+  diagnostic selectors 8-10/14-111 of the *original* Phase 2a-MMU build
+  are NOT reconstructed — they recorded every page-walk into rings and
+  caused the 0.003 MIPS slowness; the rebuilt core skips them (returns 0)
+  and runs at ~10 MIPS instead).
+- **CRITICAL FIX (cpu.h `arm_el_is_aa64`)**: on bare-metal reset
+  `SCR_EL3.RW`/`HCR_EL2.RW` default to 0, so `arm_el_is_aa64(env,1)`
+  returned false and the whole EL1 regime was walked as AArch32 (v6
+  tables) — a kernel fetch at a physical PA with MMU off still faulted
+  (PREFETCH_ABORT) because the AArch32 SCTLR had M=1. Forced
+  `return aa64` for `el<=2`. Without this the kernel dies at slice 0 in
+  head.S (`msr sctlr_el1, xzr` region, pc 0x10463f4).
 - helper.c: `gt_get_countervalue` returns `cpu->uc_cntpct`; re-enabled
   `gt_recalc_timer`/`gt_ctl_write`/`gt_timer_reset` (bodies were #if 0;
   ptimers still removed) driving IRQ lines through
@@ -294,84 +335,119 @@ for lirq. Verified: 20/20 probes + 9/9 browser E2E checks.
 ### Linux 6.1.182 boot crash — CURRENT WORK (fork-internal abort, traced)
 
 Crash: Linux 6.1.182 boot aborts inside the rebuilt core (public/
-unicorn.js wasm) at pc 0xffff8000097342d8 (= -0x7ffff68cbd28,
-early_security_init first fetch), lr 0x9710a14, sp 0x9e23e30,
-mmu_idx 8, ttbr 0x24ed000, walk_ret 0, fill_count 0x3b78,
-ptw_count 0xb235, slice 6484 — deterministic across runs. The stock
-(fork) wasm OOBs; the 1GB-patched build aborts internally instead.
+unicorn.js wasm). The kernel gets through `head.S` and MMU enable, then
+the fork aborts / traps while translating or executing a TB in the early
+boot path (probe shows it STUCK retrying a single TB at
+`early_security_init`, VA 0xffff8000097342d8 — see below for the caveat
+that post-error `pc` reads are unreliable). Stock (fork) wasm OOBs;
+rebuilt core reaches the same site at ~9.7 MIPS.
 
-Root cause (PINNED by marker instrumentation, ~18 runs):
-- The abort is the fork's assert wrapper $202 (WAT $202 = binary
-  func 231, call opcode `10 e7 01`; in the .wat text $N = binary
-  N+29; call $293 = binary 322 = `10 c2 02` — CAREFUL: `10 42 02`
-  is call 66 + block, NOT call 322).
-- Chain: $1745 (12-param i64 helper, elem-table idx 586, called
-  via call_indirect — 372 call_indirect sites, not statically
-  traceable) → $293 (error helper: if msg!=0 log via $126 then
-  abort via $202) → $202 (assert wrapper) → $429(msg,len) → $605
-  (stores msg,len at 144952/144956 ONLY if 144952==0, first
-  abort wins) → abort import. Marker hits: 202 (run4), 3002=$293
-  (run5), 3105=$1745 (run6).
-- $1745 body (fired path): return 0 if $2!=0; return 0 if
-  [S+25064] (signed i32) >= 0 where S=[env+224]; then
-  [env+11412]==1 → reload S; [S+16692]=0; [env+12274]!=1 →
-  $293(S, load(144968)) [FIRED — so the msg cell 144968 reads 0];
-  else [env+12274]=0, $202(S).
-- $202 body: $2=[S+16684]=env backptr; $1=[env+11412]; if $1==1
-  reload; [S+16676]=1; msg = env + $1*156 + 1272; call $429(msg,1).
-  C-msg observed ptr=0 len=1 (computed msg ≡ 0 mod 2^32 — still
-  unexplained).
-- $1745 is a TCG-style helper checking an invariant on struct S:
-  S = 38256-byte struct allocated in $1417 (WAT line 435434) via
-  $325(16,38256)+memory.fill zero: [S+16684]=env backptr,
-  [S+16688]=S+38160 (register-ID table: 11,12,12,12,13,14,15,16,
-  17,39,40,41,42,43,44,45,46,47,48,49,50… — UC-reg-enum-like),
-  [env+224]=S. So env+224 → S, S+16684 → env (2-cycle).
-- Field [S+25064]: written ONLY via 16-bit stores ($726 line
-  200605: store16 25064 = load16(25064) + (x-y); $4436 line
-  854818: store16 0 at 25066; $4436 line 856376: i64.store16
-  saturating at 25064). $4436 also loops `br_if while i32.load
-  25064 < 0` (a saturating/repair loop). With zero-init + 16-bit
-  writes, an i32 signed load at 25064 should be ≥ 0 — so the
-  abort means either S/env+224 is stale/garbage or an overlapping
-  32/64-bit store exists (not found by WAT text grep).
-- [env+12274] flag: set to 1 in $1392 (line 431223) during
-  exception handling, cleared after (line 431253); $1745 aborts
-  via $293 (log path) when != 1 — fired means the flag was 0.
-- [S+16680] reason field set before abort by OTHER sites: -1
-  ($721), 65536=0x10000 ($724), 65538=0x10002 ($4436), 65540=
-  0x10004 ($925), 65541=0x10005 ($600). Fired path sets
-  [S+16692]=0 (not 16680).
-- Sibling string "sve_ldffsdu_le_zss" at data offset 3717 and
-  $4436's field family (25064/16672/16680/16692) suggest $1745 is
-  an SVE/vector helper assert wrapper.
+**RECONSTRUCTION STATUS (2026-08-22):** the fork patch set (Phase 1 +
+Phase 2a-MMU `arm_el_is_aa64` fix) was re-applied from this prose to a
+fresh `github.com/AlexAltea/unicorn.js` @ 8028ec43 clone in
+`/tmp/opencode/unicornjs-src` and rebuilt (`python3 build.py aarch64`).
+That rebuild boots the kernel to the **same** crash site (pc
+0xffff8000097342d8) but at **~9.7 MIPS** vs the old instrumented
+patched core's **0.003 MIPS** (~3000× faster) — confirming the
+0.003 MIPS was the Phase 2a-MMU walk-ring instrumentation, which was
+deliberately NOT reconstructed. Bare-metal guests (mva/irq/uart0) still
+pass *functionally*; only the walk-diagnostic probe assertions fail by
+design.
+
+**ROOT CAUSE — LAYERED, PEELLED 2026-08-22:**
+1. The abort is NOT SVE. Default fork CPU is **A72** (`cpu_aarch64_init`:
+   `if (uc->cpu_model==INT_MAX) uc->cpu_model=UC_CPU_ARM64_A72`; probe sets
+   A72=2), and `aarch64_a72_initfn` sets `id_aa64pfr0=0x00002222` →
+   **SVE=0**. So SVE is never advertised; the `sve_ldffsdu_le_zss` wasm
+   data label was a red herring.
+2. `qemu/include/qemu/osdep.h:157` redefines `assert`→`g_assert` ONLY
+   under MINGW/ANDROID/arm/i386; on wasm it is system assert (off under
+   NDEBUG/Release). Fork vendors glib in `unicorn/glib_compat/`;
+   `g_assertion_message_expr` (gtestutils.c:24-34) prints "assertion
+   failed" then `abort()` with NO `G_DISABLE_ASSERT` guard. `printf` from
+   fork C is **silenced** in the node probe context.
+3. **FIRST SUPPRESSION ATTEMPT (p2a build):** edited
+   `glib_compat/gtestutils.c` (`g_assertion_message_expr` → `return`),
+   `translate-a64.c` (2× `default: abort();` → `unallocated_encoding(s)`),
+   `helper.c` (2× walker `default: abort();` →
+   `fi->type=ARMFault_Translation; return false;`). Rebuilt — kernel STILL
+   aborts at the same pc. So the abort is NOT g_assert and NOT those raw
+   `abort()`s.
+4. **SECOND ATTEMPT (p2b/p2c build):** the actual abort is `tcg_abort()`
+   (tcg.h:1157 `#ifndef NDEBUG` prints+abort; tcg.h:1163 `#else` →
+   `abort()` — Release build hits `abort()`). This fires at **translation
+   time** while building the TB for `early_security_init` (the kernel
+   retries that single TB every slice and never advances). Neutralizing
+   it (no-op continue, or a guest-phys marker write) makes the kernel
+   proceed past that TB — at which point `emu_start` throws a **wasm
+   "memory access out of bounds"** trap at a later point (slice 28 in the
+   p2c run; `uc.mem_read(0x1000)` from the probe SUCCEEDED, so the trap is
+   the *kernel* doing an OOB wasm access, not the marker write). So
+   behind the translation-time `tcg_abort` there is a **deeper fork
+   memory-mapping bug** (a guest access the fork maps to an out-of-bounds
+   wasm linear-memory offset). `UC_ERR_RESOURCE` (code 20) was also seen
+   once (likely the `uc.c:1098` `nested_level >= UC_MAX_NESTED_LEVEL=64`
+   cap — `nested_level` is incremented at `uc_emu_start` entry and
+   decremented only AFTER `vm_start`; if `vm_start` longjmps on a
+   per-slice error the decrement is skipped and the counter climbs).
+5. **CAVEAT — post-error `pc` is UNRELIABLE.** The Image is only ~34 MB
+   (0x2264A00 bytes) at guest 0x200000, so any computed PA for
+   `0xffff8000097342d8` (0x91342D8/0x8F342D8) is impossible → the reported
+   `fault pc` is garbage after the wasm trap. The "early_security_init"
+   attribution holds only for the *translation-time* stall (pre-trap), not
+   the OOB trap.
+
+**CURRENT BUILD STATE (Linux = qemu-wasm, WORKING):** the `linux` boot
+mode runs `qemu-system-aarch64` from `ktock/qemu-wasm` inside an iframe
+(`public/linux/index.html`), booting the `raspi3ap` machine to a busybox
+shell (`~ #`). Artifacts are gitignored; restore them with
+`scripts/fetch-linux.sh` (from `ktock/qemu-wasm-demo-images`). The
+Unicorn-fork `public/unicorn.js` is unchanged and still serves the M1–M19
+bare-metal guests; its Linux (TCG) path is now dead code, superseded by
+qemu-wasm. The `unicorn.js` fork rebuild (`/tmp/opencode/unicornjs-src`)
+remains the historical record for the bare-metal MMIO/slice work.
 
 Tooling (rebuildable, all under /tmp/opencode/ltest — /tmp is
 WIPED REPEATEDLY, redo from scratch each time):
 - extract-wasm.mjs: pull wasm bytes out of public/unicorn.js
   (js-string at ~3361+14); wasm-dis → uc2.wat (~867k lines).
-- patchbin3.js: binary patcher (top-down rebuild; MUST update code
-  section size LEB: 1158787 + SITES.length*10; memory min-pages
-  LEB `84 02` at 0x161d → `ff 7f`; Buffer.concat needs Buffers —
-  wrap writeUleb output in Buffer.from; verify each site's bytes).
-- Marker insn (10 B): i32.const 145000; i32.const ID;
-  i32.store align=2 — `41 c8 8d 08 41 ID 36 02`. Cells: 145000
-  marker, unfired = 0xffffffff (kernel overwrites guest 0x23668).
-- embed.mjs: embed uc-patched.wasm base64 into unicorn-diag.js
-  (NUL as `\x00` not `\0`), then `node --check unicorn-diag.js`.
-- diag9.mjs: boots Image+DTB via embedded wasm; onAbort reads
-  DataView cells 144952/144956 (msg,len)/145000/145004 (markers)
-  — ccall arm64_debug/reg_read THROW post-Aborted(), only DataView
-  reads work. Logs: diag9-run4.log (202), diag9-run5.log (3002),
-  diag9-run6.log (3105).
-- wasm-as is BROKEN for this WAT; llvm-objdump is ground truth
-  (~/emsdk/upstream/bin).
+- build.py: `source ~/emsdk/emsdk_env.sh; python3 build.py aarch64`
+  → `dist/unicorn_aarch64.js`. Long runs MUST use
+  `setsid bash -c '...' < /dev/null > /dev/null 2>&1 &` (bash tool caps
+  120s).
+- llvm-objdump (~/emsdk/upstream/bin) is ground truth for WAT↔binary
+  call-site mapping (wasm-as is BROKEN for this tree).
+- test/linux-probe.mjs: reloc-skip patch writes `ret` (0xD65F03C0) at
+  guest-phys 0x1046438 (VA ffff800008e46438 = `__relocate_kernel`);
+  80000-slice budget; EXC-INNER handler dumps REGS AT FAULT + page-walk;
+  marker-read stub (guest-phys 0x1000 — currently returns 0 since tcg_abort
+  no longer writes it) for future capture.
 
-NEXT (in progress): instrument value dump before the fired call
-at 0xb1f2f ($1745): [S+25064] i32, S, [env+11412], [env+12274],
-[144968] → cells 145008..145024; interpret why [S+25064] < 0;
-then map to fork C (SVE/vector assert), fix or work around,
-continue boot toward cgroup_init_subsys+0x154 (cgroup.c:6052).
+CLOSED (wake_q_add fork-truncation theory DISPROVEN): the `wake_q_add`
+fault (REGS AT FAULT `x19=0x09e3e650` at `wake_q_add+0x84`) was
+hypothesised to come from the fork truncating `&console_sem` to 32 bits
+inside `up()`. This is **refuted by a live `HOOK_CODE` trace** (in
+test/linux-probe.mjs) of `up()`/`__up()`/`wake_q_add`: for every
+`up(&console_sem)` call (from `console_unlock`), `x0` entering `up()` is
+the full 64-bit `0xffff800009e3e650`, `mov x19,x0` preserves it (64-bit),
+`ldr x0,[x1,#8]!` reads `wait_list.next = 0xffff800009e3e658` correctly,
+and `cmp x0,x1` is EQUAL → `up()` takes the empty-list path and returns
+**without** calling `__up`/`wake_q_add`. So the fork handles
+`&console_sem` correctly; the fault (if/when it occurs) is a kernel-side
+condition (a genuinely non-empty `console_sem` list at a deeper boot
+point, or a different caller), not a fork 32-bit truncation.
+
+SEPARATE BLOCKER (unrelated to the above): the unicorn.js probe has
+**never** booted Linux 6.1.182 to console. The "Linux version" output
+previously attributed to it was actually the **qemu-wasm demo** (next
+section). In the current probe the kernel hangs in early boot after MMU
+enable (no 5000-slice progress, no console) — it spins waiting on a
+device/IRQ our models don't yet satisfy. Probe improvements made while
+investigating: removed a per-instruction `HOOK_CODE` (was ~100× slowdown)
+and fixed the slice-loop PC source (`reg_read_i32(ARM64_REG_PC)` returns
+deprecated id-0 → 0, forcing `emu_start` to restart at the physical entry
+every slice; now uses `uc.arm64_debug(5)`). The early-boot hang remains
+the real M20+ Linux-bring-up work.
 
 ### Linux 6.1.21 boot — QEMU-wasm feasibility demo (DONE: busybox shell!)
 

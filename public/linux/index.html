@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Raspberry Pi 3 (BCM2837) — Linux on QEMU Wasm</title>
+    <link rel="stylesheet" href="./vendor/xterm.css" />
+    <style>
+      body { background: #111; color: #eee; font-family: system-ui, sans-serif; margin: 0; padding: 12px; }
+      h1 { font-size: 16px; font-weight: 600; }
+      #terminal { height: 70vh; }
+      .hint { color: #888; font-size: 12px; margin-top: 8px; }
+    </style>
+  </head>
+  <body>
+    <h1>Raspberry Pi 3 (aarch64) — Linux boot via QEMU Wasm</h1>
+    <div id="terminal"></div>
+    <p class="hint">It can take some time to load and start the VM. Serial console → xterm.</p>
+
+    <script src="./coi-serviceworker.js"></script>
+    <script src="./module.js"></script>
+    <script src="./load.js"></script>
+    <script type="module">
+      import 'https://unpkg.com/xterm@5.3.0/lib/xterm.js';
+      import 'https://unpkg.com/xterm-pty/index.js';
+      import './module.js';
+      import initEmscriptenModule from './out.js';
+
+      const xterm = new Terminal();
+      xterm.open(document.getElementById("terminal"));
+
+      const { master, slave } = openpty();
+
+      xterm.loadAddon(master);
+
+      Module.pty = slave;
+      Module['mainScriptUrlOrBlob'] = location.href.replace(/index\.html$/, '') + 'out.js';
+      (async () => {
+          const instance = await initEmscriptenModule(Module);
+
+          var oldPoll = Module['TTY'].stream_ops.poll;
+          var pty = Module['pty'];
+          Module['TTY'].stream_ops.poll = function(stream, timeout){
+              if (!pty.readable) {
+                  return (pty.readable ? 1 : 0) | (pty.writable ? 4 : 0);
+              }
+              return oldPoll.call(stream, timeout);
+          }
+      })();
+    </script>
+  </body>
+</html>

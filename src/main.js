@@ -1353,6 +1353,44 @@ function linuxRun() {
   linuxFrame = requestAnimationFrame(frame);
 }
 
+// Linux boot uses the qemu-wasm engine (a self-contained page at
+// /linux/index.html) instead of the unicorn core. We embed it in an iframe
+// rather than driving it from JS: the page wires xterm to the emulated
+// PL011 via xterm-pty and boots the raspi3ap machine (4x Cortex-A53, 512 MB)
+// with the prebuilt kernel8.img + DTB + busybox rootfs.
+function runLinux() {
+  cancelAnimationFrame(gpioFrame);
+  cancelAnimationFrame(fbFrame);
+  cancelAnimationFrame(irqFrame);
+  cancelAnimationFrame(linuxFrame);
+  gpioLoopActive = false;
+  runBtn.disabled = true;
+  term.hidden = true;
+  gpioPanel.hidden = true;
+  fbCanvas.hidden = true;
+  let frame = document.getElementById('linuxframe');
+  if (!frame) {
+    frame = document.createElement('iframe');
+    frame.id = 'linuxframe';
+    frame.style.width = '100%';
+    frame.style.height = '82vh';
+    frame.style.border = '0';
+    frame.style.background = '#111';
+    document.querySelector('main').appendChild(frame);
+  }
+  const loaded = frame.src && frame.src.indexOf('linux/index.html') !== -1;
+  if (loaded) {
+    try { frame.contentWindow.location.reload(); } catch (e) { frame.src = './linux/index.html'; }
+  } else {
+    frame.src = './linux/index.html';
+  }
+  frame.hidden = false;
+  setStatus('booting Linux — qemu-wasm raspi3ap (Pi 3 B+, 4× Cortex-A53, 512 MB) — serial console in the frame below');
+  hint.textContent = 'Linux runs in the embedded frame (cross-origin isolated for threads). Press Reboot to reload the VM.';
+  runBtn.textContent = 'Reboot';
+  runBtn.disabled = false;
+}
+
 // The guest drives itself: it prints to the UART TX slots (one char per
 // slice) and parks in getc until a key arrives. Run slices until the guest
 // has gone quiet for two consecutive slices — i.e. it is back waiting for
@@ -1432,12 +1470,21 @@ function tapKeys(btn) {
 }
 
 async function run() {
+  // Linux boot is handled by the qemu-wasm engine in an embedded iframe,
+  // not by the unicorn core — bail out before initializing unicorn.
+  if (progSel.value === LINUX_MODE) {
+    runLinux();
+    return;
+  }
   cancelAnimationFrame(gpioFrame);
   cancelAnimationFrame(fbFrame);
   cancelAnimationFrame(irqFrame);
   cancelAnimationFrame(linuxFrame);
   gpioLoopActive = false;
   runBtn.disabled = true;
+  term.hidden = false;
+  const linuxFrameEl = document.getElementById('linuxframe');
+  if (linuxFrameEl) linuxFrameEl.hidden = true;
   term.textContent = '';
   gpioPanel.hidden = true;
   fbCanvas.hidden = true;
@@ -1549,26 +1596,6 @@ async function run() {
       draw(runUntilSdDone()); // FAT12 card: boot sector, root dir, HELLO.TXT
       setStatus(
         `booted — running sd — BCM2835 SDHCI (EMMC) @ 0x3F300000 — FAT12 card, HELLO.TXT read — press Reboot to re-run`
-      );
-    } else if (progSel.value === LINUX_MODE) {
-      mode = LINUX_MODE;
-      const [imgResp, dtbResp] = await Promise.all([
-        fetch('./linux/Image'),
-        fetch('./linux/bcm2837-rpi-3-b.dtb'),
-      ]);
-      if (!imgResp.ok || !dtbResp.ok) throw new Error('cannot fetch ./linux/Image or dtb');
-      const image = new Uint8Array(await imgResp.arrayBuffer());
-      const dtb = new Uint8Array(await dtbResp.arrayBuffer());
-      if (dtb[0] !== 0xd0 || dtb[1] !== 0x0d || dtb[2] !== 0xfe || dtb[3] !== 0xed) {
-        throw new Error('bad DTB magic');
-      }
-      boot(ucMod, uc, board, null, {
-        ramSize: LINUX_RAM_SIZE,
-        linux: { image, dtb },
-      });
-      linuxRun(); // async: rAF-paced slices, real IRQs via the local block
-      setStatus(
-        `booted — running linux — arm64 Image @ 0x200000, DTB @ 0x3000000, 128 MB RAM — press Reboot to re-run`
       );
     } else {
       mode = 'single';
