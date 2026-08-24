@@ -19,6 +19,15 @@
       #coi { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
         background: #0c0c0c; color: #aaa; font-size: 14px; z-index: 10; }
       #coi.hidden { display: none; }
+      #boot { position: fixed; inset: 0; z-index: 5; display: flex; flex-direction: column;
+        align-items: center; justify-content: center; gap: 14px; background: #0c0c0c; color: #ddd; }
+      #boot.hidden { display: none; }
+      #boot .title { font-size: 18px; font-weight: 600; color: #fff; }
+      #boot .sub { font-size: 13px; color: #9a9a9a; }
+      #boot .status { font-size: 13px; color: #6cc; margin-top: 6px; min-height: 1em; }
+      #boot .spin { width: 28px; height: 28px; border: 3px solid #2a2a2a; border-top-color: #6cc;
+        border-radius: 50%; animation: spin 0.9s linear infinite; }
+      @keyframes spin { to { transform: rotate(360deg); } }
     </style>
   </head>
   <body>
@@ -30,6 +39,12 @@
       <div id="terminal"></div>
     </div>
     <div id="coi">Establishing cross-origin isolation (threads) — one-time reload…</div>
+    <div id="boot">
+      <div class="spin"></div>
+      <div class="title">Raspberry Pi 3 — booting Linux</div>
+      <div class="sub">QEMU (TCG→WebAssembly) · raspi3ap · 4× Cortex-A53 · 512 MB</div>
+      <div class="status" id="boot-status">Booting kernel…</div>
+    </div>
 
     <script src="./coi-serviceworker.js"></script>
     <script src="./vendor/xterm.js"></script>
@@ -65,17 +80,31 @@
 
         // Auto-activate the console: the getty prints "Please press Enter to
         // activate this console." and waits. Inject a CR so the user lands
-        // straight at the shell without having to press a key.
-        var activated = false;
+        // straight at the shell without having to press a key. Also drive the
+        // boot overlay status and hide it once the shell prompt appears.
+        var activated = false, booted = false;
+        var bootEl = document.getElementById("boot");
+        var bootStatus = document.getElementById("boot-status");
+        var setBoot = function (m) { if (bootStatus) bootStatus.textContent = m; };
+        bootEl.addEventListener("click", function () { bootEl.classList.add("hidden"); });
         var iv = setInterval(function () {
           try {
             var rows = document.querySelector(".xterm-rows");
-            if (rows && /Please press Enter to activate this console\./.test(rows.innerText)) {
+            if (!rows) return;
+            var txt = rows.innerText;
+            if (/Linux version/.test(txt)) setBoot("Kernel up — starting userspace…");
+            if (/Please press Enter to activate this console\./.test(txt)) {
               if (!activated) {
                 activated = true;
+                setBoot("Console ready — activating shell…");
                 xterm.focus();
                 xterm.paste("\r");
               }
+            }
+            if (/~ #/.test(txt)) {
+              if (!booted) { booted = true; setBoot("Boot complete"); }
+              bootEl.classList.add("hidden");
+              clearInterval(iv);
             }
           } catch (e) { console.log("AUTOACTIVATE err: " + e); }
         }, 1000);
