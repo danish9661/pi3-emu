@@ -6,9 +6,10 @@
 # (qemu-system-aarch64.wasm/.data/.worker.js, out.js, load.js) into public/linux/.
 # Faithful to ktock/qemu-wasm's README. Requires podman (or docker via $DOCKER).
 #
-# The build is LONG (emscripten compiles QEMU to wasm — plan for ~1-2h and a
-# network connection). Run it in the background:
-#   setsid bash scripts/build-linux.sh > /tmp/build-linux.log 2>&1 &
+# The build is LONG (emscripten compiles QEMU to wasm — often 30+ min). It is
+# RESUMABLE: the build container is kept between runs (its /build tree persists),
+# so `emmake make` continues from existing object files if a previous run was
+# interrupted. Just re-run this script to continue.
 #
 # Env overrides:
 #   DOCKER=podman          container engine (default: podman)
@@ -37,54 +38,56 @@ if [ -z "$SRC" ]; then
 fi
 echo "[*] qemu-wasm source: $SRC"
 
-# 1) base image (emscripten + zlib/libffi/glib/pixman + xterm-pty)
+# 1) base image (emscripten + zlib/libffi/glib/pixman + xterm-pty) — cached
 if ! $DOCKER image exists "$IMG" 2>/dev/null; then
-  echo "[*] building base image $IMG (this is slow: pulls emscripten, builds glib/pixman)"
+  echo "[*] building base image $IMG (slow: pulls emscripten, builds glib/pixman)"
   $DOCKER build -t "$IMG" - < "$SRC/Dockerfile"
 else
   echo "[*] base image $IMG already present, reusing"
 fi
 
-# 2) long-running build container with the source mounted read-only
-if $DOCKER ps -a --format '{{.Names}}' | grep -qx "$CTN"; then
-  $DOCKER rm -f "$CTN" >/dev/null
+# 2) build container — reused across runs so /build (object files) persists
+if ! $DOCKER ps -a --format '{{.Names}}' | grep -qx "$CTN"; then
+  echo "[*] creating build container $CTN"
+  $DOCKER run --name "$CTN" -d "$IMG" sleep infinity
 fi
-echo "[*] starting build container $CTN"
-$DOCKER run --rm -d --name "$CTN" "$IMG" sleep infinity
+$DOCKER start "$CTN" >/dev/null 2>&1 || true
 
-cleanup() { $DOCKER rm -f "$CTN" >/dev/null 2>&1 || true; }
-trap cleanup EXIT
-
-# Bring the qemu-wasm source into the container's own filesystem. Host bind
-# mounts can be noexec under rootless podman (breaks executing /qemu/configure).
-if [ -n "$SRC" ]; then
+# 3) copy the source into the container fs once (host bind mounts can be
+#    noexec under rootless podman, which breaks executing /qemu/configure)
+if ! $DOCKER exec "$CTN" test -f /qemu/configure; then
   echo "[*] copying source into container at /qemu"
   $DOCKER cp "$SRC"/. "$CTN:/qemu"
 else
-  echo "[*] cloning ktock/qemu-wasm into container at /qemu"
-  $DOCKER exec -it "$CTN" git clone --depth 1 https://github.com/ktock/qemu-wasm /qemu
+  echo "[*] source already in container, reusing"
 fi
 
-# 3) configure + make qemu-system-aarch64 (the long step)
-echo "[*] configuring qemu (aarch64-softmmu, wasm32)"
-$DOCKER exec -it "$CTN" emconfigure /qemu/configure --static \
-  --target-list=aarch64-softmmu --cpu=wasm32 --cross-prefix=
-echo "[*] building qemu-system-aarch64 (emscripten -> wasm; very long)"
+# 4) configure once
+if ! $DOCKER exec "$CTN" test -f /build/config-host.mak; then
+  echo "[*] configuring qemu (aarch64-softmmu, wasm32)"
+  $DOCKER exec -it "$CTN" emconfigure /qemu/configure --static \
+    --target-list=aarch64-softmmu --cpu=wasm32 --cross-prefix=
+else
+  echo "[*] already configured, skipping configure"
+fi
+
+# 5) build qemu-system-aarch64 — RESUMABLE across invocations
+echo "[*] building qemu-system-aarch64 (emscripten -> wasm; resumes if interrupted)"
 $DOCKER exec -it "$CTN" emmake make -j "$(nproc)" qemu-system-aarch64
 
-# 4) build the kernel + dtb + busybox rootfs image
+# 6) build the kernel + dtb + busybox rootfs image
 echo "[*] building raspi3ap guest image (kernel8.img + dtb + rootfs.bin)"
 PACK="$(mktemp -d)"
 $DOCKER build --output=type=local,dest="$PACK" "$SRC/examples/raspi3ap/image"
 $DOCKER cp "$PACK/." "$CTN:/pack"
 rm -rf "$PACK"
 
-# 5) package the /pack directory into the .data preload bundle
+# 7) package the /pack directory into the .data preload bundle
 echo "[*] packaging qemu-system-aarch64.data (preload /pack)"
 $DOCKER exec -it "$CTN" /bin/sh -c \
   "/emsdk/upstream/emscripten/tools/file_packager.py qemu-system-aarch64.data --preload /pack > load.js"
 
-# 6) copy artifacts into public/linux/
+# 8) copy artifacts into public/linux/
 echo "[*] copying artifacts into $LINUX_DIR"
 $DOCKER cp "$CTN:/build/qemu-system-aarch64" "$LINUX_DIR/out.js"
 for f in qemu-system-aarch64.wasm qemu-system-aarch64.worker.js qemu-system-aarch64.data load.js; do
