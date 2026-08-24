@@ -39,7 +39,7 @@ CTN="build-qemu-wasm"
 # compile-safe flags; the -sX linker settings go in LDFLAGS. (-DWASM_BIGINT is
 # the C macro and stays in CFLAGS; -sWASM_BIGINT is the link flag.)
 QEMU_CFLAGS="-O2 -matomics -mbulk-memory -DNDEBUG -DWASM_BIGINT -pthread -Wno-error=unused-command-line-argument -Wno-error=implicit-function-declaration"
-QEMU_LDFLAGS="-L/build/target/lib -O2 -matomics -mbulk-memory -pthread -sWASM_BIGINT -sMALLOC=mimalloc -sASYNCIFY=1"
+QEMU_LDFLAGS="-L/build/target/lib -O2 -matomics -mbulk-memory -pthread -sWASM_BIGINT -sMALLOC=mimalloc -sASYNCIFY=1 -sFORCE_FILESYSTEM"
 
 mkdir -p "$LINUX_DIR"
 
@@ -84,10 +84,15 @@ if $DOCKER exec "$CTN" sh -c 'test -f /build/build.ninja && grep -Eq "c_args.*-s
   $DOCKER exec "$CTN" rm -rf /build
 fi
 if ! $DOCKER exec "$CTN" test -f /build/config-host.mak; then
-  echo "[*] configuring qemu (aarch64-softmmu, wasm32)"
-  $DOCKER exec -it -e CFLAGS="$QEMU_CFLAGS" -e LDFLAGS="$QEMU_LDFLAGS" "$CTN" \
-    bash -c 'mkdir -p /build && cd /build &&     emconfigure /qemu/configure --static --disable-werror \
-    --target-list=aarch64-softmmu --cpu=wasm32 --cross-prefix='
+  CONF='mkdir -p /build && cd /build && emconfigure /qemu/configure --static --disable-werror --target-list=aarch64-softmmu --cpu=wasm32 --cross-prefix='
+  echo "[*] configuring qemu (aarch64-softmmu, wasm32) — pass 1 (downloads dtc subproject)"
+  $DOCKER exec -it -e CFLAGS="$QEMU_CFLAGS" -e LDFLAGS="$QEMU_LDFLAGS" "$CTN" bash -c "$CONF"
+  # dtc is a meson wrap downloaded during meson setup; its meson.build sets
+  # default_options: 'werror=true', which turns emscripten's unused-arg
+  # warnings (e.g. -no-pie) into hard errors. Patch it, then reconfigure.
+  $DOCKER exec "$CTN" bash -c 'test -f /qemu/subprojects/dtc/meson.build && sed -i "s/werror=true/werror=false/" /qemu/subprojects/dtc/meson.build && echo "[*] dtc werror disabled"'
+  echo "[*] configuring qemu — pass 2 (applies patched dtc)"
+  $DOCKER exec -it -e CFLAGS="$QEMU_CFLAGS" -e LDFLAGS="$QEMU_LDFLAGS" "$CTN" bash -c "$CONF"
 else
   echo "[*] already configured (good flags), skipping configure"
 fi
@@ -104,16 +109,21 @@ $DOCKER build --output=type=local,dest="$PACK" "$SRC/examples/raspi3ap/image"
 $DOCKER cp "$PACK/." "$CTN:/pack"
 rm -rf "$PACK"
 
-# 7) package the /pack directory into the .data preload bundle
+# 7) package the /pack directory into the .data preload bundle (run in /build)
 echo "[*] packaging qemu-system-aarch64.data (preload /pack)"
-$DOCKER exec -it "$CTN" /bin/sh -c \
+$DOCKER exec -it -w /build "$CTN" /bin/sh -c \
   "/emsdk/upstream/emscripten/tools/file_packager.py qemu-system-aarch64.data --preload /pack > load.js"
 
-# 8) copy artifacts into public/linux/
-echo "[*] copying artifacts into $LINUX_DIR"
-$DOCKER cp "$CTN:/build/qemu-system-aarch64" "$LINUX_DIR/out.js"
+# 8) copy artifacts into a SEPARATE dir. NEVER overwrite the live
+#    public/linux/ (which holds the verified prebuilt pthread/MTTCG binary).
+#    This checkout lacks PROXY_TO_PTHREAD, so the from-source qemu is
+#    single-thread and must not replace the prebuilt engine.
+BUILT_DIR="$ROOT/public/linux-fromsrc"
+mkdir -p "$BUILT_DIR"
+echo "[*] copying artifacts into $BUILT_DIR (NOT the live public/linux/)"
+$DOCKER cp "$CTN:/build/qemu-system-aarch64" "$BUILT_DIR/out.js"
 for f in qemu-system-aarch64.wasm qemu-system-aarch64.worker.js qemu-system-aarch64.data load.js; do
-  $DOCKER cp "$CTN:/build/$f" "$LINUX_DIR/$f"
+  $DOCKER cp "$CTN:/build/$f" "$BUILT_DIR/$f"
 done
 
-echo "[done] built artifacts in $LINUX_DIR — reload the linux boot option to use them."
+echo "[done] built (single-thread) artifacts in $BUILT_DIR — the live public/linux/ is untouched."

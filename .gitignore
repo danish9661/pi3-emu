@@ -9,3 +9,5 @@ public/linux/qemu-system-aarch64.data
 public/linux/qemu-system-aarch64.worker.js
 public/linux/out.js
 public/linux/load.js
+# From-source qemu-wasm build output (single-thread; NOT the live engine)
+public/linux-fromsrc/

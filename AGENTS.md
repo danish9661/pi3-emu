@@ -431,11 +431,22 @@ and typing `echo ...` round-trips. Tests: `test/linux-boot-vendored.mjs`,
 
 **FROM-SOURCE BUILD:** `scripts/build-linux.sh` rebuilds qemu-wasm + the
 raspi3ap kernel/rootfs from `ktock/qemu-wasm` via podman (faithful to that
-repo's README) into `public/linux/`. NOTE: this checkout lacks
-`PROXY_TO_PTHREAD`/pthread support, so a from-source build here yields a
-*single-thread* qemu (no worker.js) — do NOT swap it over the verified
-prebuilt pthread/MTTCG artifacts unless you confirm it still boots. The
-prebuilt demo binary (from `ktock/qemu-wasm-demo-images`) is the live one.
+repo's README). It is **working end-to-end** (qemu engine, kernel, dtb,
+busybox rootfs, and the `.data` preload all build under rootless podman).
+Key fixes baked into the script: split emscripten CFLAGS/LDFLAGS (linker
+settings like `-sWASM_BIGINT`/`-sMALLOC`/`-sASYNCIFY` belong in LDFLAGS,
+not compile flags), `--disable-werror`, a two-pass configure that patches
+the `dtc` meson wrap's `werror=true` (else `-no-pie` becomes a hard error
+under emscripten), and a fakeroot-wrapped `mknod`/`mke2fs` so the rootfs
+image builds without `CAP_MKNOD`. The build is **RESUMABLE** across
+invocations (the build container and its `/build` object tree persist;
+`emmake make` continues from existing `.o` files). NOTE: this checkout
+lacks `PROXY_TO_PTHREAD`/pthread support, so the from-source qemu is
+*single-thread* (~22 MB wasm vs the prebuilt's ~57 MB pthread/MTTCG
+binary) — so the script copies its output into `public/linux-fromsrc/`
+and deliberately does **NOT** overwrite the live `public/linux/`. The
+prebuilt demo binary (from `ktock/qemu-wasm-demo-images`) remains the live
+engine; do NOT swap the single-thread build over it.
 
 Tooling (rebuildable, all under /tmp/opencode/ltest — /tmp is
 WIPED REPEATEDLY, redo from scratch each time):
