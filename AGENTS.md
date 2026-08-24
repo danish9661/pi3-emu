@@ -445,8 +445,28 @@ lacks `PROXY_TO_PTHREAD`/pthread support, so the from-source qemu is
 *single-thread* (~22 MB wasm vs the prebuilt's ~57 MB pthread/MTTCG
 binary) — so the script copies its output into `public/linux-fromsrc/`
 and deliberately does **NOT** overwrite the live `public/linux/`. The
-prebuilt demo binary (from `ktock/qemu-wasm-demo-images`) remains the live
-engine; do NOT swap the single-thread build over it.
+ prebuilt demo binary (from `ktock/qemu-wasm-demo-images`) remains the live
+ engine; do NOT swap the single-thread build over it.
+
+ GLUE-COMPAT CAVEAT (2026-08-24): the from-source `out.js` is **standard
+ emscripten glue** built with a DIFFERENT emscripten toolchain/flags than
+ ktock's prebuilt, so it is NOT harness-bootable as-is. The `.wasm` engine,
+ the kernel/rootfs `.data` (byte-identical to the prebuilt, 26700273 bytes),
+ and `load.js` all load and execute (200s, no engine fault), but boot fails
+ in the file_packager `load.js` preload because `out.js` does not expose
+ ktock's runtime API on `Module`: first `Module['FS_createPath']`/
+ `Module['FS_createDataFile']` are missing (fixable with a one-line shim to
+ global `FS`), then `Module.addRunDependency`/`removeRunDependency` are
+ missing. Root cause: the emscripten version/`-sEXPORTED_RUNTIME_METHODS`/
+ `MODULARIZE` flags differ from ktock's build, so the glue and `load.js`
+ (generated against ktock's API) disagree. To make `public/linux-fromsrc/`
+ actually boot, either (a) rebuild with ktock's exact emscripten link flags
+ (MODULARIZE + `EXPORTED_RUNTIME_METHODS` incl. FS API + run dependencies +
+ a default export), or (b) generate a from-source-native `load.js`/harness
+ matched to the from-source emscripten version. The qemu *engine* is the same
+ qemu-wasm source and is functionally equivalent; this is purely a packaging
+ gap. Verified headless: harness loads engine+data+wasm (all 200), then
+ `PAGEERROR: Module.addRunDependency is not a function` (preload stage).
 
 Tooling (rebuildable, all under /tmp/opencode/ltest — /tmp is
 WIPED REPEATEDLY, redo from scratch each time):
