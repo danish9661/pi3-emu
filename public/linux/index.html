@@ -28,6 +28,9 @@
       #boot .spin { width: 28px; height: 28px; border: 3px solid #2a2a2a; border-top-color: #6cc;
         border-radius: 50%; animation: spin 0.9s linear infinite; }
       @keyframes spin { to { transform: rotate(360deg); } }
+      #reboot { margin-left: auto; background: #2a2a2a; color: #ddd; border: 1px solid #3a3a3a;
+        border-radius: 4px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
+      #reboot:hover { background: #333; }
     </style>
   </head>
   <body>
@@ -35,6 +38,7 @@
       <header>
         <b>Raspberry Pi 3 (BCM2837)</b>
         <span class="hint">Linux on QEMU Wasm · raspi3ap · 4× Cortex-A53 · 512 MB — serial console</span>
+        <button id="reboot" type="button" onclick="location.reload()">Reboot</button>
       </header>
       <div id="terminal"></div>
     </div>
@@ -85,7 +89,10 @@
         var activated = false, booted = false;
         var bootEl = document.getElementById("boot");
         var bootStatus = document.getElementById("boot-status");
-        var setBoot = function (m) { if (bootStatus) bootStatus.textContent = m; };
+        var setBoot = function (m) {
+          if (bootStatus) bootStatus.textContent = m;
+          try { window.parent.postMessage({ type: "linux-boot", phase: m }, "*"); } catch (e) {}
+        };
         bootEl.addEventListener("click", function () { bootEl.classList.add("hidden"); });
         var iv = setInterval(function () {
           try {

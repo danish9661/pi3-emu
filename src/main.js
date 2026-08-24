@@ -1349,6 +1349,8 @@ function runLinux() {
   term.hidden = true;
   gpioPanel.hidden = true;
   fbCanvas.hidden = true;
+  const linuxBoot = document.getElementById('linuxBoot');
+  if (linuxBoot) { linuxBoot.hidden = false; linuxBoot.textContent = 'booting Linux…'; }
   let frame = document.getElementById('linuxframe');
   if (!frame) {
     frame = document.createElement('iframe');
@@ -1371,6 +1373,15 @@ function runLinux() {
   runBtn.textContent = 'Reboot';
   runBtn.disabled = false;
 }
+
+// Receive boot-phase updates from the Linux iframe (serial milestones) and
+// surface them in the parent UI's #linuxBoot indicator.
+window.addEventListener('message', (e) => {
+  if (e.data && e.data.type === 'linux-boot') {
+    const el = document.getElementById('linuxBoot');
+    if (el && !el.hidden) el.textContent = 'Linux boot: ' + e.data.phase;
+  }
+});
 
 // The guest drives itself: it prints to the UART TX slots (one char per
 // slice) and parks in getc until a key arrives. Run slices until the guest
@@ -1465,6 +1476,8 @@ async function run() {
   term.hidden = false;
   const linuxFrameEl = document.getElementById('linuxframe');
   if (linuxFrameEl) linuxFrameEl.hidden = true;
+  const linuxBootEl = document.getElementById('linuxBoot');
+  if (linuxBootEl) linuxBootEl.hidden = true;
   term.textContent = '';
   gpioPanel.hidden = true;
   fbCanvas.hidden = true;
