@@ -26,6 +26,15 @@ REF="${QEMU_WASM_REF:-HEAD}"
 IMG="buildqemu"
 CTN="build-qemu-wasm"
 
+# ktock's Dockerfile bakes -sWASM_BIGINT into CFLAGS, but that is a *linker*
+# setting — emscripten errors on it during compilation
+# (-Werror=unused-command-line-argument). glib's meson wrap neutralizes that
+# warning, but qemu's build does not, so we override CFLAGS/LDFLAGS for the
+# qemu configure/make steps: drop -sWASM_BIGINT from compile flags (keep the
+# -DWASM_BIGINT macro) and move it to LDFLAGS, plus a safety -Wno-error.
+QEMU_CFLAGS="-O2 -matomics -mbulk-memory -DNDEBUG -DWASM_BIGINT -pthread -sMALLOC=mimalloc -sASYNCIFY=1 -Wno-error=unused-command-line-argument"
+QEMU_LDFLAGS="-L/build/target/lib -O2 -sWASM_BIGINT"
+
 mkdir -p "$LINUX_DIR"
 
 if [ -z "$SRC" ]; then
@@ -62,18 +71,24 @@ else
   echo "[*] source already in container, reusing"
 fi
 
-# 4) configure once
+# 4) configure (clean slate if a previous run left a config with the old flags)
+if $DOCKER exec "$CTN" sh -c 'test -f /build/config-host.mak && grep -q -- "-sWASM_BIGINT" /build/config-host.mak' 2>/dev/null; then
+  echo "[*] stale config (old CFLAGS) — cleaning /build"
+  $DOCKER exec "$CTN" rm -rf /build
+fi
 if ! $DOCKER exec "$CTN" test -f /build/config-host.mak; then
   echo "[*] configuring qemu (aarch64-softmmu, wasm32)"
-  $DOCKER exec -it "$CTN" emconfigure /qemu/configure --static \
+  $DOCKER exec -it -e CFLAGS="$QEMU_CFLAGS" -e LDFLAGS="$QEMU_LDFLAGS" "$CTN" \
+    emconfigure /qemu/configure --static \
     --target-list=aarch64-softmmu --cpu=wasm32 --cross-prefix=
 else
-  echo "[*] already configured, skipping configure"
+  echo "[*] already configured (good flags), skipping configure"
 fi
 
 # 5) build qemu-system-aarch64 — RESUMABLE across invocations
 echo "[*] building qemu-system-aarch64 (emscripten -> wasm; resumes if interrupted)"
-$DOCKER exec -it "$CTN" emmake make -j "$(nproc)" qemu-system-aarch64
+$DOCKER exec -it -e CFLAGS="$QEMU_CFLAGS" -e LDFLAGS="$QEMU_LDFLAGS" "$CTN" \
+  emmake make -j "$(nproc)" qemu-system-aarch64
 
 # 6) build the kernel + dtb + busybox rootfs image
 echo "[*] building raspi3ap guest image (kernel8.img + dtb + rootfs.bin)"
