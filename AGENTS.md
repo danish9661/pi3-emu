@@ -411,16 +411,23 @@ M24/M25 polish (committed + pushed): xterm + xterm-pty are vendored locally
 under `public/linux/vendor/` (xterm UMD → global `Terminal`, xterm-pty UMD
 → global `openpty`) so the console works **offline** (no CDN). The console
 auto-activates: `index.html` watches `.xterm-rows` for the getty's
-"Please press Enter to activate this console." and injects `xterm.paste("\r")`,
-so the user lands straight at the `~ #` shell. Accel is **MTTCG**
+"Please press Enter to activate this console." and calls `xterm.focus()`
+then `xterm.paste("\r")`, so the user lands straight at the `~ #` shell
+(the `focus()` is required — `paste()` without focus does not deliver the
+key inside a same-origin iframe). Accel is **MTTCG**
 (`-accel tcg,tb-size=500,thread=multi -smp 4,sockets=4`) — this is the
 working config for ktock's pthread build; single-thread triggers a
-`start is not a function` pthread-worker race. Needs cross-origin isolation
-(`coi-serviceworker.js`); the harness shows a one-time "establishing COI"
-splash and reloads. Verified headless Chrome (puppeteer-core +
-/usr/bin/google-chrome-stable): boots to `~ #` with no page errors, and
-typing `echo ...` round-trips. Tests: `test/linux-boot-vendored.mjs`,
-`test/linux-shell-interactive.mjs`.
+`start is not a function` pthread-worker race. The Linux engine runs inside
+a same-origin `<iframe>` in the pi3-emu UI; for that iframe to be
+cross-origin isolated (SharedArrayBuffer / pthreads), the WHOLE app must be
+isolated, so `vite.config.js` now sets `Cross-Origin-Opener-Policy:
+same-origin` + `Cross-Origin-Embedder-Policy: require-corp` on every
+dev/preview response (the `coi-serviceworker.js` in `public/linux/` is then
+a no-op fallback for static hosts that don't send these headers). Verified
+headless Chrome (puppeteer-core + /usr/bin/google-chrome-stable): the full
+UI flow (select `linux` → Run → iframe) boots to `~ #` with no page errors,
+and typing `echo ...` round-trips. Tests: `test/linux-boot-vendored.mjs`,
+`test/linux-shell-interactive.mjs`, `test/linux-ui-integration.mjs`.
 
 **FROM-SOURCE BUILD:** `scripts/build-linux.sh` rebuilds qemu-wasm + the
 raspi3ap kernel/rootfs from `ktock/qemu-wasm` via podman (faithful to that

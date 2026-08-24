@@ -28,7 +28,6 @@ const MAX_SLICES = 5000;
 // IRQ delivery is real (CPU_INTERRUPT_HARD via the local block, native
 // vectors/eret) like LIRQ_MODE.
 const LINUX_MODE = 'linux';
-const LINUX_RAM_SIZE = 0x8000000;
 // The arm64 boot protocol wants a 2M-aligned base (text_offset=0). The fork
 // cannot fetch at pc 0 (a TB-gen quirk), so the image goes at 0x200000: the
 // kernel's tables map VA KIMAGE+X -> phys 0x200000+X, and the fork's
@@ -1336,23 +1335,6 @@ function irqRun() {
 // the IRQ guests; IRQs are delivered natively (CPU_INTERRUPT_HARD via the
 // local block, real vectors, real eret) with the arch timer ticked per
 // slice, exactly like LIRQ_MODE. The boot runs until the user reboots.
-let linuxFrame = 0;
-function linuxRun() {
-  let out = '';
-  const frame = () => {
-    if (mode !== LINUX_MODE) return;
-    const t0 = performance.now();
-    do {
-      out += runSlice(SLICE_INSNS);
-    } while (performance.now() - t0 < 16);
-    draw(out);
-    out = '';
-    updateStats();
-    linuxFrame = requestAnimationFrame(frame);
-  };
-  linuxFrame = requestAnimationFrame(frame);
-}
-
 // Linux boot uses the qemu-wasm engine (a self-contained page at
 // /linux/index.html) instead of the unicorn core. We embed it in an iframe
 // rather than driving it from JS: the page wires xterm to the emulated
@@ -1362,7 +1344,6 @@ function runLinux() {
   cancelAnimationFrame(gpioFrame);
   cancelAnimationFrame(fbFrame);
   cancelAnimationFrame(irqFrame);
-  cancelAnimationFrame(linuxFrame);
   gpioLoopActive = false;
   runBtn.disabled = true;
   term.hidden = true;
@@ -1479,7 +1460,6 @@ async function run() {
   cancelAnimationFrame(gpioFrame);
   cancelAnimationFrame(fbFrame);
   cancelAnimationFrame(irqFrame);
-  cancelAnimationFrame(linuxFrame);
   gpioLoopActive = false;
   runBtn.disabled = true;
   term.hidden = false;

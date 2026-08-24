@@ -68,10 +68,16 @@
         // straight at the shell without having to press a key.
         var activated = false;
         var iv = setInterval(function () {
-          var rows = document.querySelector(".xterm-rows");
-          if (rows && /Please press Enter to activate this console\./.test(rows.innerText)) {
-            if (!activated) { activated = true; xterm.paste("\r"); }
-          }
+          try {
+            var rows = document.querySelector(".xterm-rows");
+            if (rows && /Please press Enter to activate this console\./.test(rows.innerText)) {
+              if (!activated) {
+                activated = true;
+                xterm.focus();
+                xterm.paste("\r");
+              }
+            }
+          } catch (e) { console.log("AUTOACTIVATE err: " + e); }
         }, 1000);
       })();
     </script>
