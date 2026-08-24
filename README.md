@@ -812,4 +812,42 @@ dist/                 production bundle
   a working busybox `~ #` shell under TCG — the root cause there was a
   dangling `/init -> busybox` symlink (busybox lives at bin/busybox)
   that tripped the rpi kernel's `init_eaccess` check and panicked in
+  `prepare_namespace`; fixing `/init -> bin/busybox` boots to `~ #`. The
+  unicorn-fork Linux path is abandoned (its TCI interpreter cannot
+  translate NEON/SIMD — TCI has zero vector-op handlers), and this
+  QEMU-wasm engine becomes the Linux boot path.
+- M24 — QEMU-wasm becomes the live Linux engine. The `linux` program
+  option now boots a real arm64 Linux (raspi3ap: BCM2837 / Pi 3 B+,
+  4× Cortex-A53, 512 MB) via `ktock/qemu-wasm` inside an iframe
+  (`runLinux()` in `src/main.js`) instead of the dead unicorn
+  `linuxRun()` path. Harness in `public/linux/` (index.html, module.js,
+  vendor/xterm.css). xterm + xterm-pty are vendored locally (xterm UMD →
+  global `Terminal`, xterm-pty UMD → global `openpty`) so the console
+  works offline; the console auto-activates by watching `.xterm-rows`
+  for "Please press Enter to activate this console." and calling
+  `xterm.focus()` then `xterm.paste("\r")`. Acceleration is MTTCG
+  (`-accel tcg,tb-size=500,thread=multi -smp 4,sockets=4`) — single-
+  thread triggers a `start is not a function` pthread-worker race. The
+  whole app is cross-origin isolated (vite.config.js sets
+  Cross-Origin-Opener-Policy: same-origin + Cross-Origin-Embedder-
+  Policy: require-corp) so the same-origin iframe can use
+  SharedArrayBuffer/pthreads; `public/linux/coi-serviceworker.js` is a
+  no-op fallback for static hosts that don't send these headers.
+  Verified headless: kernel boots to a busybox `~ #` on the serial
+  console; typing round-trips. Tests: `test/linux-boot-vendored.mjs`,
+  `test/linux-shell-interactive.mjs`, `test/linux-ui-integration.mjs`.
+- M25 — From-source build + console polish. `scripts/build-linux.sh`
+  rebuilds qemu-wasm + the raspi3ap kernel/rootfs from `ktock/qemu-wasm`
+  via rootless podman, working end-to-end: emscripten CFLAGS/LDFLAGS are
+  split (linker settings `-sWASM_BIGINT`/`-sMALLOC`/`-sASYNCIFY` belong
+  in LDFLAGS), `--disable-werror` plus a two-pass configure that patches
+  the `dtc` meson wrap's `werror=true` (else `-no-pie` is a hard error
+  under emscripten), and a fakeroot-wrapped `mknod`/`mke2fs` so the
+  rootfs image builds without `CAP_MKNOD`. The build is resumable
+  (the build container and its `/build` object tree persist across
+  invocations). NOTE: this ktock checkout lacks `PROXY_TO_PTHREAD`, so
+  the from-source qemu is single-thread (~22 MB wasm vs the prebuilt's
+  ~57 MB pthread/MTTCG binary) — the script copies its output into
+  `public/linux-fromsrc/` and deliberately does NOT overwrite the live
+  `public/linux/`; the prebuilt demo binary remains the deployed engine.
   `prepare_namespace`; fixed initramfs boots to the shell.
