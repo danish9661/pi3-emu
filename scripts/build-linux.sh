@@ -32,8 +32,14 @@ CTN="build-qemu-wasm"
 # warning, but qemu's build does not, so we override CFLAGS/LDFLAGS for the
 # qemu configure/make steps: drop -sWASM_BIGINT from compile flags (keep the
 # -DWASM_BIGINT macro) and move it to LDFLAGS, plus a safety -Wno-error.
-QEMU_CFLAGS="-O2 -matomics -mbulk-memory -DNDEBUG -DWASM_BIGINT -pthread -sMALLOC=mimalloc -sASYNCIFY=1 -Wno-error=unused-command-line-argument"
-QEMU_LDFLAGS="-L/build/target/lib -O2 -sWASM_BIGINT"
+# ktock's Dockerfile bakes several -sX LINKER settings into CFLAGS, but those
+# are link-time only — emscripten errors on them during compilation
+# (-Werror=unused-command-line-argument). glib's meson wrap neutralizes that
+# warning, but qemu's build does not. So we split: CFLAGS keeps only
+# compile-safe flags; the -sX linker settings go in LDFLAGS. (-DWASM_BIGINT is
+# the C macro and stays in CFLAGS; -sWASM_BIGINT is the link flag.)
+QEMU_CFLAGS="-O2 -matomics -mbulk-memory -DNDEBUG -DWASM_BIGINT -pthread -Wno-error=unused-command-line-argument -Wno-error=implicit-function-declaration"
+QEMU_LDFLAGS="-L/build/target/lib -O2 -matomics -mbulk-memory -pthread -sWASM_BIGINT -sMALLOC=mimalloc -sASYNCIFY=1"
 
 mkdir -p "$LINUX_DIR"
 
@@ -55,10 +61,11 @@ else
   echo "[*] base image $IMG already present, reusing"
 fi
 
-# 2) build container — reused across runs so /build (object files) persists
+# 2) build container — reused across runs so /build (object files) persists.
+#    WORKDIR is /root (never /build) so `rm -rf /build` can't break later execs.
 if ! $DOCKER ps -a --format '{{.Names}}' | grep -qx "$CTN"; then
   echo "[*] creating build container $CTN"
-  $DOCKER run --name "$CTN" -d "$IMG" sleep infinity
+  $DOCKER run --name "$CTN" --workdir /root -d "$IMG" sleep infinity
 fi
 $DOCKER start "$CTN" >/dev/null 2>&1 || true
 
@@ -72,15 +79,15 @@ else
 fi
 
 # 4) configure (clean slate if a previous run left a config with the old flags)
-if $DOCKER exec "$CTN" sh -c 'test -f /build/config-host.mak && grep -q -- "-sWASM_BIGINT" /build/config-host.mak' 2>/dev/null; then
+if $DOCKER exec "$CTN" sh -c 'test -f /build/build.ninja && grep -Eq "c_args.*-sWASM_BIGINT" /build/build.ninja' 2>/dev/null; then
   echo "[*] stale config (old CFLAGS) — cleaning /build"
   $DOCKER exec "$CTN" rm -rf /build
 fi
 if ! $DOCKER exec "$CTN" test -f /build/config-host.mak; then
   echo "[*] configuring qemu (aarch64-softmmu, wasm32)"
   $DOCKER exec -it -e CFLAGS="$QEMU_CFLAGS" -e LDFLAGS="$QEMU_LDFLAGS" "$CTN" \
-    emconfigure /qemu/configure --static \
-    --target-list=aarch64-softmmu --cpu=wasm32 --cross-prefix=
+    bash -c 'mkdir -p /build && cd /build &&     emconfigure /qemu/configure --static --disable-werror \
+    --target-list=aarch64-softmmu --cpu=wasm32 --cross-prefix='
 else
   echo "[*] already configured (good flags), skipping configure"
 fi
@@ -88,7 +95,7 @@ fi
 # 5) build qemu-system-aarch64 — RESUMABLE across invocations
 echo "[*] building qemu-system-aarch64 (emscripten -> wasm; resumes if interrupted)"
 $DOCKER exec -it -e CFLAGS="$QEMU_CFLAGS" -e LDFLAGS="$QEMU_LDFLAGS" "$CTN" \
-  emmake make -j "$(nproc)" qemu-system-aarch64
+  bash -c 'cd /build && emmake make -j "$(nproc)" qemu-system-aarch64'
 
 # 6) build the kernel + dtb + busybox rootfs image
 echo "[*] building raspi3ap guest image (kernel8.img + dtb + rootfs.bin)"
