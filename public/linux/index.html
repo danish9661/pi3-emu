@@ -108,7 +108,7 @@
                 xterm.paste("\r");
               }
             }
-            if (/~ #/.test(txt)) {
+            if (/~ ?#/.test(txt)) {
               if (!booted) { booted = true; setBoot("Boot complete"); }
               bootEl.classList.add("hidden");
               clearInterval(iv);

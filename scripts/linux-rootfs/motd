@@ -1,0 +1,10 @@
+  ___  _  _  ___  ___     ___  ___  _  _  ___
+ | _ \\| || |/ _ \\| _ \\   |_  )/ _ \\| || |/ __|
+ |  _/| __ | (_) |   /    / /| (_) | __ |\\__ \\
+ |_|  |_||_|\\___/|_|_\\   /___|\\___/|_||_||___/
+
+        Raspberry Pi 3 (BCM2837) — arm64 Linux
+        QEMU (TCG -> WebAssembly) · raspi3ap
+        4x Cortex-A53 · 512 MB · serial console
+
+  Type 'help' at the shell, or just poke around. Have fun.

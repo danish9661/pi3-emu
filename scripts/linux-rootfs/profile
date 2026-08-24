@@ -1,0 +1,5 @@
+# sourced by login shells on the Pi 3 emu
+export PS1='\h:\w\$ '
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+alias ll='ls -la'
+alias help='echo "This is a busybox shell on an emulated Raspberry Pi 3 (arm64). Try: ls, cat /proc/cpuinfo, uname -a, free, ps"'

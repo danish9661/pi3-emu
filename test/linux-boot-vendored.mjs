@@ -42,14 +42,14 @@ page.on("response", (r) => { if (r.status() === 404) errors.push("404: " + r.url
 await page.goto(url, { waitUntil: "load" });
 
 let sawPrompt = false, sawShell = false, sentFallback = false;
-for (let i = 0; i < 120; i++) {
+for (let i = 0; i < 420; i++) {
   await new Promise((r) => setTimeout(r, 1000));
   const txt = await page.evaluate(() => {
     const r = document.querySelector(".xterm-rows");
     return r ? r.innerText : "";
   });
   if (/Please press Enter to activate this console\./.test(txt)) sawPrompt = true;
-  if (/~ #/.test(txt)) { sawShell = true; break; }
+  if (/~ ?#/.test(txt)) { sawShell = true; break; }
 }
 
 await browser.close();

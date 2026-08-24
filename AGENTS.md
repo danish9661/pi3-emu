@@ -465,10 +465,33 @@ and deliberately does **NOT** overwrite the live `public/linux/`. The
  a default export), or (b) generate a from-source-native `load.js`/harness
  matched to the from-source emscripten version. The qemu *engine* is the same
  qemu-wasm source and is functionally equivalent; this is purely a packaging
- gap. Verified headless: harness loads engine+data+wasm (all 200), then
- `PAGEERROR: Module.addRunDependency is not a function` (preload stage).
+  gap. Verified headless: harness loads engine+data+wasm (all 200), then
+  `PAGEERROR: Module.addRunDependency is not a function` (preload stage).
 
-Tooling (rebuildable, all under /tmp/opencode/ltest — /tmp is
+  LINUX USERSPACE ENRICHMENT (B1, 2026-08-24): the live rootfs was enriched
+  with a hostname (`pi3-emu`), a MOTD banner (scripts/linux-rootfs/motd), an
+  `/etc/profile` (hostname-in-prompt `PS1='\h:\w\$ '`), and an `rcS` that sets
+  the hostname and prints the banner at boot. All busybox applets are already
+  symlinked by ktock's example Dockerfile, so no extra applet work was needed.
+  How the enriched `public/linux/qemu-system-aarch64.data` was produced
+  (gitignored; fetched fresh by `scripts/fetch-linux.sh`): the `.data` is a
+  flat concatenation `dtb ‖ kernel8.img ‖ rootfs.bin` (26700273 bytes, no
+  header; the ARM64 Image magic `0x644d5241` lives at Image offset 0x38, so
+  the kernel blob starts at byte 32753). We kept the **prebuilt** (fast)
+  `kernel8.img` + `bcm2710-rpi-3-b-plus.dtb` and only swapped in a freshly
+  built enriched `rootfs.bin` (built from the patched
+  `examples/raspi3ap/image` in a clone of `ktock/qemu-wasm`, with
+  `scripts/linux-rootfs/*` copied in and `rcS`/`Dockerfile` patched to install
+  them; the `mknod` step needs `fakeroot` under rootless podman). Slice:
+  `dtb = data[0:32753]`, `kernel = data[32753:22505969]`,
+  `rootfs = data[22505969:26700273]`; rebuild as
+  `Buffer.concat([prebuiltDtb, prebuiltKernel, enrichedRootfs])`. Rebuilding
+  the *kernel* too (ktock's Dockerfile uses upstream `bcm2711_defconfig`, not
+  the Pi-tuned config) makes boot ~3× slower — do NOT replace the kernel.
+  NOTE: boot time in this environment is variable/slow (>400s under load);
+  the enrichment itself is correct (banner + `pi3-emu:~#` prompt verified).
+
+ Tooling (rebuildable, all under /tmp/opencode/ltest — /tmp is
 WIPED REPEATEDLY, redo from scratch each time):
 - extract-wasm.mjs: pull wasm bytes out of public/unicorn.js
   (js-string at ~3361+14); wasm-dis → uc2.wat (~867k lines).

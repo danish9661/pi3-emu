@@ -47,10 +47,10 @@ const textOfFrame = async () => {
 };
 
 let sawShell = false;
-for (let i = 0; i < 240; i++) {
+for (let i = 0; i < 420; i++) {
   await wait(1000);
   const t = await textOfFrame();
-  if (/~ #/.test(t)) { sawShell = true; break; }
+  if (/~ ?#/.test(t)) { sawShell = true; break; }
 }
 
 await browser.close();

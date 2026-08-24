@@ -30,9 +30,9 @@ await page.goto("http://127.0.0.1:8099/", { waitUntil: "load" });
 const textOf = () => page.evaluate(() => { const r = document.querySelector(".xterm-rows"); return r ? r.innerText : ""; });
 
 let sawShell = false;
-for (let i = 0; i < 180; i++) {
+for (let i = 0; i < 420; i++) {
   await new Promise((r) => setTimeout(r, 1000));
-  if (/~ #/.test(await textOf())) { sawShell = true; break; }
+  if (/~ ?#/.test(await textOf())) { sawShell = true; break; }
 }
 if (!sawShell) { console.log("NO SHELL"); await browser.close(); server.close(); process.exit(1); }
 
