@@ -11,3 +11,5 @@ public/linux/out.js
 public/linux/load.js
 # From-source qemu-wasm build output (single-thread; NOT the live engine)
 public/linux-fromsrc/
+# qemu-wasm source clone + build scratch (ephemeral; do not commit)
+scripts/.build/
