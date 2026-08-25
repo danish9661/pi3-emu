@@ -20,6 +20,8 @@
       .tools button { background: #2a2a2a; color: #ddd; border: 1px solid #3a3a3a;
         border-radius: 4px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
       .tools button:hover { background: #333; }
+      .tools button.gpioBtn { min-width: 30px; padding: 3px 6px; }
+      .tools button.gpioBtn.on { background: #2c5; color: #041; border-color: #2c5; }
       #terminal { flex: 1 1 auto; padding: 6px; }
       #terminal .xterm { height: 100%; }
       #coi { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
@@ -46,8 +48,15 @@
           <button id="uploadBtn" type="button">Upload ▸ /mnt/incoming</button>
           <input type="text" id="cmd" placeholder="type a command, e.g. hw" />
           <button id="cmdBtn" type="button">Run</button>
-          <button id="gpioOn" type="button">GPIO21 on</button>
-          <button id="gpioOff" type="button">GPIO21 off</button>
+          <span class="hint">GPIO:</span>
+          <button class="gpioBtn" data-pin="17" type="button">17</button>
+          <button class="gpioBtn" data-pin="18" type="button">18</button>
+          <button class="gpioBtn" data-pin="21" type="button">21</button>
+          <button class="gpioBtn" data-pin="22" type="button">22</button>
+          <input type="file" id="diskUpload" style="display:none" />
+          <button id="saveDisk" type="button">Save Disk</button>
+          <button id="loadDisk" type="button">Load Disk</button>
+          <button id="resetDisk" type="button">Reset Disk</button>
           <button id="reboot" type="button" onclick="location.reload()">Reboot</button>
         </span>
       </header>
@@ -101,20 +110,109 @@
         reader.readAsArrayBuffer(f);
       });
 
-      // ---- C4: browser -> guest control (command box + GPIO buttons) ----
+      // ---- C4/N4: browser -> real emulated GPIO pins (sysfs over serial) ----
       const cmd = document.getElementById("cmd");
       const runCmd = () => { if (cmd.value.trim()) { sendLine(cmd.value); cmd.value = ""; } };
       document.getElementById("cmdBtn").addEventListener("click", runCmd);
       cmd.addEventListener("keydown", (e) => { if (e.key === "Enter") runCmd(); });
-      const gpioCmd = (v) =>
-        sendLine("echo 21 > /sys/class/gpio/export 2>/dev/null; " +
-                 "echo out > /sys/class/gpio/gpio21/direction 2>/dev/null; " +
-                 "echo " + v + " > /sys/class/gpio/gpio21/value 2>/dev/null; " +
-                 "echo GPIO21 -> " + v);
-      document.getElementById("gpioOn").addEventListener("click", () => gpioCmd(1));
-      document.getElementById("gpioOff").addEventListener("click", () => gpioCmd(0));
+      const gpioSet = (pin, v) =>
+        sendLine("echo " + pin + " > /sys/class/gpio/export 2>/dev/null; " +
+                 "echo out > /sys/class/gpio/gpio" + pin + "/direction 2>/dev/null; " +
+                 "echo " + v + " > /sys/class/gpio/gpio" + pin + "/value 2>/dev/null");
+      document.querySelectorAll(".gpioBtn").forEach((b) => {
+        let on = false;
+        b.addEventListener("click", () => {
+          on = !on;
+          gpioSet(b.dataset.pin, on ? 1 : 0);
+          b.classList.toggle("on", on);
+          b.textContent = b.dataset.pin + (on ? "*" : "");
+        });
+      });
+
+      // ---- N3: snapshot the SD card image (rootfs.bin) to IndexedDB + file ----
+      // Download/Upload gives a portable disk file; IndexedDB persists the loaded
+      // disk across reboots. The active disk is injected over the unpacked
+      // /pack/rootfs.bin in a preRun, before qemu opens the SD drive, so a
+      // downloaded/uploaded disk becomes the live filesystem on next boot.
+      const DISK_PATH = "/pack/rootfs.bin";
+      const fsApi = () => (Module.FS || Module["FS"]);
+      const toU8 = (b) => (b instanceof Uint8Array ? b : new Uint8Array(b));
+      const idbOpen = () => new Promise((res, rej) => {
+        const r = indexedDB.open("pi3emu", 1);
+        r.onupgradeneeded = () => r.result.createObjectStore("disk");
+        r.onsuccess = () => res(r.result);
+        r.onerror = () => rej(r.error);
+      });
+      const idbGet = async () => {
+        const db = await idbOpen();
+        return await new Promise((res, rej) => {
+          const rq = db.transaction("disk", "readonly").objectStore("disk").get("rootfs");
+          rq.onsuccess = () => res(rq.result); rq.onerror = () => rej(rq.error);
+        });
+      };
+      const idbPut = async (buf) => {
+        const db = await idbOpen();
+        await new Promise((res) => {
+          const tx = db.transaction("disk", "readwrite");
+          tx.objectStore("disk").put(buf, "rootfs");
+          tx.oncomplete = res;
+        });
+      };
+      const idbDel = async () => {
+        const db = await idbOpen();
+        await new Promise((res) => {
+          const tx = db.transaction("disk", "readwrite");
+          tx.objectStore("disk").delete("rootfs");
+          tx.oncomplete = res;
+        });
+      };
+      const downloadBuf = (buf, name) => {
+        const blob = new Blob([buf], { type: "application/octet-stream" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = name; a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+      };
+
+      document.getElementById("saveDisk").addEventListener("click", async () => {
+        try {
+          const buf = toU8(fsApi().readFile(DISK_PATH));
+          await idbPut(buf);
+          window.__pi3Disk = buf;
+          downloadBuf(buf, "pi3-rootfs-" + Date.now() + ".bin");
+        } catch (e) { console.log("Save Disk failed: " + e); }
+      });
+      const diskUpload = document.getElementById("diskUpload");
+      document.getElementById("loadDisk").addEventListener("click", () => diskUpload.click());
+      diskUpload.addEventListener("change", () => {
+        const f = diskUpload.files[0]; if (!f) return;
+        const reader = new FileReader();
+        reader.onload = async () => {
+          const buf = new Uint8Array(reader.result);
+          await idbPut(buf);
+          window.__pi3Disk = buf;
+          diskUpload.value = "";
+          location.reload();
+        };
+        reader.readAsArrayBuffer(f);
+      });
+      document.getElementById("resetDisk").addEventListener("click", async () => {
+        await idbDel();
+        window.__pi3Disk = null;
+        location.reload();
+      });
 
       (async () => {
+        // restore any persisted disk, then inject it over the unpacked
+        // /pack/rootfs.bin in a preRun (runs before qemu opens the SD drive)
+        try { const d = await idbGet(); if (d) window.__pi3Disk = toU8(d); } catch (e) {}
+        if (Module["preRun"]) {
+          Module["preRun"].push(() => {
+            if (window.__pi3Disk) {
+              try { fsApi().writeFile(DISK_PATH, window.__pi3Disk); } catch (e) {}
+            }
+          });
+        }
         await initEmscriptenModule(Module);
 
         var oldPoll = Module["TTY"].stream_ops.poll;

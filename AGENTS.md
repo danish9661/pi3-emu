@@ -739,6 +739,44 @@ a real browser (`npm run dev` → Linux tab) where the worker starts cleanly.
   browser. The tcc binary itself and the image contents ARE verified sound via
   `debugfs`/`file`/`e2fsck`.
 
+### M28 — snapshot file (N3) + real GPIO bridge (N4)
+
+- **N3 Snapshot file (DONE, live):** the SD card image (`/pack/rootfs.bin`)
+  is now downloadable/uploadable from the Linux harness (`public/linux/
+  index.html`): **Save Disk** downloads the current disk as
+  `pi3-rootfs-<ts>.bin` AND persists it to **IndexedDB**; **Load Disk**
+  reads an uploaded `.bin` into IndexedDB and reboots with it injected over
+  the unpacked `/pack/rootfs.bin` (via a `preRun` that runs after the
+  `load.js` packager preRun); **Reset Disk** clears IndexedDB → original
+  disk. This is the "a file which stores data the user can download and
+  upload" workaround for save/restore — it persists the **filesystem**
+  (the user's compiled programs, installed files) across sessions. It is a
+  pure harness feature (no qemu rebuild): `index.html` reads/writes the
+  emscripten FS via `Module.FS` and uses IndexedDB for cross-reload
+  persistence. GOTCHA: it is NOT a full VM-state snapshot (RAM/registers) —
+  qemu-wasm has no savevm→IndexedDB path and the raspi3ap machine's
+  migration is unverified, so a true "freeze the whole VM" snapshot is not
+  available. Re-boot from a saved disk is the supported model.
+- **N4 GPIO bridge — two layers:**
+  - **Live harness bridge (DONE):** the toolbar GPIO buttons now cover pins
+    **17/18/21/22** (toggle on click, `* ` suffix + green when on). Each
+    click drives the **real emulated BCM2835 GPIO** via sysfs over the serial
+    console (`echo <pin> > /sys/class/gpio/export; echo out > …/direction;
+    echo <v> > …/value`). This is a genuine browser→guest GPIO control of
+    actual SoC pins (the C4 serial path, generalized to multiple pins).
+  - **True device-level bridge (SOURCE ONLY, not live):** `scripts/linux-
+    rootfs/pi3ctl.c` is a qemu `sysbus` device (`pi3-ctl`) that exposes MMIO
+    registers for 64 virtual lines and forwards line state to a qemu
+    **chardev** (`chr` property) — device→browser as `S <line> <v>\n`,
+    browser→device as `I <line> <v>\n`. Wire it with `-chardev web,id=pi3
+    -device pi3-ctl,chr=pi3` and map its MMIO in `hw/arm/raspi.c`. This
+    needs a **pthread/MTTCG qemu-wasm rebuild with a `web` chardev backend**
+    (ktock's exact emscripten flags). THIS CHECKOUT CANNOT BUILD THAT (the
+    GLUE-COMPAT note: no `PROXY_TO_PTHREAD`, so from-source is single-thread
+    and won't replace the live prebuilt engine). So `pi3ctl.c` is committed
+    as buildable source + design only; the live bridge remains the harness
+    serial path until a proper pthread qemu-wasm build is produced.
+
 ## Key risks
 
 - Core patch (Phase 1) is the big unknown: if the unicorn.js build can't
