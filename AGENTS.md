@@ -417,17 +417,17 @@ then `xterm.paste("\r")`, so the user lands straight at the `~ #` shell
 key inside a same-origin iframe). Accel is **MTTCG**
 (`-accel tcg,tb-size=500,thread=multi`); ktock's pthread build needs
 multi-thread (single-thread triggers a `start is not a function`
-pthread-worker race). For **boot speed** the guest runs **`-smp 1`** and the
-cmdline uses **`quiet`** with **no `earlycon`** (the early-console serial
-flood + `calibrate_delay` on 3 extra vCPUs are the two biggest TCG slow
-paths). Userspace `/dev/console` writes (getty prompt, shell) still print under
-`quiet`, so auto-activate keeps working. The root filesystem is an **initramfs
+pthread-worker race). **`-smp` must stay `4,sockets=4`** — `raspi3ap` enforces
+the SoC's 4 cores and rejects `-smp 1` ("invalid smp cpu"). For **boot speed**
+the cmdline uses **`quiet`** with **no `earlycon`** (the early-console serial
+flood is the biggest TCG slow path). The root filesystem is an **initramfs
 (gzipped cpio) loaded via `-initrd /pack/rootfs.bin`** instead of an emulated
 SD card — this drops the slow/unreliable SD/MMC path (sdhci IRQ never fires
-under TCG). The cpio has a `/init` that mounts devtmpfs/proc/sys and hands off
-to busybox init; it is packed from the dev rootfs (`scripts/linux-rootfs`) and
-the `.data` (dtb ‖ kernel ‖ cpio) is now **committed** (~38 MB) with matching
-`load.js`, so Pages is self-contained. The Linux engine runs inside
+under TCG) and is the main speed win. The cpio has a `/init` that mounts
+devtmpfs/proc/sys and hands off to busybox init; it is packed from the dev
+rootfs (`scripts/linux-rootfs`) and the `.data` (dtb ‖ kernel ‖ cpio) is now
+**committed** (~38 MB) with matching `load.js`, so Pages is self-contained.
+The Linux engine runs inside
 a same-origin `<iframe>` in the pi3-emu UI; for that iframe to be
 cross-origin isolated (SharedArrayBuffer / pthreads), the WHOLE app must be
 isolated. In dev/preview, `vite.config.js` sets `Cross-Origin-Opener-Policy:

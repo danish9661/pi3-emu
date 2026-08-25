@@ -9,7 +9,7 @@ Module['arguments'] = [
     // for ktock/qemu-wasm's pthread build — the vCPU threads keep the pthread
     // worker machinery warm (single-thread triggers a 'start is not a function'
     // worker race). Needs cross-origin isolation (COI service worker).
-    '-accel', 'tcg,tb-size=500,thread=multi', '-smp', '1,sockets=1',
+    '-accel', 'tcg,tb-size=500,thread=multi', '-smp', '4,sockets=4',
     '-dtb', '/pack/bcm2710-rpi-3-b-plus.dtb',
     '-kernel', '/pack/kernel8.img',
     // Root filesystem is an initramfs (gzipped cpio) loaded via -initrd instead
@@ -21,7 +21,8 @@ Module['arguments'] = [
     // Speed: drop earlycon (huge early-boot serial flood under TCG) and use
     // 'quiet' (suppresses kernel printk noise). Userspace /dev/console writes
     // (getty prompt, shell) still appear, so auto-activate keeps working.
-    // -smp 1 avoids calibrate_delay on 3 extra vCPUs (a slow TCG path).
+    // NOTE: -smp must stay 4 (raspi3ap enforces the SoC's 4 cores; -smp 1 is
+    // rejected with "invalid smp cpu"). The initramfs root is the main speed win.
     '-append', 'console=ttyAMA0,115200 quiet initcall_blacklist=bcm2835_pm_driver_init no_console_suspend'
 ];
 (function () {
