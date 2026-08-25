@@ -31,20 +31,12 @@ jobs:
 
       - run: npm ci
 
-      # Fetch the Linux boot image (.data, ~156 MB) and its matching load.js
-      # from ktock/qemu-wasm-demo-images. The engine (out.js/.wasm/.worker.js)
-      # is committed, so N4 (pi3-ctl) stays live on Pages; only the data is
-      # fetched because it is too large to commit and load.js must match it.
-      - name: Fetch Linux boot image (.data + load.js)
-        run: |
-          TMP=$(mktemp -d)
-          git clone --depth 1 --filter=blob:none --sparse \
-            https://github.com/ktock/qemu-wasm-demo-images.git "$TMP"
-          (cd "$TMP" && git sparse-checkout set raspi3ap)
-          cp "$TMP/raspi3ap/qemu-system-aarch64.data" public/linux/qemu-system-aarch64.data
-          cp "$TMP/raspi3ap/load.js" public/linux/load.js
-          rm -rf "$TMP"
-          echo "fetched .data ($(wc -c < public/linux/qemu-system-aarch64.data) bytes) + load.js"
+      # The Linux boot image (qemu-system-aarch64.data, ~38 MB initramfs) and its
+      # matching load.js are COMMITTED, so the deploy is self-contained: the
+      # engine (out.js/.wasm/.worker.js) and the initramfs rootfs (rootfs.bin,
+      # a gzipped cpio loaded via -initrd) are all in-repo. N4 (pi3-ctl) stays
+      # live and boot is fast (no SD/MMC emulation). Do NOT fetch ktock's
+      # SD-based .data here -- it would overwrite our initramfs image.
 
       - run: npm run build
 

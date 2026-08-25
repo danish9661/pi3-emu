@@ -12,12 +12,17 @@ Module['arguments'] = [
     '-accel', 'tcg,tb-size=500,thread=multi', '-smp', '1,sockets=1',
     '-dtb', '/pack/bcm2710-rpi-3-b-plus.dtb',
     '-kernel', '/pack/kernel8.img',
-    '-drive', 'file=/pack/rootfs.bin,format=raw,if=sd',
+    // Root filesystem is an initramfs (gzipped cpio) loaded via -initrd instead
+    // of an emulated SD card. This skips the slow/unreliable SD/MMC emulation
+    // (the sdhci IRQ never fires under TCG -> 'mmc1 Timeout' noise) and is a
+    // faster, more deterministic boot path. See /init in the cpio for the
+    // boot entrypoint (mounts devtmpfs/proc/sys, hands off to busybox init).
+    '-initrd', '/pack/rootfs.bin',
     // Speed: drop earlycon (huge early-boot serial flood under TCG) and use
     // 'quiet' (suppresses kernel printk noise). Userspace /dev/console writes
     // (getty prompt, shell) still appear, so auto-activate keeps working.
     // -smp 1 avoids calibrate_delay on 3 extra vCPUs (a slow TCG path).
-    '-append', 'console=ttyAMA0,115200 quiet initcall_blacklist=bcm2835_pm_driver_init root=/dev/mmcblk0 rootfstype=ext4 rootwait no_console_suspend'
+    '-append', 'console=ttyAMA0,115200 quiet initcall_blacklist=bcm2835_pm_driver_init no_console_suspend'
 ];
 (function () {
     const here = (document.currentScript && document.currentScript.src) || location.href;

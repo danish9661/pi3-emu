@@ -199,11 +199,13 @@
         });
       }
 
-      // ---- N3: snapshot the SD card image (rootfs.bin) to IndexedDB + file ----
+      // ---- N3: snapshot the initramfs image (rootfs.bin) to IndexedDB + file ----
       // Download/Upload gives a portable disk file; IndexedDB persists the loaded
-      // disk across reboots. The active disk is injected over the unpacked
-      // /pack/rootfs.bin in a preRun, before qemu opens the SD drive, so a
-      // downloaded/uploaded disk becomes the live filesystem on next boot.
+      // disk across reboots. The active image is injected over the unpacked
+      // /pack/rootfs.bin in a preRun, before qemu loads it as -initrd, so a
+      // downloaded/uploaded image becomes the live rootfs on next boot.
+      // (Note: the running FS lives in tmpfs, so Save captures the loaded image,
+      // not live session edits — treat it as a disk-image swap, not a live snap.)
       const DISK_PATH = "/pack/rootfs.bin";
       const fsApi = () => (Module.FS || Module["FS"]);
       const toU8 = (b) => (b instanceof Uint8Array ? b : new Uint8Array(b));
