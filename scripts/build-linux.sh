@@ -102,10 +102,15 @@ echo "[*] building qemu-system-aarch64 (emscripten -> wasm; resumes if interrupt
 $DOCKER exec -it -e CFLAGS="$QEMU_CFLAGS" -e LDFLAGS="$QEMU_LDFLAGS" "$CTN" \
   bash -c 'cd /build && emmake make -j "$(nproc)" qemu-system-aarch64'
 
-# 6) build the kernel + dtb + busybox rootfs image
+# 6) build the kernel + dtb + rootfs image (rootfs carries busybox + glibc +
+#    C headers + tcc, per scripts/linux-rootfs/image.Dockerfile). The build
+#    context is scripts/linux-rootfs so the committed rcS/inittab/passwd/...
+#    sources are used (not the upstream ones from the clone).
 echo "[*] building raspi3ap guest image (kernel8.img + dtb + rootfs.bin)"
+ROOTFS_CTX="$ROOT/scripts/linux-rootfs"
+cp "$ROOTFS_CTX/image.Dockerfile" "$SRC/examples/raspi3ap/image/Dockerfile"
 PACK="$(mktemp -d)"
-$DOCKER build --output=type=local,dest="$PACK" "$SRC/examples/raspi3ap/image"
+$DOCKER build --output=type=local,dest="$PACK" -f "$ROOTFS_CTX/image.Dockerfile" "$ROOTFS_CTX"
 $DOCKER cp "$PACK/." "$CTN:/pack"
 rm -rf "$PACK"
 

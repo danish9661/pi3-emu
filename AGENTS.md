@@ -686,6 +686,59 @@ be end-to-end verified here, but they are sound (rootfs derived from the
 original image's geometry; harness changes are additive serial/DOM). Verify in
 a real browser (`npm run dev` → Linux tab) where the worker starts cleanly.
 
+### M27 — Linux dev environment (N1 compiler + N2 fast kernel) (DONE)
+
+- **N1 In-guest C compiler:** the guest rootfs is now a full dev environment —
+  busybox (static), glibc shared loader + libs (`/lib/ld-linux-aarch64.so.1`,
+  `libc.so.6`, `libm`, `libgcc_s`, `libpthread`, `libdl`), aarch64 C headers
+  (`/usr/include`), and a **static `tcc`** (`/bin/tcc`) with its runtime
+  `libtcc1.a` (`/lib/tcc/libtcc1.a`, `/usr/lib/tcc/libtcc1.a`). Guest can now
+  `tcc -o hello hello.c && ./hello` (uses libc + headers at runtime). Verified
+  via `debugfs` on the built image: `/bin/tcc` is an aarch64 ELF, `libc.so.6`
+  + `ld-linux` + `stdio.h` present, `libtcc1.a` present, `e2fsck` clean.
+  - tcc build recipe (in `scripts/linux-rootfs/image.Dockerfile`): clone
+    `repo.or.cz/tinycc.git`, build the host helper `c2str.exe` with **x86
+    `gcc`** (`gcc -DC2STR -o c2str.exe conftest.c && touch c2str.exe`) so the
+    cross `make` doesn't try to recompile it, then `./configure
+    --cross-prefix=aarch64-linux-gnu- --cpu=arm64 --enable-static && make`
+    (the `make` fails at `libtcc1.a` because the aarch64 `tcc` can't run on x86
+    — ignore with `|| true`; build `libtcc1.a` separately with
+    `aarch64-linux-gnu-gcc -c lib/lib-arm64.c && ar rcs`). Resulting `tcc` is
+    dynamic (links glibc at runtime — fine, glibc is in the image).
+  - The dev rootfs is **128 MB** (was 4 MB) to fit glibc + headers + tcc.
+- **N2 Faster/real kernel:** SATISFIED by retaining ktock's **prebuilt** fast
+  `kernel8.img` (raspberrypi/linux tag `1.20230405`, ~22 MB). Rebuilding with
+  the upstream `bcm2711_defconfig` (the image Dockerfile's `kernel-dev` stage)
+  makes boot ~3× slower — do NOT swap it in for the live `.data`. N2 needed no
+  code change; it is a "keep the prebuilt kernel" decision.
+- **LIVE `.data` ASSEMBLY (fast kernel + dev rootfs):** because the dev rootfs
+  is bigger, the `.data` layout and the committed `public/linux/load.js` slices
+  change. The live `public/linux/qemu-system-aarch64.data` is reassembled as
+  `prebuiltDtb[0:32753] ‖ prebuiltKernel[32753:22505969] ‖ devRootfs[22505969:
+  156723697]` (total 156723697). `load.js` `loadPackage` slices updated to
+  rootfs `end: 156723697`, `remote_package_size: 156723697`. Recipe:
+  ```
+  node -e 'const fs=require("fs");const p=fs.readFileSync(process.env.HOME+"/qemu-wasm-demo-images/raspi3ap/qemu-system-aarch64.data");const r=fs.readFileSync("dev-rootfs.bin");fs.writeFileSync("public/linux/qemu-system-aarch64.data",Buffer.concat([p.subarray(0,32753),p.subarray(32753,22505969),r]));'
+  ```
+  **GOTCHA:** whenever the rootfs size changes, BOTH `load.js` (the two slice
+  numbers + `remote_package_size`) AND the repackaged `.data` must be updated
+  together, or the preload unpacks the wrong byte range and the kernel panics
+  ("VFS: unable to mount root fs").
+- **REPRODUCIBLE FROM SOURCE:** `scripts/linux-rootfs/image.Dockerfile` (the
+  full multi-stage file, committed) is copied over the clone by
+  `scripts/build-linux.sh` (step 6 now builds from `scripts/linux-rootfs` as the
+  docker context, using `image.Dockerfile`). `bash scripts/build-linux.sh`
+  therefore produces a from-source `.data` WITH the dev rootfs (single-thread +
+  slow kernel, into `public/linux-fromsrc/`, never touching the live
+  `public/linux/`). For the live **fast+dev** combo, assemble the `.data`
+  manually from the prebuilt kernel + the dev `rootfs.bin` as above.
+- **STATUS:** dev rootfs built and repackaged into the live (gitignored)
+  `public/linux/qemu-system-aarch64.data`; `load.js` offsets updated; Dockerfile
+  + `build-linux.sh` recipe committed. End-to-end boot NOT verifiable in this
+  sandbox (pthread worker race, see VERIFICATION CAVEAT) — verify in a real
+  browser. The tcc binary itself and the image contents ARE verified sound via
+  `debugfs`/`file`/`e2fsck`.
+
 ## Key risks
 
 - Core patch (Phase 1) is the big unknown: if the unicorn.js build can't
