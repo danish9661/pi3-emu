@@ -308,7 +308,7 @@
             var rows = document.querySelector(".xterm-rows");
             if (!rows) return;
             var txt = rows.innerText;
-            if (/Linux version/.test(txt)) setBoot("Kernel up — starting userspace…");
+            if (/Linux version|Please press Enter to activate this console\./.test(txt)) setBoot("Kernel up — starting userspace…");
             if (/login:/.test(txt) && stage === 0) {
               stage = 1; setBoot("Console ready — logging in…"); xterm.focus(); xterm.paste("root\r");
             } else if (/Password:/.test(txt) && stage === 1) {

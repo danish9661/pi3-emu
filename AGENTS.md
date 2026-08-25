@@ -415,9 +415,13 @@ auto-activates: `index.html` watches `.xterm-rows` for the getty's
 then `xterm.paste("\r")`, so the user lands straight at the `~ #` shell
 (the `focus()` is required — `paste()` without focus does not deliver the
 key inside a same-origin iframe). Accel is **MTTCG**
-(`-accel tcg,tb-size=500,thread=multi -smp 4,sockets=4`) — this is the
-working config for ktock's pthread build; single-thread triggers a
-`start is not a function` pthread-worker race. The Linux engine runs inside
+(`-accel tcg,tb-size=500,thread=multi`); ktock's pthread build needs
+multi-thread (single-thread triggers a `start is not a function`
+pthread-worker race). For **boot speed** the guest runs **`-smp 1`** and the
+cmdline uses **`quiet`** with **no `earlycon`** (the early-console serial
+flood + `calibrate_delay` on 3 extra vCPUs are the two biggest TCG slow
+paths). Userspace `/dev/console` writes (getty prompt, shell) still print under
+`quiet`, so auto-activate keeps working. The Linux engine runs inside
 a same-origin `<iframe>` in the pi3-emu UI; for that iframe to be
 cross-origin isolated (SharedArrayBuffer / pthreads), the WHOLE app must be
 isolated. In dev/preview, `vite.config.js` sets `Cross-Origin-Opener-Policy:
