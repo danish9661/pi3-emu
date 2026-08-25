@@ -758,24 +758,33 @@ a real browser (`npm run dev` → Linux tab) where the worker starts cleanly.
   migration is unverified, so a true "freeze the whole VM" snapshot is not
   available. Re-boot from a saved disk is the supported model.
 - **N4 GPIO bridge — two layers:**
-  - **Live harness bridge (DONE):** the toolbar GPIO buttons now cover pins
+  - **Live harness bridge (DONE):** the toolbar GPIO buttons cover pins
     **17/18/21/22** (toggle on click, `* ` suffix + green when on). Each
     click drives the **real emulated BCM2835 GPIO** via sysfs over the serial
     console (`echo <pin> > /sys/class/gpio/export; echo out > …/direction;
-    echo <v> > …/value`). This is a genuine browser→guest GPIO control of
-    actual SoC pins (the C4 serial path, generalized to multiple pins).
-  - **True device-level bridge (SOURCE ONLY, not live):** `scripts/linux-
-    rootfs/pi3ctl.c` is a qemu `sysbus` device (`pi3-ctl`) that exposes MMIO
-    registers for 64 virtual lines and forwards line state to a qemu
-    **chardev** (`chr` property) — device→browser as `S <line> <v>\n`,
-    browser→device as `I <line> <v>\n`. Wire it with `-chardev web,id=pi3
-    -device pi3-ctl,chr=pi3` and map its MMIO in `hw/arm/raspi.c`. This
-    needs a **pthread/MTTCG qemu-wasm rebuild with a `web` chardev backend**
-    (ktock's exact emscripten flags). THIS CHECKOUT CANNOT BUILD THAT (the
-    GLUE-COMPAT note: no `PROXY_TO_PTHREAD`, so from-source is single-thread
-    and won't replace the live prebuilt engine). So `pi3ctl.c` is committed
-    as buildable source + design only; the live bridge remains the harness
-    serial path until a proper pthread qemu-wasm build is produced.
+    echo <v> > …/value`). Genuine browser→guest GPIO control of actual SoC
+    pins (the C4 serial path, generalized to multiple pins).
+  - **True device-level bridge (IMPLEMENTED, compiled into from-source
+    build, not live yet):** `scripts/linux-rootfs/pi3ctl.{c,h}` is a qemu
+    **plain `DEVICE`** (no MMIO — avoids the address-collision risk) that is
+    wired directly to the real `bcm2835_gpio` by `hw/arm/raspi.c`:
+    `bcm2835_gpio.out[line] → pi3-ctl input` (guest GPIO output writes are
+    forwarded to the browser as `S <line> <v>\n` via emscripten
+    `postMessage`), and `pi3-ctl output[line] → bcm2835_gpio.in[line]`
+    (the browser sends `I <line> <v>\n` → `pi3_rx()` sets a real emulated
+    GPIO **input** the guest reads via GPLEV). `bcm2835_gpio` gained `in[54]`
+    qemu_irq input lines + `in_lev0/1` reflected in GPLEV (patched via
+    `scripts/linux-rootfs/apply-n4-patches.py`, which also instantiates
+    pi3-ctl in `raspi_machine_init`). The browser side is wired in
+    `public/linux/index.html` (Bridge buttons 23/24/25 + a guest→browser
+    state readout, guarded so the stock prebuilt engine — which lacks
+    `pi3_rx` — stays inert). **STATUS:** builds into `public/linux-fromsrc/`
+    (pthread/MTTCG since `QEMU_LDFLAGS` now has `-sPROXY_TO_PTHREAD
+    -sPTHREAD_POOL_SIZE=4`), but is NOT the live engine. To make it live,
+    rebuild the **live** `public/linux/` engine with these patches (needs
+    ktock's exact emscripten glue flags — the from-source `out.js` glue
+    differs and is not harness-bootable), then verify in a real browser
+    (the in-sandbox worker-race makes headless boot unverifiable).
 
 ## Key risks
 

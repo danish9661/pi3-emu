@@ -78,12 +78,15 @@ else
   echo "[*] source already in container, reusing"
 fi
 
-# 3b) inject the N4 pi3-ctl device source (compiled into qemu; instantiation in
-#     hw/arm/raspi.c — MMIO map + chr property — is the remaining step and must
-#     use an address verified free in the raspi3ap DTS, so it is NOT auto-added
-#     here to avoid breaking the kernel boot).
-$DOCKER cp "$ROOT/scripts/linux-rootfs/pi3ctl.c" "$CTN:/qemu/hw/misc/pi3ctl.c"
+# 3b) inject the N4 pi3-ctl device source + header, register it in meson,
+#     and apply the board/gpio wiring patches (no MMIO: pi3-ctl is wired
+#     directly to the bcm2835_gpio input/output lines by hw/arm/raspi.c).
+$DOCKER cp "$ROOT/scripts/linux-rootfs/pi3ctl.c"  "$CTN:/qemu/hw/misc/pi3ctl.c"
+$DOCKER cp "$ROOT/scripts/linux-rootfs/pi3ctl.h"  "$CTN:/qemu/include/hw/misc/pi3ctl.h"
+$DOCKER cp "$ROOT/scripts/linux-rootfs/apply-n4-patches.py" "$CTN:/qemu/apply-n4-patches.py"
 $DOCKER exec "$CTN" bash -c "grep -q \"files('pi3ctl.c')\" /qemu/hw/misc/meson.build || printf \"system_ss.add(files('pi3ctl.c'))\n\" >> /qemu/hw/misc/meson.build"
+echo "[*] applying N4 patches"
+$DOCKER exec -w /qemu "$CTN" python3 /qemu/apply-n4-patches.py
 
 # 4) configure (clean slate if a previous run left a config with the old flags)
 if $DOCKER exec "$CTN" sh -c 'test -f /build/build.ninja && grep -Eq "c_args.*-sWASM_BIGINT" /build/build.ninja' 2>/dev/null; then
@@ -128,8 +131,10 @@ $DOCKER exec -it -w /build "$CTN" /bin/sh -c \
 
 # 8) copy artifacts into a SEPARATE dir. NEVER overwrite the live
 #    public/linux/ (which holds the verified prebuilt pthread/MTTCG binary).
-#    This checkout lacks PROXY_TO_PTHREAD, so the from-source qemu is
-#    single-thread and must not replace the prebuilt engine.
+#    The from-source build now enables PROXY_TO_PTHREAD (see QEMU_LDFLAGS),
+#    but it is rebuilt from scratch with a different emscripten toolchain than
+#    ktock's prebuilt glue (out.js), so it is NOT harness-bootable as-is and
+#    must not replace the live engine.
 BUILT_DIR="$ROOT/public/linux-fromsrc"
 mkdir -p "$BUILT_DIR"
 echo "[*] copying artifacts into $BUILT_DIR (NOT the live public/linux/)"
@@ -138,4 +143,4 @@ for f in qemu-system-aarch64.wasm qemu-system-aarch64.worker.js qemu-system-aarc
   $DOCKER cp "$CTN:/build/$f" "$BUILT_DIR/$f"
 done
 
-echo "[done] built (single-thread) artifacts in $BUILT_DIR — the live public/linux/ is untouched."
+echo "[done] built (pthread/MTTCG) artifacts in $BUILT_DIR — the live public/linux/ is untouched."

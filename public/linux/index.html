@@ -53,6 +53,11 @@
           <button class="gpioBtn" data-pin="18" type="button">18</button>
           <button class="gpioBtn" data-pin="21" type="button">21</button>
           <button class="gpioBtn" data-pin="22" type="button">22</button>
+          <span class="hint">Bridge:</span>
+          <button class="gpioBtn bridgeIn" data-pin="23" type="button">23</button>
+          <button class="gpioBtn bridgeIn" data-pin="24" type="button">24</button>
+          <button class="gpioBtn bridgeIn" data-pin="25" type="button">25</button>
+          <span id="bridgeState" class="hint"></span>
           <input type="file" id="diskUpload" style="display:none" />
           <button id="saveDisk" type="button">Save Disk</button>
           <button id="loadDisk" type="button">Load Disk</button>
@@ -124,6 +129,44 @@
         b.addEventListener("click", () => {
           on = !on;
           gpioSet(b.dataset.pin, on ? 1 : 0);
+          b.classList.toggle("on", on);
+          b.textContent = b.dataset.pin + (on ? "*" : "");
+        });
+      });
+
+      // ---- N4 (true device bridge): pi3-ctl <-> browser over postMessage ----
+      // The patched qemu engine (if built with pi3-ctl) forwards guest GPIO
+      // OUTPUT writes to the browser as "S <line> <0|1>\n" (worker->main via
+      // postMessage), and accepts "I <line> <0|1>\n" from the browser to drive
+      // a real emulated GPIO INPUT the guest can read via GPLEV. Guarded: the
+      // stock prebuilt engine has no pi3_rx, so this stays inert there.
+      const bridgeLevels = {};
+      const bridgeReady = () =>
+        typeof Module !== "undefined" && typeof Module.ccall === "function" &&
+        Module.ccall("pi3_rx", "void", ["string"], ["I 0 0"]) !== undefined;
+      const pi3Send = (line, v) => {
+        try {
+          if (typeof Module !== "undefined" && typeof Module.ccall === "function") {
+            Module.ccall("pi3_rx", "void", ["string"], ["I " + line + " " + (v ? 1 : 0)]);
+          }
+        } catch (e) { /* pi3_rx not exported in this engine */ }
+      };
+      window.addEventListener("message", (e) => {
+        if (typeof e.data !== "string") return;
+        const m = /^S (\d+) (\d+)$/.exec(e.data);
+        if (!m) return;
+        const line = m[1], v = m[2] === "1";
+        bridgeLevels[line] = v;
+        const el = document.getElementById("bridgeState");
+        if (el) el.textContent =
+          "guest→browser: " +
+          Object.keys(bridgeLevels).map((k) => "G" + k + (bridgeLevels[k] ? "=1" : "=0")).join(" ");
+      });
+      document.querySelectorAll(".bridgeIn").forEach((b) => {
+        let on = false;
+        b.addEventListener("click", () => {
+          on = !on;
+          pi3Send(b.dataset.pin, on ? 1 : 0);
           b.classList.toggle("on", on);
           b.textContent = b.dataset.pin + (on ? "*" : "");
         });
