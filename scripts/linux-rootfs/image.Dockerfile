@@ -24,6 +24,9 @@ COPY ./motd /rootfs/etc/motd
 COPY ./profile /rootfs/etc/profile
 COPY ./hw /rootfs/bin/hw
 RUN chmod 755 /rootfs/bin/hw
+COPY ./bridge-demo.sh /rootfs/bin/bridge-demo
+RUN chmod 755 /rootfs/bin/bridge-demo
+COPY ./bridge-demo.c /rootfs/root/bridge-demo.c
 COPY ./inittab /rootfs/etc/inittab
 COPY ./passwd /rootfs/etc/passwd
 RUN chmod 644 /rootfs/etc/passwd

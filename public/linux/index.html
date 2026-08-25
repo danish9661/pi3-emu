@@ -57,6 +57,9 @@
           <button class="gpioBtn bridgeIn" data-pin="23" type="button">23</button>
           <button class="gpioBtn bridgeIn" data-pin="24" type="button">24</button>
           <button class="gpioBtn bridgeIn" data-pin="25" type="button">25</button>
+          <button class="gpioBtn bridgeIn" data-pin="26" type="button">26</button>
+          <button class="gpioBtn bridgeIn" data-pin="27" type="button">27</button>
+          <button id="bridgeTest" type="button">Echo Test</button>
           <span id="bridgeState" class="hint"></span>
           <input type="file" id="diskUpload" style="display:none" />
           <button id="saveDisk" type="button">Save Disk</button>
@@ -171,6 +174,26 @@
           b.textContent = b.dataset.pin + (on ? "*" : "");
         });
       });
+
+      // N4 Echo Test: pulse Bridge pin 23 (browser->guest) and, if the guest
+      // runs `bridge-demo`, it echoes pin23 -> pin21 (guest->browser). The
+      // toolbar readout will show G21 go high then low, proving a full
+      // round-trip through the pi3-ctl device.
+      const bridgeTest = document.getElementById("bridgeTest");
+      if (bridgeTest) {
+        let busy = false;
+        bridgeTest.addEventListener("click", () => {
+          if (busy) return;
+          busy = true;
+          bridgeTest.classList.add("on");
+          pi3Send(23, 1);
+          setTimeout(() => {
+            pi3Send(23, 0);
+            bridgeTest.classList.remove("on");
+            busy = false;
+          }, 900);
+        });
+      }
 
       // ---- N3: snapshot the SD card image (rootfs.bin) to IndexedDB + file ----
       // Download/Upload gives a portable disk file; IndexedDB persists the loaded
