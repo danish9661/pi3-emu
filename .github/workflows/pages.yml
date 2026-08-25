@@ -30,6 +30,22 @@ jobs:
           cache: npm
 
       - run: npm ci
+
+      # Fetch the Linux boot image (.data, ~156 MB) and its matching load.js
+      # from ktock/qemu-wasm-demo-images. The engine (out.js/.wasm/.worker.js)
+      # is committed, so N4 (pi3-ctl) stays live on Pages; only the data is
+      # fetched because it is too large to commit and load.js must match it.
+      - name: Fetch Linux boot image (.data + load.js)
+        run: |
+          TMP=$(mktemp -d)
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/ktock/qemu-wasm-demo-images.git "$TMP"
+          (cd "$TMP" && git sparse-checkout set raspi3ap)
+          cp "$TMP/raspi3ap/qemu-system-aarch64.data" public/linux/qemu-system-aarch64.data
+          cp "$TMP/raspi3ap/load.js" public/linux/load.js
+          rm -rf "$TMP"
+          echo "fetched .data ($(wc -c < public/linux/qemu-system-aarch64.data) bytes) + load.js"
+
       - run: npm run build
 
       - uses: actions/configure-pages@v5
