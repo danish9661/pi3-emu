@@ -37,9 +37,13 @@ CTN="build-qemu-wasm"
 # (-Werror=unused-command-line-argument). glib's meson wrap neutralizes that
 # warning, but qemu's build does not. So we split: CFLAGS keeps only
 # compile-safe flags; the -sX linker settings go in LDFLAGS. (-DWASM_BIGINT is
-# the C macro and stays in CFLAGS; -sWASM_BIGINT is the link flag.)
-QEMU_CFLAGS="-O2 -matomics -mbulk-memory -DNDEBUG -DWASM_BIGINT -pthread -Wno-error=unused-command-line-argument -Wno-error=implicit-function-declaration"
-QEMU_LDFLAGS="-L/build/target/lib -O2 -matomics -mbulk-memory -pthread -sWASM_BIGINT -sMALLOC=mimalloc -sASYNCIFY=1 -sFORCE_FILESYSTEM -sPROXY_TO_PTHREAD -sPTHREAD_POOL_SIZE=4"
+# ktock/qemu-wasm exact build flags (README, aarch64) + ccall export for pi3_rx.
+# Replicate the documented command as closely as possible. The -s flags are
+# passed via --extra-cflags AND --extra-ldflags so they reach both compile and
+# link (qemu's final link only uses LDFLAGS).
+PTY_LIB="/opt/xterm-pty/node_modules/xterm-pty/emscripten-pty.js"
+EXTRA_CFLAGS="-O3 -g -Wno-error=unused-command-line-argument -matomics -mbulk-memory -DNDEBUG -DG_DISABLE_ASSERT -D_GNU_SOURCE -sASYNCIFY=1 -pthread -sPROXY_TO_PTHREAD=1 -sFORCE_FILESYSTEM -sALLOW_TABLE_GROWTH -sTOTAL_MEMORY=2300MB -sWASM_BIGINT -sMALLOC=mimalloc --js-library=$PTY_LIB -sEXPORT_ES6=1 -sASYNCIFY_IMPORTS=ffi_call_js"
+EXTRA_LDFLAGS="$EXTRA_CFLAGS -L/build/target/lib -sEXPORTED_RUNTIME_METHODS=getTempRet0,setTempRet0,addFunction,removeFunction,TTY,FS,ccall"
 
 mkdir -p "$LINUX_DIR"
 
@@ -69,6 +73,11 @@ if ! $DOCKER ps -a --format '{{.Names}}' | grep -qx "$CTN"; then
 fi
 $DOCKER start "$CTN" >/dev/null 2>&1 || true
 
+# 2b) ensure the xterm-pty js-library is present (the TTY needs
+#     --js-library=$PTY_LIB). Install it OUTSIDE /build so the step-4
+#     `rm -rf /build` (when flags change) doesn't wipe it. Idempotent.
+$DOCKER exec "$CTN" bash -c "test -f $PTY_LIB || (mkdir -p /opt/xterm-pty && cd /opt/xterm-pty && npm i xterm-pty@v0.10.1)" || true
+
 # 3) copy the source into the container fs once (host bind mounts can be
 #    noexec under rootless podman, which breaks executing /qemu/configure)
 if ! $DOCKER exec "$CTN" test -f /qemu/configure; then
@@ -88,29 +97,35 @@ $DOCKER exec "$CTN" bash -c "grep -q \"files('pi3ctl.c')\" /qemu/hw/misc/meson.b
 echo "[*] applying N4 patches"
 $DOCKER exec -w /qemu "$CTN" python3 /qemu/apply-n4-patches.py
 
-# 4) configure (clean slate if a previous run left a config with the old flags)
-if $DOCKER exec "$CTN" sh -c 'test -f /build/build.ninja && grep -Eq "c_args.*-sWASM_BIGINT" /build/build.ninja' 2>/dev/null; then
-  echo "[*] stale config (old CFLAGS) — cleaning /build"
-  $DOCKER exec "$CTN" rm -rf /build
+# 4) configure. Build in /qb (NOT /build) so we never disturb the image-provided
+#    /build/target sysroot (glib/zlib/pixman built for wasm32). Reuse /qb only if
+#    it was configured with THESE exact flags; otherwise blow it away. The
+#    signature is written at the end of a successful configure.
+BUILD=/qb
+FLAG_SIG=$(printf '%s|%s' "$EXTRA_CFLAGS" "$EXTRA_LDFLAGS" | sha256sum | cut -d' ' -f1)
+if ! $DOCKER exec -e FLAG_SIG="$FLAG_SIG" "$CTN" sh -c "test -f $BUILD/.n4sig && [ \"\$(cat $BUILD/.n4sig)\" = '$FLAG_SIG' ]" 2>/dev/null; then
+  echo "[*] flags changed or no valid config — cleaning $BUILD"
+  $DOCKER exec "$CTN" rm -rf "$BUILD"
 fi
-if ! $DOCKER exec "$CTN" test -f /build/config-host.mak; then
-  CONF='mkdir -p /build && cd /build && emconfigure /qemu/configure --static --disable-werror --target-list=aarch64-softmmu --cpu=wasm32 --cross-prefix='
+if ! $DOCKER exec "$CTN" test -f "$BUILD/config-host.mak"; then
+  CONF="mkdir -p $BUILD && cd $BUILD && emconfigure /qemu/configure --static --disable-werror --target-list=aarch64-softmmu --cpu=wasm32 --cross-prefix= --extra-cflags='$EXTRA_CFLAGS' --extra-cxxflags='$EXTRA_CFLAGS' --extra-ldflags='$EXTRA_LDFLAGS'"
   echo "[*] configuring qemu (aarch64-softmmu, wasm32) — pass 1 (downloads dtc subproject)"
-  $DOCKER exec -it -e CFLAGS="$QEMU_CFLAGS" -e LDFLAGS="$QEMU_LDFLAGS" "$CTN" bash -c "$CONF"
+  $DOCKER exec -it -e EXTRA_CFLAGS="$EXTRA_CFLAGS" -e EXTRA_LDFLAGS="$EXTRA_LDFLAGS" "$CTN" bash -c "$CONF"
   # dtc is a meson wrap downloaded during meson setup; its meson.build sets
   # default_options: 'werror=true', which turns emscripten's unused-arg
   # warnings (e.g. -no-pie) into hard errors. Patch it, then reconfigure.
   $DOCKER exec "$CTN" bash -c 'test -f /qemu/subprojects/dtc/meson.build && sed -i "s/werror=true/werror=false/" /qemu/subprojects/dtc/meson.build && echo "[*] dtc werror disabled"'
   echo "[*] configuring qemu — pass 2 (applies patched dtc)"
-  $DOCKER exec -it -e CFLAGS="$QEMU_CFLAGS" -e LDFLAGS="$QEMU_LDFLAGS" "$CTN" bash -c "$CONF"
+  $DOCKER exec -it -e EXTRA_CFLAGS="$EXTRA_CFLAGS" -e EXTRA_LDFLAGS="$EXTRA_LDFLAGS" "$CTN" bash -c "$CONF"
+  $DOCKER exec -e FLAG_SIG="$FLAG_SIG" "$CTN" bash -c "echo '$FLAG_SIG' > $BUILD/.n4sig"
 else
-  echo "[*] already configured (good flags), skipping configure"
+  echo "[*] config matches flags, reusing $BUILD (resumable)"
 fi
 
 # 5) build qemu-system-aarch64 — RESUMABLE across invocations
 echo "[*] building qemu-system-aarch64 (emscripten -> wasm; resumes if interrupted)"
-$DOCKER exec -it -e CFLAGS="$QEMU_CFLAGS" -e LDFLAGS="$QEMU_LDFLAGS" "$CTN" \
-  bash -c 'cd /build && emmake make -j "$(nproc)" qemu-system-aarch64'
+$DOCKER exec -it -e EXTRA_CFLAGS="$EXTRA_CFLAGS" -e EXTRA_LDFLAGS="$EXTRA_LDFLAGS" "$CTN" \
+  bash -c "cd $BUILD && emmake make -j \"\$(nproc)\" qemu-system-aarch64"
 
 # 6) build the kernel + dtb + rootfs image (rootfs carries busybox + glibc +
 #    C headers + tcc, per scripts/linux-rootfs/image.Dockerfile). The build
@@ -126,21 +141,20 @@ rm -rf "$PACK"
 
 # 7) package the /pack directory into the .data preload bundle (run in /build)
 echo "[*] packaging qemu-system-aarch64.data (preload /pack)"
-$DOCKER exec -it -w /build "$CTN" /bin/sh -c \
+$DOCKER exec -it -w "$BUILD" "$CTN" /bin/sh -c \
   "/emsdk/upstream/emscripten/tools/file_packager.py qemu-system-aarch64.data --preload /pack > load.js"
 
-# 8) copy artifacts into a SEPARATE dir. NEVER overwrite the live
-#    public/linux/ (which holds the verified prebuilt pthread/MTTCG binary).
-#    The from-source build now enables PROXY_TO_PTHREAD (see QEMU_LDFLAGS),
-#    but it is rebuilt from scratch with a different emscripten toolchain than
-#    ktock's prebuilt glue (out.js), so it is NOT harness-bootable as-is and
-#    must not replace the live engine.
-BUILT_DIR="$ROOT/public/linux-fromsrc"
+# 8) install the rebuilt engine into the LIVE public/linux/ directory.
+#    We only swap the 3 engine artifacts (out.js glue, .wasm, .worker.js).
+#    The preload bundle (.data) and load.js are NOT overwritten: the live
+#    .data already carries the dev rootfs with the correct offsets, and the
+#    qemu-side pi3-ctl device does not change the disk image.
+BUILT_DIR="$ROOT/public/linux"
 mkdir -p "$BUILT_DIR"
-echo "[*] copying artifacts into $BUILT_DIR (NOT the live public/linux/)"
-$DOCKER cp "$CTN:/build/qemu-system-aarch64" "$BUILT_DIR/out.js"
-for f in qemu-system-aarch64.wasm qemu-system-aarch64.worker.js qemu-system-aarch64.data load.js; do
-  $DOCKER cp "$CTN:/build/$f" "$BUILT_DIR/$f"
+echo "[*] installing rebuilt engine into LIVE $BUILT_DIR (preserving .data/load.js)"
+$DOCKER cp "$CTN:$BUILD/qemu-system-aarch64" "$BUILT_DIR/out.js"
+for f in qemu-system-aarch64.wasm qemu-system-aarch64.worker.js; do
+  $DOCKER cp "$CTN:$BUILD/$f" "$BUILT_DIR/$f"
 done
 
-echo "[done] built (pthread/MTTCG) artifacts in $BUILT_DIR — the live public/linux/ is untouched."
+echo "[done] rebuilt live engine (pthread/MTTCG + pi3-ctl) installed in $BUILT_DIR"

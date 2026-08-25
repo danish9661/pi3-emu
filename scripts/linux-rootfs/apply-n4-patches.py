@@ -21,14 +21,18 @@ FILES = {
 def patch(path, old, new):
     with open(path, "r") as f:
         src = f.read()
-    if old not in src:
+    if old in src:
+        if src.count(old) != 1:
+            raise SystemExit(f"ANCHOR AMBIGUOUS ({src.count(old)}) in {path}")
+        src = src.replace(old, new)
+        with open(path, "w") as f:
+            f.write(src)
+        print(f"patched {path}")
+    elif new in src:
+        # Already applied (idempotent re-run on the same source tree).
+        print(f"already patched (skipped) {path}")
+    else:
         raise SystemExit(f"ANCHOR NOT FOUND in {path}:\n{old}")
-    if src.count(old) != 1:
-        raise SystemExit(f"ANCHOR AMBIGUOUS ({src.count(old)}) in {path}")
-    src = src.replace(old, new)
-    with open(path, "w") as f:
-        f.write(src)
-    print(f"patched {path}")
 
 
 # 1) bcm2835_gpio.h: add input line state + input qemu_irq array.

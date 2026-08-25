@@ -764,27 +764,32 @@ a real browser (`npm run dev` → Linux tab) where the worker starts cleanly.
     console (`echo <pin> > /sys/class/gpio/export; echo out > …/direction;
     echo <v> > …/value`). Genuine browser→guest GPIO control of actual SoC
     pins (the C4 serial path, generalized to multiple pins).
-  - **True device-level bridge (IMPLEMENTED, compiled into from-source
-    build, not live yet):** `scripts/linux-rootfs/pi3ctl.{c,h}` is a qemu
-    **plain `DEVICE`** (no MMIO — avoids the address-collision risk) that is
-    wired directly to the real `bcm2835_gpio` by `hw/arm/raspi.c`:
-    `bcm2835_gpio.out[line] → pi3-ctl input` (guest GPIO output writes are
-    forwarded to the browser as `S <line> <v>\n` via emscripten
-    `postMessage`), and `pi3-ctl output[line] → bcm2835_gpio.in[line]`
-    (the browser sends `I <line> <v>\n` → `pi3_rx()` sets a real emulated
-    GPIO **input** the guest reads via GPLEV). `bcm2835_gpio` gained `in[54]`
+  - **True device-level bridge (LIVE as of 2026-08-25):** `scripts/linux-
+    rootfs/pi3ctl.{c,h}` is a qemu **plain `DEVICE`** (no MMIO — avoids the
+    address-collision risk) wired directly to the real `bcm2835_gpio` by
+    `hw/arm/raspi.c`: `bcm2835_gpio.out[line] → pi3-ctl input` (guest GPIO
+    output writes forwarded to the browser as `S <line> <v>\n` via emscripten
+    `postMessage`), and `pi3-ctl output[line] → bcm2835_gpio.in[line]` (the
+    browser sends `I <line> <v>\n` → `pi3_rx()` sets a real emulated GPIO
+    **input** the guest reads via GPLEV). `bcm2835_gpio` gained `in[54]`
     qemu_irq input lines + `in_lev0/1` reflected in GPLEV (patched via
     `scripts/linux-rootfs/apply-n4-patches.py`, which also instantiates
     pi3-ctl in `raspi_machine_init`). The browser side is wired in
     `public/linux/index.html` (Bridge buttons 23/24/25 + a guest→browser
-    state readout, guarded so the stock prebuilt engine — which lacks
-    `pi3_rx` — stays inert). **STATUS:** builds into `public/linux-fromsrc/`
-    (pthread/MTTCG since `QEMU_LDFLAGS` now has `-sPROXY_TO_PTHREAD
-    -sPTHREAD_POOL_SIZE=4`), but is NOT the live engine. To make it live,
-    rebuild the **live** `public/linux/` engine with these patches (needs
-    ktock's exact emscripten glue flags — the from-source `out.js` glue
-    differs and is not harness-bootable), then verify in a real browser
-    (the in-sandbox worker-race makes headless boot unverifiable).
+    state readout). **ENGINE REBUILD:** `scripts/build-linux.sh` now replicates
+    ktock's exact emscripten flags (README aarch64): `-O3 -DG_DISABLE_ASSERT
+    -D_GNU_SOURCE -sPROXY_TO_PTHREAD=1 -sFORCE_FILESYSTEM -sALLOW_TABLE_GROWTH
+    -sTOTAL_MEMORY=2300MB -sWASM_BIGINT -sMALLOC=mimalloc --js-library=xterm-pty
+    -sEXPORT_ES6=1 -sASYNCIFY_IMPORTS=ffi_call_js`, plus `-sEXPORTED_RUNTIME_
+    METHODS=...,TTY,FS,ccall` (the `ccall` export lets the harness call
+    `pi3_rx`). The build runs in `/qb` (never `/build`, which holds the
+    image sysroot) and installs `out.js`/`.wasm`/`.worker.js` into the LIVE
+    `public/linux/` (the `.data`/`load.js` are preserved). The rebuilt live
+    engine was verified to compile, export `pi3_rx`/`ccall`/`FS_createPath`,
+    and match the prebuilt's `.worker.js` size (6001 B, pthread parity).
+    **VERIFICATION CAVEAT:** full boot is still unverifiable headlessly here
+    (pthread worker-race, see M26 caveat) — the browser-side bridge must be
+    confirmed in a real browser (`npm run dev` → Linux tab → Bridge buttons).
 
 ## Key risks
 
