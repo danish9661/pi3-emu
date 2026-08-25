@@ -39,7 +39,7 @@ CTN="build-qemu-wasm"
 # compile-safe flags; the -sX linker settings go in LDFLAGS. (-DWASM_BIGINT is
 # the C macro and stays in CFLAGS; -sWASM_BIGINT is the link flag.)
 QEMU_CFLAGS="-O2 -matomics -mbulk-memory -DNDEBUG -DWASM_BIGINT -pthread -Wno-error=unused-command-line-argument -Wno-error=implicit-function-declaration"
-QEMU_LDFLAGS="-L/build/target/lib -O2 -matomics -mbulk-memory -pthread -sWASM_BIGINT -sMALLOC=mimalloc -sASYNCIFY=1 -sFORCE_FILESYSTEM"
+QEMU_LDFLAGS="-L/build/target/lib -O2 -matomics -mbulk-memory -pthread -sWASM_BIGINT -sMALLOC=mimalloc -sASYNCIFY=1 -sFORCE_FILESYSTEM -sPROXY_TO_PTHREAD -sPTHREAD_POOL_SIZE=4"
 
 mkdir -p "$LINUX_DIR"
 
@@ -77,6 +77,13 @@ if ! $DOCKER exec "$CTN" test -f /qemu/configure; then
 else
   echo "[*] source already in container, reusing"
 fi
+
+# 3b) inject the N4 pi3-ctl device source (compiled into qemu; instantiation in
+#     hw/arm/raspi.c — MMIO map + chr property — is the remaining step and must
+#     use an address verified free in the raspi3ap DTS, so it is NOT auto-added
+#     here to avoid breaking the kernel boot).
+$DOCKER cp "$ROOT/scripts/linux-rootfs/pi3ctl.c" "$CTN:/qemu/hw/misc/pi3ctl.c"
+$DOCKER exec "$CTN" bash -c "grep -q \"files('pi3ctl.c')\" /qemu/hw/misc/meson.build || printf \"system_ss.add(files('pi3ctl.c'))\n\" >> /qemu/hw/misc/meson.build"
 
 # 4) configure (clean slate if a previous run left a config with the old flags)
 if $DOCKER exec "$CTN" sh -c 'test -f /build/build.ninja && grep -Eq "c_args.*-sWASM_BIGINT" /build/build.ninja' 2>/dev/null; then

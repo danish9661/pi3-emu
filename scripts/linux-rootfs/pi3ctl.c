@@ -32,6 +32,7 @@
 #include "qapi/error.h"
 #include "hw/sysbus.h"
 #include "hw/qdev-properties.h"
+#include "hw/qdev-properties-system.h"
 #include "chardev/char-fe.h"
 
 #define TYPE_PI3_CTL "pi3-ctl"
@@ -122,14 +123,9 @@ static void pi3ctl_init(Object *obj)
 static void pi3ctl_realize(DeviceState *dev, Error **errp)
 {
     PI3CtlState *s = PI3_CTL(dev);
-    if (!qemu_chr_fe_backend_connected(&s->chr)) {
-        /* chardev is optional; without it the device is write-only local. */
-        qemu_chr_fe_set_handlers(&s->chr, pi3ctl_chr_can_read,
-            pi3ctl_chr_read, pi3ctl_chr_event, NULL, s, NULL, true);
-    } else {
-        qemu_chr_fe_set_handlers(&s->chr, pi3ctl_chr_can_read,
-            pi3ctl_chr_read, pi3ctl_chr_event, NULL, s, NULL, true);
-    }
+    /* Wire the chardev (if connected) so the browser can send "I <l> <v>". */
+    qemu_chr_fe_set_handlers(&s->chr, pi3ctl_chr_can_read,
+        pi3ctl_chr_read, pi3ctl_chr_event, NULL, s, NULL, true);
 }
 
 static Property pi3ctl_props[] = {
