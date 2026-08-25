@@ -1,0 +1,21 @@
+#!/bin/sh
+# hw — tour of the emulated Raspberry Pi 3 hardware, straight from the shell.
+echo "== pi3-emu hardware tour =="
+echo "SoC        : BCM2837 (4x Cortex-A53, aarch64)"
+echo "Kernel     : $(uname -sr)"
+echo "CPUs       : $(grep -c '^processor' /proc/cpuinfo)"
+echo "Memory     : $(grep MemTotal /proc/meminfo | awk '{print $2, $3}')"
+echo "Uptime     : $(cut -d' ' -f1 /proc/uptime) s"
+echo "Clocksource: $(cat /sys/devices/system/clocksource/clocksource0/current_clocksource 2>/dev/null)"
+echo "-- GPIO (sysfs) --"
+if [ -d /sys/class/gpio ]; then
+  echo "gpiochip  : $(ls /sys/class/gpio | tr '\n' ' ')"
+  echo "try       : echo 21 > /sys/class/gpio/export"
+  echo "            echo out > /sys/class/gpio/gpio21/direction"
+  echo "            echo 1  > /sys/class/gpio/gpio21/value"
+else
+  echo "no /sys/class/gpio exposed by this kernel"
+fi
+echo "-- mailbox / UART --"
+echo "serial console is the PL011 (ttyAMA0) you are using right now."
+echo "Use the GPIO21 on/off buttons in the browser toolbar to drive a pin."

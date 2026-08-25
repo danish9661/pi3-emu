@@ -11,9 +11,15 @@
         font-family: system-ui, sans-serif; }
       #app { display: flex; flex-direction: column; height: 100vh; }
       header { padding: 6px 10px; font-size: 13px; background: #161616;
-        border-bottom: 1px solid #2a2a2a; display: flex; gap: 10px; align-items: center; }
+        border-bottom: 1px solid #2a2a2a; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
       header b { color: #fff; font-weight: 600; }
       header .hint { color: #888; font-size: 12px; }
+      .tools { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+      .tools input[type=text] { background: #0e0e0e; color: #ddd; border: 1px solid #333;
+        border-radius: 4px; padding: 3px 6px; font-size: 12px; width: 200px; }
+      .tools button { background: #2a2a2a; color: #ddd; border: 1px solid #3a3a3a;
+        border-radius: 4px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
+      .tools button:hover { background: #333; }
       #terminal { flex: 1 1 auto; padding: 6px; }
       #terminal .xterm { height: 100%; }
       #coi { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
@@ -28,9 +34,6 @@
       #boot .spin { width: 28px; height: 28px; border: 3px solid #2a2a2a; border-top-color: #6cc;
         border-radius: 50%; animation: spin 0.9s linear infinite; }
       @keyframes spin { to { transform: rotate(360deg); } }
-      #reboot { margin-left: auto; background: #2a2a2a; color: #ddd; border: 1px solid #3a3a3a;
-        border-radius: 4px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
-      #reboot:hover { background: #333; }
     </style>
   </head>
   <body>
@@ -38,7 +41,15 @@
       <header>
         <b>Raspberry Pi 3 (BCM2837)</b>
         <span class="hint">Linux on QEMU Wasm · raspi3ap · 4× Cortex-A53 · 512 MB — serial console</span>
-        <button id="reboot" type="button" onclick="location.reload()">Reboot</button>
+        <span class="tools">
+          <input type="file" id="upload" style="display:none" />
+          <button id="uploadBtn" type="button">Upload ▸ /mnt/incoming</button>
+          <input type="text" id="cmd" placeholder="type a command, e.g. hw" />
+          <button id="cmdBtn" type="button">Run</button>
+          <button id="gpioOn" type="button">GPIO21 on</button>
+          <button id="gpioOff" type="button">GPIO21 off</button>
+          <button id="reboot" type="button" onclick="location.reload()">Reboot</button>
+        </span>
       </header>
       <div id="terminal"></div>
     </div>
@@ -70,7 +81,38 @@
       const coiEl = document.getElementById("coi");
       const hideCoi = () => { if (window.crossOriginIsolated) coiEl.classList.add("hidden"); };
       hideCoi();
-      const coiIv = setInterval(hideCoi, 500);
+      setInterval(hideCoi, 500);
+
+      // send a line (with trailing CR) to the guest over the serial console
+      const sendLine = (s) => { xterm.focus(); xterm.paste(s + "\r"); };
+
+      // ---- C3: upload a file into the VM via base64 piped through busybox ----
+      const upload = document.getElementById("upload");
+      document.getElementById("uploadBtn").addEventListener("click", () => upload.click());
+      upload.addEventListener("change", () => {
+        const f = upload.files[0]; if (!f) return;
+        const name = f.name.replace(/[^A-Za-z0-9._-]/g, "_");
+        const reader = new FileReader();
+        reader.onload = () => {
+          const b64 = Buffer.from(new Uint8Array(reader.result)).toString("base64");
+          sendLine("echo " + b64 + " | base64 -d > /mnt/incoming/" + name);
+          upload.value = "";
+        };
+        reader.readAsArrayBuffer(f);
+      });
+
+      // ---- C4: browser -> guest control (command box + GPIO buttons) ----
+      const cmd = document.getElementById("cmd");
+      const runCmd = () => { if (cmd.value.trim()) { sendLine(cmd.value); cmd.value = ""; } };
+      document.getElementById("cmdBtn").addEventListener("click", runCmd);
+      cmd.addEventListener("keydown", (e) => { if (e.key === "Enter") runCmd(); });
+      const gpioCmd = (v) =>
+        sendLine("echo 21 > /sys/class/gpio/export 2>/dev/null; " +
+                 "echo out > /sys/class/gpio/gpio21/direction 2>/dev/null; " +
+                 "echo " + v + " > /sys/class/gpio/gpio21/value 2>/dev/null; " +
+                 "echo GPIO21 -> " + v);
+      document.getElementById("gpioOn").addEventListener("click", () => gpioCmd(1));
+      document.getElementById("gpioOff").addEventListener("click", () => gpioCmd(0));
 
       (async () => {
         await initEmscriptenModule(Module);
@@ -82,11 +124,10 @@
           return oldPoll.call(stream, timeout);
         };
 
-        // Auto-activate the console: the getty prints "Please press Enter to
-        // activate this console." and waits. Inject a CR so the user lands
-        // straight at the shell without having to press a key. Also drive the
-        // boot overlay status and hide it once the shell prompt appears.
-        var activated = false, booted = false;
+        // ---- C2: real login flow (getty + login). Auto-fill credentials so the
+        // user lands at the shell without typing. Also tolerate the legacy
+        // "Please press Enter" path in case getty isn't active. ----
+        var stage = 0, booted = false;
         var bootEl = document.getElementById("boot");
         var bootStatus = document.getElementById("boot-status");
         var setBoot = function (m) {
@@ -100,13 +141,14 @@
             if (!rows) return;
             var txt = rows.innerText;
             if (/Linux version/.test(txt)) setBoot("Kernel up — starting userspace…");
-            if (/Please press Enter to activate this console\./.test(txt)) {
-              if (!activated) {
-                activated = true;
-                setBoot("Console ready — activating shell…");
-                xterm.focus();
-                xterm.paste("\r");
-              }
+            if (/login:/.test(txt) && stage === 0) {
+              stage = 1; setBoot("Console ready — logging in…"); xterm.focus(); xterm.paste("root\r");
+            } else if (/Password:/.test(txt) && stage === 1) {
+              stage = 2; xterm.paste("raspberry\r");
+            } else if (/Login incorrect/.test(txt)) {
+              stage = 0;
+            } else if (/Please press Enter to activate this console\./.test(txt) && stage === 0) {
+              stage = 1; setBoot("Console ready — activating shell…"); xterm.focus(); xterm.paste("\r");
             }
             if (/~ ?#/.test(txt)) {
               if (!booted) { booted = true; setBoot("Boot complete"); }

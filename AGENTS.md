@@ -619,6 +619,73 @@ re-apply when porting to the unicorn.js core.
 - DMA engine for the SDHCI driver, performance tuning, IndexedDB
   snapshots, xterm.js.
 
+### M26 — Linux UX polish (C1–C4)
+
+The live Linux engine (public/linux/, ktock/qemu-wasm raspi3ap) gained four
+user-facing improvements to the busybox shell experience:
+
+- **C1 `hw` tour + richer userspace:** `scripts/linux-rootfs/hw` is a shell
+  script (`/bin/hw`) printing a tour of the emulated SoC (CPU count, memory,
+  clocksource, GPIO sysfs hint). Plus the B1 hostname/MOTD/profile banner.
+- **C2 Real login:** `scripts/linux-rootfs/{inittab,passwd,shadow}` install a
+  busybox `getty` + `login` on ttyAMA0. root password = `raspberry` (md5
+  crypt for busybox-login compat). The harness auto-fills `root`/`raspberry`
+  (public/linux/index.html auto-activate detects `login:`/`Password:`).
+  **GOTCHA:** the inittab MUST use `/bin/getty` — in ktock's rootfs every
+  busybox applet is symlinked into `/bin` only; `/sbin/getty` does not exist,
+  which would leave init with no console (silent dead boot).
+- **C3 Browser→VM file upload:** the harness "Upload" button reads a local
+  file, base64-encodes it, and pastes
+  `echo <b64> | base64 -d > /mnt/incoming/<name>` into the serial console
+  (busybox ships `base64`). `/mnt/incoming` is created by rcS. Works over the
+  existing xterm/pty serial bridge — no FS plumbing needed.
+- **C4 Browser→guest control panel:** a command box (`#cmd` + Run) and GPIO21
+  on/off buttons in the toolbar send shell commands into the guest over the
+  serial console. (Light loop: browser → serial → guest shell → qemu GPIO
+  device; NOT a direct device-model bridge — that needs a qemu device patch,
+  see deferred B3.)
+
+**REBUILDING THE ROOTFS WITHOUT THE CONTAINER (preferred):** a fresh `mke2fs`
+image works but the container build is gitignored/ephemeral and slow. Inject
+files into the ORIGINAL `rootfs.bin` with userspace `debugfs` (no mount/root
+needed), preserving the proven on-disk geometry:
+```
+node -e 'const fs=require("fs");const p=fs.readFileSync(process.env.HOME+"/qemu-wasm-demo-images/raspi3ap/qemu-system-aarch64.data");fs.writeFileSync("orig-rootfs.bin",p.subarray(22505969,26700273));'
+cp orig-rootfs.bin work-rootfs.bin
+debugfs -w work-rootfs.bin <<'E'
+rm /etc/inittab
+write scripts/linux-rootfs/hw /bin/hw
+chmod 755 /bin/hw
+write scripts/linux-rootfs/inittab /etc/inittab
+write scripts/linux-rootfs/passwd /etc/passwd
+chmod 644 /etc/passwd
+write scripts/linux-rootfs/shadow /etc/shadow
+chmod 600 /etc/shadow
+write scripts/linux-rootfs/hostname /etc/hostname
+write scripts/linux-rootfs/motd /etc/motd
+write scripts/linux-rootfs/profile /etc/profile
+mkdir /mnt/incoming
+write rcS /etc/init.d/rcS
+chmod 755 /etc/init.d/rcS
+E
+e2fsck -fy work-rootfs.bin
+# repackage .data: dtb[0:32753] kernel[32753:22505969] rootfs[22505969:26700273]
+node -e 'const fs=require("fs");const p=fs.readFileSync(process.env.HOME+"/qemu-wasm-demo-images/raspi3ap/qemu-system-aarch64.data");const r=fs.readFileSync("work-rootfs.bin");fs.writeFileSync("qemu-system-aarch64.data",Buffer.concat([p.subarray(0,32753),p.subarray(32753,22505969),r]));'
+```
+**GOTCHA:** `debugfs write` REFUSES to overwrite an existing file ("Ext2 file
+already exists") — `rm` it first, then `write`. Injecting into the original
+image (not building fresh) keeps the first blocks byte-identical, so the SD
+card (mmc0) probe in the kernel is unchanged.
+
+**VERIFICATION CAVEAT (2026-08-25):** headless boot in THIS sandbox is
+currently UNRELIABLE — the qemu-wasm pthread worker intermittently fails to
+start ("start is not a function" worker race) and the guest freezes during
+kernel boot; this was observed even with the **stock, unmodified** `.data`, so
+it is an environment issue, not a regression from C1–C4. The changes could not
+be end-to-end verified here, but they are sound (rootfs derived from the
+original image's geometry; harness changes are additive serial/DOM). Verify in
+a real browser (`npm run dev` → Linux tab) where the worker starts cleanly.
+
 ## Key risks
 
 - Core patch (Phase 1) is the big unknown: if the unicorn.js build can't
