@@ -53,6 +53,12 @@
       <div id="stats"></div>
       <div id="linuxBoot" class="hint" hidden></div>
     </main>
+    <!-- Cross-origin isolation (COOP/COEP) for the qemu-wasm Linux engine's
+         SharedArrayBuffer/pthreads. GitHub Pages cannot send these headers, so
+         this Service Worker injects them for the whole origin (scope /pi3-emu/),
+         which also covers the embedded Linux iframe. Registered early so the
+         first navigation is already isolated (no iframe reload race). -->
+    <script src="./coi-serviceworker.js"></script>
     <script src="./unicorn.js"></script>
     <script type="module" src="/src/main.js"></script>
   </body>

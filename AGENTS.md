@@ -420,10 +420,17 @@ working config for ktock's pthread build; single-thread triggers a
 `start is not a function` pthread-worker race. The Linux engine runs inside
 a same-origin `<iframe>` in the pi3-emu UI; for that iframe to be
 cross-origin isolated (SharedArrayBuffer / pthreads), the WHOLE app must be
-isolated, so `vite.config.js` now sets `Cross-Origin-Opener-Policy:
-same-origin` + `Cross-Origin-Embedder-Policy: require-corp` on every
-dev/preview response (the `coi-serviceworker.js` in `public/linux/` is then
-a no-op fallback for static hosts that don't send these headers). Verified
+isolated. In dev/preview, `vite.config.js` sets `Cross-Origin-Opener-Policy:
+same-origin` + `Cross-Origin-Embedder-Policy: require-corp` on every response.
+On static hosts (GitHub Pages) that cannot send these headers, the coi
+workaround is the PRIMARY mechanism: `public/coi-serviceworker.js` (root scope
+`/pi3-emu/`, registered by the main `index.html`) injects COOP/COEP for the
+whole origin — which also covers the embedded Linux iframe. `public/linux/
+index.html` points at that same root SW (`../coi-serviceworker.js`) so direct
+loads of the Linux page are isolated too. A per-frame SW at `public/linux/
+coi-serviceworker.js` was dropped because a SW scoped to the iframe directory
+races on GitHub Pages (the iframe navigation isn't intercepted →
+`SharedArrayBuffer is not defined`). Verified
 headless Chrome (puppeteer-core + /usr/bin/google-chrome-stable): the full
 UI flow (select `linux` → Run → iframe) boots to `~ #` with no page errors,
 and typing `echo ...` round-trips. Tests: `test/linux-boot-vendored.mjs`,
