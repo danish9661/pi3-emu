@@ -310,6 +310,10 @@
             var rows = document.querySelector(".xterm-rows");
             if (!rows) return;
             var txt = rows.innerText;
+            // Reveal the terminal as soon as the guest starts printing: the boot
+            // overlay is opaque and would otherwise hide the kernel boot log (and
+            // block the toolbar) for the whole boot. Dismiss it on first output.
+            if (txt && txt.trim().length) bootEl.classList.add("hidden");
             if (/Linux version|Please press Enter to activate this console\./.test(txt)) setBoot("Kernel up — starting userspace…");
             if (/login:/.test(txt) && stage === 0) {
               stage = 1; setBoot("Console ready — logging in…"); xterm.focus(); xterm.paste("root\r");
