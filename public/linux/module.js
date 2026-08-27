@@ -23,7 +23,10 @@ Module['arguments'] = [
     // (getty prompt, shell) still appear, so auto-activate keeps working.
     // NOTE: -smp must stay 4 (raspi3ap enforces the SoC's 4 cores; -smp 1 is
     // rejected with "invalid smp cpu"). The initramfs root is the main speed win.
-    '-append', 'console=ttyAMA0,115200 quiet initcall_blacklist=bcm2835_pm_driver_init no_console_suspend'
+    // lpj: skip the one-time calibrate_delay pass. On arm64 udelay is timer-based
+    // (arch counter), so a fixed lpj is safe and only trims boot time. Value
+    // approximates the BCM2837 Cortex-A53; drop it if timing ever looks off.
+    '-append', 'console=ttyAMA0,115200 quiet lpj=7000000 initcall_blacklist=bcm2835_pm_driver_init no_console_suspend'
 ];
 (function () {
     const here = (document.currentScript && document.currentScript.src) || location.href;

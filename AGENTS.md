@@ -798,8 +798,15 @@ a real browser (`npm run dev` → Linux tab) where the worker starts cleanly.
     qemu_irq input lines + `in_lev0/1` reflected in GPLEV (patched via
     `scripts/linux-rootfs/apply-n4-patches.py`, which also instantiates
     pi3-ctl in `raspi_machine_init`). The browser side is wired in
-    `public/linux/index.html` (Bridge buttons 23/24/25 + a guest→browser
-    state readout). **ENGINE REBUILD:** `scripts/build-linux.sh` now replicates
+    `public/linux/index.html` (Bridge buttons 23/24/25/26/27 + an `Echo Test`
+    pulse button, and a live `guest→browser: G<line>=<v>` readout). The harness
+    shows a `pi3-ctl: ready` / `pi3-ctl: n/a (stock engine)` badge so the device
+    support is visible without a kernel round-trip, and the `S <line> <v>` RX
+    regex tolerates the C code's trailing newline. **Boot speed:** `module.js`
+    append adds `lpj=7000000` to skip the one-time `calibrate_delay` (safe on
+    arm64 where udelay is timer-based). **Terminal:** `index.html` auto-fits the
+    pty grid to its container via a `fitTerminal()` measuring the rendered cell.
+    **ENGINE REBUILD:** `scripts/build-linux.sh` now replicates
     ktock's exact emscripten flags (README aarch64): `-O3 -DG_DISABLE_ASSERT
     -D_GNU_SOURCE -sPROXY_TO_PTHREAD=1 -sFORCE_FILESYSTEM -sALLOW_TABLE_GROWTH
     -sTOTAL_MEMORY=2300MB -sWASM_BIGINT -sMALLOC=mimalloc --js-library=xterm-pty

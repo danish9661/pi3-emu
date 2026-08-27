@@ -93,6 +93,27 @@
       xterm.open(document.getElementById("terminal"));
       xterm.focus();
 
+      // ---- terminal auto-fit: size the pty grid to the container ----
+      // Measure the actual rendered cell from .xterm-rows, then derive cols/rows
+      // from the container's client size. xterm-pty picks up term.onResize.
+      function fitTerminal() {
+        const container = document.getElementById("terminal");
+        const rowEl = xterm.element && xterm.element.querySelector(".xterm-rows > div");
+        if (!rowEl || !container || !xterm.cols) return;
+        const cellW = rowEl.getBoundingClientRect().width / xterm.cols;
+        const cellH = rowEl.getBoundingClientRect().height;
+        if (!cellW || !cellH) return;
+        const cols = Math.max(1, Math.floor(container.clientWidth / cellW));
+        const rows = Math.max(1, Math.floor(container.clientHeight / cellH));
+        if (cols !== xterm.cols || rows !== xterm.rows) xterm.resize(cols, rows);
+      }
+      requestAnimationFrame(() => fitTerminal());
+      setTimeout(fitTerminal, 300);
+      window.addEventListener("resize", fitTerminal);
+      if (typeof ResizeObserver !== "undefined") {
+        new ResizeObserver(fitTerminal).observe(document.getElementById("terminal"));
+      }
+
       const { master, slave } = openpty();
       xterm.loadAddon(master);
       Module.pty = slave;
@@ -148,9 +169,17 @@
       // a real emulated GPIO INPUT the guest can read via GPLEV. Guarded: the
       // stock prebuilt engine has no pi3_rx, so this stays inert there.
       const bridgeLevels = {};
-      const bridgeReady = () =>
-        typeof Module !== "undefined" && typeof Module.ccall === "function" &&
-        Module.ccall("pi3_rx", "void", ["string"], ["I 0 0"]) !== undefined;
+      // Indicate whether the running engine supports the pi3-ctl device (the
+      // rebuilt live engine does; the stock ktock prebuilt does not export
+      // ccall, so the bridge stays inert there). This is the quickest way to
+      // confirm N4 wiring from the browser without a kernel round-trip.
+      const bridgeStateEl = document.getElementById("bridgeState");
+      const bridgeSupported = () =>
+        typeof Module !== "undefined" && typeof Module.ccall === "function";
+      if (bridgeStateEl) {
+        bridgeStateEl.textContent =
+          bridgeSupported() ? "pi3-ctl: ready" : "pi3-ctl: n/a (stock engine)";
+      }
       const pi3Send = (line, v) => {
         try {
           if (typeof Module !== "undefined" && typeof Module.ccall === "function") {
@@ -160,7 +189,7 @@
       };
       window.addEventListener("message", (e) => {
         if (typeof e.data !== "string") return;
-        const m = /^S (\d+) (\d+)$/.exec(e.data);
+        const m = /^S (\d+) (\d+)\s*$/.exec(e.data);
         if (!m) return;
         const line = m[1], v = m[2] === "1";
         bridgeLevels[line] = v;
