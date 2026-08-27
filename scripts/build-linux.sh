@@ -144,17 +144,21 @@ echo "[*] packaging qemu-system-aarch64.data (preload /pack)"
 $DOCKER exec -it -w "$BUILD" "$CTN" /bin/sh -c \
   "/emsdk/upstream/emscripten/tools/file_packager.py qemu-system-aarch64.data --preload /pack > load.js"
 
-# 8) install the rebuilt engine into the LIVE public/linux/ directory.
-#    We only swap the 3 engine artifacts (out.js glue, .wasm, .worker.js).
-#    The preload bundle (.data) and load.js are NOT overwritten: the live
-#    .data already carries the dev rootfs with the correct offsets, and the
-#    qemu-side pi3-ctl device does not change the disk image.
+# 8) install the rebuilt engine + initramfs bundle into the LIVE public/linux/.
+#    The .data (dtb + kernel + gzipped-cpio rootfs) and load.js are rebuilt as
+#    part of this pipeline (steps 6/7) so the deploy is self-consistent with
+#    module.js' -initrd boot. NOTE: this is a from-source build, so the kernel is
+#    ktock's upstream bcm2711_defconfig kernel (slower than the raspi prebuilt
+#    fast kernel). To keep the fast prebuilt kernel, re-stitch it after this step
+#    using the manual repack recipe in AGENTS.md (M27): the .data layout is
+#    dtb[0:32753] | kernel[32753:22505969] | rootfs[22505969:end], and both the
+#    repacked .data and load.js must be updated together.
 BUILT_DIR="$ROOT/public/linux"
 mkdir -p "$BUILT_DIR"
-echo "[*] installing rebuilt engine into LIVE $BUILT_DIR (preserving .data/load.js)"
+echo "[*] installing rebuilt engine + initramfs bundle into LIVE $BUILT_DIR"
 $DOCKER cp "$CTN:$BUILD/qemu-system-aarch64" "$BUILT_DIR/out.js"
-for f in qemu-system-aarch64.wasm qemu-system-aarch64.worker.js; do
+for f in qemu-system-aarch64.wasm qemu-system-aarch64.worker.js qemu-system-aarch64.data load.js; do
   $DOCKER cp "$CTN:$BUILD/$f" "$BUILT_DIR/$f"
 done
 
-echo "[done] rebuilt live engine (pthread/MTTCG + pi3-ctl) installed in $BUILT_DIR"
+echo "[done] rebuilt live engine (pthread/MTTCG + pi3-ctl) + initramfs installed in $BUILT_DIR"

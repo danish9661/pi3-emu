@@ -48,9 +48,12 @@ RUN cp -f tcc /rootfs/bin/tcc && chmod 755 /rootfs/bin/tcc && \
     mkdir -p /rootfs/lib/tcc /rootfs/usr/lib/tcc && \
     cp -f /tmp/libtcc1.a /rootfs/lib/tcc/libtcc1.a && \
     cp -f /tmp/libtcc1.a /rootfs/usr/lib/tcc/libtcc1.a
-# rootless podman cannot mknod, so wrap the device node + ext4 packing in fakeroot
-RUN fakeroot sh -c 'mknod /rootfs/dev/null c 1 3 && chmod 666 /rootfs/dev/null && dd if=/dev/zero of=rootfs.bin bs=1M count=128 && mke2fs -d /rootfs rootfs.bin'
-RUN mkdir /out/ && mv rootfs.bin /out/
+# Build a gzipped-cpio initramfs (the live engine boots it via -initrd /pack/rootfs.bin).
+# Run as root so the cpio preserves uid 0 (root) in the guest. /init mounts the
+# devtmpfs/proc/sys filesystems and hands off to busybox init (which reads /etc/inittab).
+# /dev is excluded — the guest mounts devtmpfs over it at boot.
+RUN printf '#!/bin/sh\nmount -t devtmpfs none /dev 2>/dev/null || true\nmount -t proc none /proc 2>/dev/null || true\nmount -t sysfs none /sys 2>/dev/null || true\nexec /bin/init\n' > /rootfs/init && chmod 755 /rootfs/init
+RUN mkdir -p /out && cd /rootfs && find . -path './dev' -prune -o -print0 | cpio --null -o -H newc | gzip -9 > /out/rootfs.bin
 
 FROM ubuntu:24.04 AS kernel-dev
 ARG KERNEL_TAG

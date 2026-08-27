@@ -743,12 +743,18 @@ a real browser (`npm run dev` → Linux tab) where the worker starts cleanly.
   ("VFS: unable to mount root fs").
 - **REPRODUCIBLE FROM SOURCE:** `scripts/linux-rootfs/image.Dockerfile` (the
   full multi-stage file, committed) is copied over the clone by
-  `scripts/build-linux.sh` (step 6 now builds from `scripts/linux-rootfs` as the
-  docker context, using `image.Dockerfile`). `bash scripts/build-linux.sh`
-  therefore produces a from-source `.data` WITH the dev rootfs (single-thread +
-  slow kernel, into `public/linux-fromsrc/`, never touching the live
-  `public/linux/`). For the live **fast+dev** combo, assemble the `.data`
-  manually from the prebuilt kernel + the dev `rootfs.bin` as above.
+  `scripts/build-linux.sh` (step 6 builds from `scripts/linux-rootfs` as the
+  docker context, using `image.Dockerfile`). `image.Dockerfile` now emits the
+  rootfs as a **gzipped-cpio initramfs** (`rootfs.bin` = cpio.gz, with a `/init`
+  that mounts devtmpfs/proc/sys and execs busybox init) — matching the
+  `-initrd /pack/rootfs.bin` boot in `module.js`. Step 7 packages
+  `/pack` (dtb + kernel + cpio) into `qemu-system-aarch64.data` and regenerates
+  `load.js` (the `file_packager` writes the correct offsets automatically). Step
+  8 installs the engine **plus** `.data` + `load.js` into `public/linux/`, so a
+  from-source rebuild is self-consistent. This is a from-source build
+  (single-thread + **slow** upstream `bcm2711_defconfig` kernel); for the live
+  **fast+dev** combo, re-stitch the prebuilt fast kernel over the built `.data`
+  using the manual repack recipe above (dtb‖kernel‖rootfs byte ranges).
 - **STATUS:** dev rootfs built and repackaged into the live (gitignored)
   `public/linux/qemu-system-aarch64.data`; `load.js` offsets updated; Dockerfile
   + `build-linux.sh` recipe committed. End-to-end boot NOT verifiable in this
