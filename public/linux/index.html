@@ -46,8 +46,9 @@
         <span class="tools">
           <input type="file" id="upload" style="display:none" />
           <button id="uploadBtn" type="button">Upload ▸ /mnt/incoming</button>
-          <input type="text" id="cmd" placeholder="type a command, e.g. hw" />
-          <button id="cmdBtn" type="button">Run</button>
+           <input type="text" id="cmd" placeholder="type a command, e.g. hw" />
+           <button id="cmdBtn" type="button">Run</button>
+           <button id="scriptToggle" type="button">Script</button>
           <span class="hint">GPIO:</span>
           <button class="gpioBtn" data-pin="17" type="button">17</button>
           <button class="gpioBtn" data-pin="18" type="button">18</button>
@@ -68,6 +69,23 @@
           <button id="reboot" type="button" onclick="location.reload()">Reboot</button>
         </span>
       </header>
+      <div id="scriptPanel" style="display:none; padding:6px; background:#161616; border-bottom:1px solid #2a2a2a;">
+        <div style="display:flex; gap:6px; align-items:flex-start;">
+          <textarea id="scriptText" placeholder="paste a shell script or C source here…"
+            style="flex:1; height:96px; background:#0e0e0e; color:#ddd; border:1px solid #333; border-radius:4px; font-family:monospace; font-size:12px; padding:4px; resize:vertical;"></textarea>
+          <div style="display:flex; flex-direction:column; gap:4px;">
+            <input id="scriptName" value="prog.c" title="filename under /root/"
+              style="background:#0e0e0e; color:#ddd; border:1px solid #333; border-radius:4px; padding:3px 6px; font-size:12px; width:120px;" />
+            <button id="scriptSave" type="button">Save to file</button>
+            <button id="scriptPaste" type="button">Paste</button>
+            <button id="scriptClose" type="button">Close</button>
+          </div>
+        </div>
+        <div class="hint" style="color:#888; font-size:11px; margin-top:3px;">
+          “Save to file” writes the text to /root/&lt;name&gt; via a quoted heredoc (safe for $ and backticks) — then compile with
+          <code>tcc -o prog prog.c &amp;&amp; ./prog</code>. “Paste” streams it straight into the console.
+        </div>
+      </div>
       <div id="terminal"></div>
     </div>
     <div id="coi">Establishing cross-origin isolation (threads) — one-time reload…</div>
@@ -148,6 +166,35 @@
       const runCmd = () => { if (cmd.value.trim()) { sendLine(cmd.value); cmd.value = ""; } };
       document.getElementById("cmdBtn").addEventListener("click", runCmd);
       cmd.addEventListener("keydown", (e) => { if (e.key === "Enter") runCmd(); });
+
+      // ---- multi-line script runner (companion to the in-guest tcc) ----
+      const scriptPanel = document.getElementById("scriptPanel");
+      const scriptText = document.getElementById("scriptText");
+      const scriptName = document.getElementById("scriptName");
+      document.getElementById("scriptToggle").addEventListener("click", () => {
+        scriptPanel.style.display = scriptPanel.style.display === "none" ? "block" : "none";
+      });
+      document.getElementById("scriptClose").addEventListener("click", () => {
+        scriptPanel.style.display = "none";
+      });
+      document.getElementById("scriptPaste").addEventListener("click", () => {
+        const t = scriptText.value;
+        if (t) { xterm.focus();
+          // stream the text into the console (newlines act as Enter)
+          xterm.paste(t.endsWith("\n") ? t : t + "\n");
+        }
+      });
+      document.getElementById("scriptSave").addEventListener("click", () => {
+        const t = scriptText.value;
+        if (!t) return;
+        // sanitize to a bare filename under /root/ (no path traversal)
+        const name = (scriptName.value || "prog.c").replace(/[^\w.\-]/g, "_");
+        const marker = "PI3SCRIPT_EOF_" + Date.now();
+        // quoted heredoc: content is literal ($, backticks, etc. preserved)
+        const heredoc = "cat > /root/" + name + " <<'" + marker + "'\n" + t + "\n" + marker + "\n";
+        xterm.focus();
+        xterm.paste(heredoc);
+      });
       const gpioSet = (pin, v) =>
         sendLine("echo " + pin + " > /sys/class/gpio/export 2>/dev/null; " +
                  "echo out > /sys/class/gpio/gpio" + pin + "/direction 2>/dev/null; " +

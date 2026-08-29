@@ -805,7 +805,10 @@ a real browser (`npm run dev` → Linux tab) where the worker starts cleanly.
     regex tolerates the C code's trailing newline. **Boot speed:** `module.js`
     append adds `lpj=7000000` to skip the one-time `calibrate_delay` (safe on
     arm64 where udelay is timer-based). **Terminal:** `index.html` auto-fits the
-    pty grid to its container via a `fitTerminal()` measuring the rendered cell.
+    pty grid to its container via a `fitTerminal()` measuring the rendered cell,
+    and a **Script** panel (toolbar "Script" button) streams multi-line text into
+    the console or saves it to `/root/<name>` via a quoted heredoc — a companion
+    to the in-guest `tcc` workflow.
     **ENGINE REBUILD:** `scripts/build-linux.sh` now replicates
     ktock's exact emscripten flags (README aarch64): `-O3 -DG_DISABLE_ASSERT
     -D_GNU_SOURCE -sPROXY_TO_PTHREAD=1 -sFORCE_FILESYSTEM -sALLOW_TABLE_GROWTH

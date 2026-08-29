@@ -512,6 +512,45 @@ npm install
 npm run dev        # vite dev server -> http://localhost:5173
 ```
 
+## Linux tab (real arm64 Linux in the browser)
+
+Select **linux** from the program dropdown and press Run. This boots a real
+arm64 Linux kernel (Raspberry Pi OS kernel 6.1, `raspi3ap` machine) under
+qemu-wasm inside an iframe. The root filesystem is a gzipped-cpio **initramfs**
+(busybox + glibc + headers + a static `tcc`), so the shell is a full
+programmable Linux environment, not a toy.
+
+Requirements: the page must be **cross-origin isolated** (the repo ships a
+site-root COI service worker) so the pthread/MTTCG qemu worker can start.
+
+- **Login**: user `root`, password `raspberry` (auto-filled). If getty isn't
+  active you'll see "Please press Enter to activate this console." — just
+  press Enter. Hostname is `pi3-emu`; a MOTD banner prints at boot.
+- **Command box**: type a command in the toolbar `#cmd` field and press Run
+  (or Enter).
+- **Script runner**: click **Script** to open a multi-line editor. **Paste**
+  streams the text into the console; **Save to file** writes it to
+  `/root/<name>` via a quoted heredoc (safe for `$`/backticks), ready to
+  `tcc -o prog prog.c && ./prog`.
+- **File upload**: **Upload** reads a local file, base64-encodes it, and drops
+  it into `/mnt/incoming/<name>` through busybox.
+- **GPIO**: the toolbar pins **17/18/21/22** drive real emulated GPIO via sysfs
+  over the serial console. The **Bridge** pins **23/24/25/26/27** are a true
+  device-level bridge (`pi3-ctl`): the browser sets a GPIO *input* the guest
+  reads via `GPLEV`, and guest GPIO *outputs* are forwarded back to the
+  browser (readout shows `guest→browser: G<line>=<v>`). Run `bridge-demo &`
+  in the guest, then click **Echo Test** to pulse pin 23 and watch pin 21 echo
+  back. The `pi3-ctl: ready` badge confirms the running engine supports the
+  device (the stock prebuilt engine shows `n/a`).
+- **Save/Load Disk**: snapshots the initramfs image to a file + IndexedDB
+  (N3). The running FS is tmpfs, so Save captures the loaded image, not live
+  session edits — treat it as a disk-image swap, then Reboot.
+- **Speed**: boot uses `quiet` + `lpj=` (initramfs instead of emulated SD) and
+  4 vCPUs under MTTCG. First boot can take a while under TCG; be patient.
+
+Rebuild from source with `scripts/build-linux.sh` (podman), or rely on the
+committed engine + `.data` under `public/linux/`.
+
 ## Tests (no browser needed — same wasm driven from node)
 
 ```sh
