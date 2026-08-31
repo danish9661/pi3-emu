@@ -26,7 +26,15 @@ Module['arguments'] = [
     // lpj: skip the one-time calibrate_delay pass. On arm64 udelay is timer-based
     // (arch counter), so a fixed lpj is safe and only trims boot time. Value
     // approximates the BCM2837 Cortex-A53; drop it if timing ever looks off.
-    '-append', 'console=ttyAMA0,115200 quiet lpj=7000000 initcall_blacklist=bcm2835_pm_driver_init no_console_suspend'
+    // nokaslr: skip kernel address-space randomisation (pointless under TCG).
+    // mitigations=off: disable Spectre/Meltdown mitigations — huge win under TCG
+    // where there is no speculative hardware to exploit.
+    // nowatchdog/nosoftlockup: skip the lockup detector and watchdog setup.
+    // loglevel=1: even quieter than quiet (suppresses most early-boot messages
+    // but keeps panic/warning output visible).
+    // initcall_blacklist: skip drivers that are useless or timeout under TCG
+    // with no real hardware (no USB, no ethernet PHY, no thermal, no GPU, etc.).
+    '-append', 'console=ttyAMA0,115200 loglevel=1 lpj=7000000 nokaslr mitigations=off nowatchdog nosoftlockup initcall_blacklist=bcm2835_pm_driver_init,bcm2835_cpufreq_init,bcm2835_wdt_init,leds-gpio,thermal,gpio-fan,pwm-fan,dwc2,xhci-hcd,smsc95xx,usb_ernet,rndis_host,cdc_ether,usb-storage,sdhci-iproc,i2c-bcm2835,spi-bcm2835,bcm2835-rng,brcmstb_thermal'
 ];
 (function () {
     const here = (document.currentScript && document.currentScript.src) || location.href;

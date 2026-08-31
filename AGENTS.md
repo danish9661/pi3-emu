@@ -426,7 +426,7 @@ SD card — this drops the slow/unreliable SD/MMC path (sdhci IRQ never fires
 under TCG) and is the main speed win. The cpio has a `/init` that mounts
 devtmpfs/proc/sys and hands off to busybox init; it is packed from the dev
 rootfs (`scripts/linux-rootfs`) and the `.data` (dtb ‖ kernel ‖ cpio) is now
-**committed** (~38 MB) with matching `load.js`, so Pages is self-contained.
+**committed** (~24 MB) with matching `load.js`, so Pages is self-contained.
 The Linux engine runs inside
 a same-origin `<iframe>` in the pi3-emu UI; for that iframe to be
 cross-origin isolated (SharedArrayBuffer / pthreads), the WHOLE app must be
@@ -492,19 +492,14 @@ and deliberately does **NOT** overwrite the live `public/linux/`. The
   symlinked by ktock's example Dockerfile, so no extra applet work was needed.
   How the enriched `public/linux/qemu-system-aarch64.data` was produced
   (gitignored; fetched fresh by `scripts/fetch-linux.sh`): the `.data` is a
-  flat concatenation `dtb ‖ kernel8.img ‖ rootfs.bin` (26700273 bytes, no
-  header; the ARM64 Image magic `0x644d5241` lives at Image offset 0x38, so
-  the kernel blob starts at byte 32753). We kept the **prebuilt** (fast)
-  `kernel8.img` + `bcm2710-rpi-3-b-plus.dtb` and only swapped in a freshly
-  built enriched `rootfs.bin` (built from the patched
-  `examples/raspi3ap/image` in a clone of `ktock/qemu-wasm`, with
-  `scripts/linux-rootfs/*` copied in and `rcS`/`Dockerfile` patched to install
-  them; the `mknod` step needs `fakeroot` under rootless podman). Slice:
-  `dtb = data[0:32753]`, `kernel = data[32753:22505969]`,
-  `rootfs = data[22505969:26700273]`; rebuild as
-  `Buffer.concat([prebuiltDtb, prebuiltKernel, enrichedRootfs])`. Rebuilding
-  the *kernel* too (ktock's Dockerfile uses upstream `bcm2711_defconfig`, not
-  the Pi-tuned config) makes boot ~3× slower — do NOT replace the kernel.
+  flat concatenation `dtb ‖ gzipped-kernel8.img ‖ rootfs.bin` (no header; the
+  kernel is gzip-compressed to shrink the download from 38 MB to 24 MB —
+  qemu's arm64 boot code decompresses it automatically). Slice:
+  `dtb = data[0:32753]`, `kernel (gz) = data[32753:8293822]`,
+  `rootfs = data[8293822:24630397]`; rebuild as
+  `Buffer.concat([dtb, gzipSync(kernel), rootfs])`. Rebuilding the *kernel*
+  (ktock's Dockerfile uses upstream `bcm2711_defconfig`, not the Pi-tuned
+  config) makes boot ~3× slower — do NOT replace the kernel.
   NOTE: boot time in this environment is variable/slow (>400s under load);
   the enrichment itself is correct (banner + `pi3-emu:~#` prompt verified).
 
@@ -803,8 +798,14 @@ a real browser (`npm run dev` → Linux tab) where the worker starts cleanly.
     shows a `pi3-ctl: ready` / `pi3-ctl: n/a (stock engine)` badge so the device
     support is visible without a kernel round-trip, and the `S <line> <v>` RX
     regex tolerates the C code's trailing newline. **Boot speed:** `module.js`
-    append adds `lpj=7000000` to skip the one-time `calibrate_delay` (safe on
-    arm64 where udelay is timer-based). **Terminal:** `index.html` auto-fits the
+    append adds `lpj=7000000` to skip `calibrate_delay`, `nokaslr` to skip
+    KASLR, `mitigations=off` to disable Spectre/Meltdown (huge win under TCG),
+    `nowatchdog nosoftlockup` to skip the lockup detector, `loglevel=1` for
+    minimal output, and a comprehensive `initcall_blacklist` (USB, ethernet,
+    thermal, I2C, SPI, RNG, etc.) to skip drivers that timeout or are useless
+    under TCG. The **kernel is now gzip-compressed** inside `.data` (22 MB → 8
+    MB), shrinking total `.data` from 38 MB to 24 MB — qemu's arm64 boot code
+    decompresses it automatically. **Terminal:** `index.html` auto-fits the
     pty grid to its container via a `fitTerminal()` measuring the rendered cell,
     and a **Script** panel (toolbar "Script" button) streams multi-line text into
     the console or saves it to `/root/<name>` via a quoted heredoc — a companion

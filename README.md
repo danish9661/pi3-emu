@@ -545,8 +545,10 @@ site-root COI service worker) so the pthread/MTTCG qemu worker can start.
 - **Save/Load Disk**: snapshots the initramfs image to a file + IndexedDB
   (N3). The running FS is tmpfs, so Save captures the loaded image, not live
   session edits — treat it as a disk-image swap, then Reboot.
-- **Speed**: boot uses `quiet` + `lpj=` (initramfs instead of emulated SD) and
-  4 vCPUs under MTTCG. First boot can take a while under TCG; be patient.
+- **Speed**: boot uses `quiet`/`loglevel=1`, `nokaslr`, `mitigations=off`,
+  a comprehensive `initcall_blacklist`, and `lpj=` to skip `calibrate_delay`.
+  The kernel is gzip-compressed inside `.data` (22 MB → 8 MB) for faster page
+  load. 4 vCPUs under MTTCG.
 
 Rebuild from source with `scripts/build-linux.sh` (podman), or rely on the
 committed engine + `.data` under `public/linux/`.
