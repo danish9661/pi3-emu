@@ -20,7 +20,7 @@
 // the FIFO window (DLEN bytes), runs the slave, and for reads writes the
 // response into the FIFO window; the guest reads it directly.
 
-export function createI2c(uc, ucMod, base) {
+export function createI2c(uc, ucMod, base, onBridgeData) {
   const C = base + 0x00;
   const S = base + 0x04;
   const DLEN = base + 0x08;
@@ -80,20 +80,28 @@ export function createI2c(uc, ucMod, base) {
         state.resp = [];
       }
       const start = (v & ST) !== 0 && (state.c & ST) === 0;
-      // ST is an edge: keep only I2CEN|READ latched (plus the current
-      // write's ST for the next edge test).
       state.c = v & (I2CEN | READ | ST);
       if (start) {
         state.dlen = readU32(uc, DLEN) & 0xffff;
         state.addr = readU32(uc, 0x0c) & 0x7f;
         if (v & READ) {
-          state.resp = slaveRead(state.reg);
-          state.sDone = true;
+          if (onBridgeData) {
+            // Bidirectional bridge: forward read request to browser,
+            // defer sDone until bridgeRx() provides the response.
+            state.sDone = false;
+            onBridgeData({ type: 'i2c-read', addr: state.addr, reg: state.reg, dlen: state.dlen });
+          } else {
+            state.resp = slaveRead(state.reg);
+            state.sDone = true;
+          }
         } else {
           const n = Math.min(state.dlen, 4);
           const w = readU32(uc, FIFO);
           const bytes = [w & 0xff, (w >>> 8) & 0xff, (w >>> 16) & 0xff, (w >>> 24) & 0xff];
-          state.reg = bytes[0] & 0xff; // first written byte = register address
+          state.reg = bytes[0] & 0xff;
+          if (onBridgeData) {
+            onBridgeData({ type: 'i2c-write', addr: state.addr, reg: state.reg, dlen: state.dlen });
+          }
           state.sDone = true;
         }
       }
@@ -101,7 +109,14 @@ export function createI2c(uc, ucMod, base) {
     if (readU32(uc, DONE) !== 0) state.done = true;
   }
 
-  return { state, syncOut, syncIn };
+  function bridgeRx(data) {
+    if (data && data.bytes) {
+      state.resp = data.bytes.slice();
+      state.sDone = true;
+    }
+  }
+
+  return { state, syncOut, syncIn, bridgeRx };
 }
 
 function writeU32(uc, addr, v) {

@@ -153,6 +153,7 @@ const I2C_MAX_SLICES = 30000;
 let i2cSyncOut = null;
 let i2cSyncIn = null;
 let i2cState = null;
+let i2cBridgeRx = null;
 
 // Host-arbitrated SPI0 master (see spi.js): a flash-slave JEDEC responder at
 // 0x3F204000 with a DONE host extension at +0x54. Guest parks on SPI_DONE.
@@ -161,6 +162,16 @@ const SPI_MAX_SLICES = 30000;
 let spiSyncOut = null;
 let spiSyncIn = null;
 let spiState = null;
+let spiBridgeRx = null;
+
+// ---- device bridge data forwarding (PWM/SPI/I2C) ----
+// When a bridge callback is registered, device data is forwarded to the
+// parent window via postMessage so the browser can observe/control the
+// emulated peripherals.  The parent page (or Linux iframe) can call the
+// exported bridgeRx functions to inject data back into the device.
+function onBridgeData(msg) {
+  try { window.postMessage(msg, '*'); } catch (_) {}
+}
 
 // Host-arbitrated AUX mini UART (UART1) at 0x3F215000 (see uart1.js): a
 // second console, output-only. Its chars are tagged "[u1] " per line. The
@@ -353,7 +364,7 @@ function boot(ucMod, uc, board, elf, opts = {}) {
   dmaLastCS = 0;
   dmaDone = false;
   dmaIntSeen = false;
-  const pwm = createPwm(uc, ucMod, PWM_BASE);
+  const pwm = createPwm(uc, ucMod, PWM_BASE, opts.linux ? onBridgeData : null);
   pwmSyncOut = pwm.syncOut;
   pwmSyncIn = pwm.syncIn;
   pwmState = pwm.state;
@@ -361,15 +372,17 @@ function boot(ucMod, uc, board, elf, opts = {}) {
   audioPos = 0;
   audioLen = 0;
 
-  const i2c = createI2c(uc, ucMod, I2C_BASE);
+  const i2c = createI2c(uc, ucMod, I2C_BASE, opts.linux ? onBridgeData : null);
   i2cSyncOut = i2c.syncOut;
   i2cSyncIn = i2c.syncIn;
   i2cState = i2c.state;
+  i2cBridgeRx = i2c.bridgeRx;
 
-  const spi = createSpi(uc, ucMod, SPI_BASE);
+  const spi = createSpi(uc, ucMod, SPI_BASE, opts.linux ? onBridgeData : null);
   spiSyncOut = spi.syncOut;
   spiSyncIn = spi.syncIn;
   spiState = spi.state;
+  spiBridgeRx = spi.bridgeRx;
 
   const uart1 = createUart1(uc, ucMod, UART1_BASE, uart1Emit);
   uart1SyncOut = uart1.syncOut;
@@ -1349,6 +1362,10 @@ function runLinux() {
   term.hidden = true;
   gpioPanel.hidden = true;
   fbCanvas.hidden = true;
+  const hintEl = document.getElementById('hint');
+  const oskEl = document.getElementById('osk');
+  if (hintEl) hintEl.hidden = true;
+  if (oskEl) oskEl.hidden = true;
   const linuxBoot = document.getElementById('linuxBoot');
   if (linuxBoot) { linuxBoot.hidden = false; linuxBoot.textContent = 'booting Linux…'; }
   let frame = document.getElementById('linuxframe');
@@ -1359,7 +1376,9 @@ function runLinux() {
     frame.style.height = '82vh';
     frame.style.border = '0';
     frame.style.background = '#111';
-    document.querySelector('main').appendChild(frame);
+    // Insert where the terminal was (right after the hidden <pre>), not at
+    // the end of <main> — this keeps the bar/controls below the iframe.
+    term.parentNode.insertBefore(frame, term.nextSibling);
   }
   const loaded = frame.src && frame.src.indexOf('linux/index.html') !== -1;
   if (loaded) {
@@ -1631,5 +1650,19 @@ gpioBtnEl.addEventListener('pointerleave', () => pressGpioBtn(false));
 window.addEventListener('error', (e) => {
   setStatus('ERROR: ' + (e.message || e.type));
 });
+
+// ---- PWM/SPI/I2C device bridge: accept browser→device commands ----
+// The parent page (or Linux iframe) can postMessage({ type: 'bridge-rx',
+// device: 'spi'|'i2c', ... }) to inject data into the running device model.
+window.addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || typeof d !== 'object') return;
+  if (d.type === 'bridge-rx' && d.device === 'spi' && spiBridgeRx) {
+    spiBridgeRx(d);
+  } else if (d.type === 'bridge-rx' && d.device === 'i2c' && i2cBridgeRx) {
+    i2cBridgeRx(d);
+  }
+});
+
 runBtn.addEventListener('click', run);
 run();

@@ -25,7 +25,7 @@
 // limited to [DAT1, FIFO+4) so the host's own STA/CTL refreshes (outside
 // that range) never look like guest writes.
 
-export function createPwm(uc, ucMod, base) {
+export function createPwm(uc, ucMod, base, onBridgeData) {
   const CTL = base + 0x00;
   const STA = base + 0x04;
   const DAT1 = base + 0x14;
@@ -87,9 +87,14 @@ export function createPwm(uc, ucMod, base) {
       state.ring.push(state.fifo.shift());
     }
     state.drained += take;
+    if (onBridgeData && take > 0) {
+      onBridgeData({ type: 'pwm-samples', count: take });
+    }
   }
 
-  return { state, syncOut, syncIn };
+  function bridgeRx() { /* PWM is output-only; no browser→guest data */ }
+
+  return { state, syncOut, syncIn, bridgeRx };
 }
 
 function writeU32(uc, addr, v) {

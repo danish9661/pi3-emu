@@ -116,14 +116,19 @@ patch(
 static void bcm2835_gpio_reset(DeviceState *dev)""",
 )
 
-# 6) raspi.c: include the pi3-ctl header.
+# 6) raspi.c: include the pi3-ctl and bridge headers.
 patch(
     FILES["raspi_c"],
     '#include "hw/arm/bcm2836.h"',
-    '#include "hw/arm/bcm2836.h"\n#include "hw/misc/pi3ctl.h"',
+    '#include "hw/arm/bcm2836.h"\n'
+    '#include "hw/misc/pi3ctl.h"\n'
+    '#include "hw/misc/pwm-bridge.h"\n'
+    '#include "hw/misc/spi-bridge.h"\n'
+    '#include "hw/misc/i2c-bridge.h"',
 )
 
-# 7) raspi.c: instantiate + wire pi3-ctl right after the SoC is realized.
+# 7) raspi.c: instantiate + wire pi3-ctl and PWM/SPI/I2C bridge devices
+#    right after the SoC is realized.
 patch(
     FILES["raspi_c"],
     "    qdev_realize(DEVICE(&s->soc), NULL, &error_fatal);\n",
@@ -141,7 +146,38 @@ patch(
             qdev_connect_gpio_out(pi3, i, qdev_get_gpio_in(gpio, i));
         }
     }
+
+    /* PWM/SPI/I2C bridge devices: MMIO-backed register emulation with
+     * browser forwarding via emscripten postMessage.  Each device claims
+     * the real BCM2835 peripheral address so Linux drivers can probe them
+     * and the data flows to/from the browser for monitoring/control. */
+    {
+        /* PWM bridge at 0x3F20C000 */
+        DeviceState *pwm = qdev_new(TYPE_PWM_BRIDGE);
+        object_property_add_child(OBJECT(machine), "pwm-bridge", OBJECT(pwm));
+        qdev_realize(pwm, NULL, &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(pwm), 0, 0x3F20C000);
+
+        /* SPI bridge at 0x3F204000 */
+        DeviceState *spi = qdev_new(TYPE_SPI_BRIDGE);
+        object_property_add_child(OBJECT(machine), "spi-bridge", OBJECT(spi));
+        qdev_realize(spi, NULL, &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(spi), 0, 0x3F204000);
+
+        /* I2C bridge at 0x3F804000 */
+        DeviceState *i2c = qdev_new(TYPE_I2C_BRIDGE);
+        object_property_add_child(OBJECT(machine), "i2c-bridge", OBJECT(i2c));
+        qdev_realize(i2c, NULL, &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(i2c), 0, 0x3F804000);
+    }
 """,
 )
 
+# 8) raspi.c: remove PWM, SPI, I2C from the mapBlackHole skip list so the
+#    bridge devices' MMIO takes precedence.  The skip list in main.js's
+#    mapBlackHole excludes these addresses from the zeroed-RAM region, but
+#    the C devices map their own MMIO over those addresses anyway.  This
+#    patch is a no-op for the C-side — it is the JS-side (main.js) that
+#    must be updated to remove the skip entries.  Documented here for
+#    completeness.
 print("N4 patches applied OK")

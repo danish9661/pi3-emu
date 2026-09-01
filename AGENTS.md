@@ -825,6 +825,59 @@ a real browser (`npm run dev` → Linux tab) where the worker starts cleanly.
     (pthread worker-race, see M26 caveat) — the browser-side bridge must be
     confirmed in a real browser (`npm run dev` → Linux tab → Bridge buttons).
 
+### M29 — PWM/SPI/I2C device bridges (dual-path: JS + QEMU C devices)
+
+Two-layer bridge architecture for PWM (0x3F20C000), SPI (0x3F204000),
+and I2C (0x3F804000):
+
+**Layer 1 — JS-side (bare-metal guests, immediate value):**
+Extended `src/pwm.js`, `src/spi.js`, `src/i2c.js` with:
+- Optional `onBridgeData` callback parameter (4th arg to factory)
+- Each model returns a `bridgeRx` function for browser→guest data
+- When callback is registered, device data is forwarded to the browser
+  via `window.postMessage()`
+- SPI/I2C: bridge mode defers `sDone` until `bridgeRx()` provides the
+  response (bidirectional); if no callback, hardcoded slave behavior
+  is preserved (backward compatible)
+- PWM: output-only (forward drained sample count to browser)
+- `src/main.js` wires `onBridgeData` → `window.postMessage` and adds
+  a `message` listener for `bridge-rx` commands (dispatches to
+  `spiBridgeRx` / `i2cBridgeRx`)
+
+**Layer 2 — QEMU C devices (Linux path, needs engine rebuild):**
+Three new `DEVICE` objects with MMIO regions at the BCM2835 addresses:
+
+- `scripts/linux-rootfs/pwm-bridge.{c,h}` — Type `pwm-bridge`, MMIO at
+  0x3F20C000. Emulates CTL/STA/RNG1/DAT1/FIFO. FIFO writes forwarded
+  to browser as `"PWM <count>\n"`. No browser→guest (output-only).
+- `scripts/linux-rootfs/spi-bridge.{c,h}` — Type `spi-bridge`, MMIO at
+  0x3F204000. Emulates CS/FIFO/CLK/DLEN. TX bytes forwarded as
+  `"SPI_TX <hex>\n"` on TA rise. Browser responds via
+  `EMSCRIPTEN_KEEPALIVE spi_bridge_rx("SPI_RX <hex>\n")`.
+- `scripts/linux-rootfs/i2c-bridge.{c,h}` — Type `i2c-bridge`, MMIO at
+  0x3F804000. Emulates C/S/DLEN/A/FIFO. Transfers forwarded as
+  `"I2C_TX <addr> <reg> <hex>\n"` (write) or `"I2C_RD <addr> <reg> <dlen>\n"`
+  (read). Browser responds via `EMSCRIPTEN_KEEPALIVE i2c_bridge_rx("I2C_RX <hex>\n")`.
+
+**Wiring:** `apply-n4-patches.py` extended (patches 6–8): includes new
+headers, instantiates all three bridge devices via `qdev_new` /
+`sysbus_mmio_map` after SoC realize. `build-linux.sh` step 3b copies
+the 6 new files and registers them in `hw/misc/meson.build`.
+
+**Browser UI:** `public/linux/index.html` toolbar gains:
+- `#bridgeData` span for PWM/SPI/I2C readout
+- `window.addEventListener("message")` handles `"PWM <n>"`,
+  `"SPI_TX <hex>"`, `"I2C_TX/WR/RD ..."`, `"I2C_RX ..."` strings
+- `spiBridgeSend(hex)` / `i2cBridgeSend(hex)` ccall wrappers for
+  browser→device responses
+- Bridge status badge shows `pi3-ctl: ready` when ccall is available
+
+**VERIFICATION:** JS layer verified via `npx vite build` (16 modules
+transformed, no errors). C devices compile only inside the qemu-wasm
+container (need QEMU headers); verify with `scripts/build-linux.sh`.
+Full bridge round-trip requires browser verification (`npm run dev` →
+Linux tab → bridge readout + send).
+
 ## Key risks
 
 - Core patch (Phase 1) is the big unknown: if the unicorn.js build can't

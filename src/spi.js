@@ -15,7 +15,7 @@
 // its own response writes (state.guard) so they don't re-enter the TX
 // queue. CLEAR (guest) resets the session so repeated transactions work.
 
-export function createSpi(uc, ucMod, base) {
+export function createSpi(uc, ucMod, base, onBridgeData) {
   const CS = base + 0x00;
   const FIFO = base + 0x04;
   const DONE = base + 0x54;
@@ -58,10 +58,15 @@ export function createSpi(uc, ucMod, base) {
   }
 
   function process() {
-    // Drain pending outbound bytes (they were already answered at push
-    // time); DONE means the whole response queue is available.
     if (state.tx.length > 0) {
-      state.sDone = true;
+      if (onBridgeData) {
+        // Bidirectional bridge: forward TX bytes to browser, defer DONE
+        // until bridgeRx() provides the MISO response.
+        state.sDone = false;
+        onBridgeData({ type: 'spi-tx', bytes: state.tx.slice() });
+      } else {
+        state.sDone = true;
+      }
     }
   }
 
@@ -125,7 +130,14 @@ export function createSpi(uc, ucMod, base) {
     if (readU32(uc, DONE) !== 0) state.done = true;
   }
 
-  return { state, syncOut, syncIn };
+  function bridgeRx(data) {
+    if (data && data.bytes) {
+      state.rx = data.bytes.slice();
+      state.sDone = true;
+    }
+  }
+
+  return { state, syncOut, syncIn, bridgeRx };
 }
 
 function readU32(uc, addr) {

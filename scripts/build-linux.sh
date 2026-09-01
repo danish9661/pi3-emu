@@ -87,13 +87,22 @@ else
   echo "[*] source already in container, reusing"
 fi
 
-# 3b) inject the N4 pi3-ctl device source + header, register it in meson,
-#     and apply the board/gpio wiring patches (no MMIO: pi3-ctl is wired
-#     directly to the bcm2835_gpio input/output lines by hw/arm/raspi.c).
+# 3b) inject the N4 pi3-ctl device source + header, and the PWM/SPI/I2C bridge
+#     devices, register them in meson, and apply the board/gpio wiring patches.
+#     pi3-ctl is wired directly to the bcm2835_gpio input/output lines (no MMIO);
+#     the bridge devices have MMIO at the BCM2835 peripheral addresses.
 $DOCKER cp "$ROOT/scripts/linux-rootfs/pi3ctl.c"  "$CTN:/qemu/hw/misc/pi3ctl.c"
 $DOCKER cp "$ROOT/scripts/linux-rootfs/pi3ctl.h"  "$CTN:/qemu/include/hw/misc/pi3ctl.h"
+$DOCKER cp "$ROOT/scripts/linux-rootfs/pwm-bridge.c" "$CTN:/qemu/hw/misc/pwm-bridge.c"
+$DOCKER cp "$ROOT/scripts/linux-rootfs/pwm-bridge.h" "$CTN:/qemu/include/hw/misc/pwm-bridge.h"
+$DOCKER cp "$ROOT/scripts/linux-rootfs/spi-bridge.c" "$CTN:/qemu/hw/misc/spi-bridge.c"
+$DOCKER cp "$ROOT/scripts/linux-rootfs/spi-bridge.h" "$CTN:/qemu/include/hw/misc/spi-bridge.h"
+$DOCKER cp "$ROOT/scripts/linux-rootfs/i2c-bridge.c" "$CTN:/qemu/hw/misc/i2c-bridge.c"
+$DOCKER cp "$ROOT/scripts/linux-rootfs/i2c-bridge.h" "$CTN:/qemu/include/hw/misc/i2c-bridge.h"
 $DOCKER cp "$ROOT/scripts/linux-rootfs/apply-n4-patches.py" "$CTN:/qemu/apply-n4-patches.py"
-$DOCKER exec "$CTN" bash -c "grep -q \"files('pi3ctl.c')\" /qemu/hw/misc/meson.build || printf \"system_ss.add(files('pi3ctl.c'))\n\" >> /qemu/hw/misc/meson.build"
+for f in pi3ctl pwm-bridge spi-bridge i2c-bridge; do
+  $DOCKER exec "$CTN" bash -c "grep -q \"files('${f}.c')\" /qemu/hw/misc/meson.build || printf \"system_ss.add(files('${f}.c'))\n\" >> /qemu/hw/misc/meson.build"
+done
 echo "[*] applying N4 patches"
 $DOCKER exec -w /qemu "$CTN" python3 /qemu/apply-n4-patches.py
 
