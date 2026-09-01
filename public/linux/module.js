@@ -34,7 +34,7 @@ Module['arguments'] = [
     // but keeps panic/warning output visible).
     // initcall_blacklist: skip drivers that are useless or timeout under TCG
     // with no real hardware (no USB, no ethernet PHY, no thermal, no GPU, etc.).
-    '-append', 'console=ttyAMA0,115200 loglevel=1 lpj=7000000 nokaslr mitigations=off nowatchdog nosoftlockup initcall_blacklist=bcm2835_pm_driver_init,bcm2835_cpufreq_init,bcm2835_wdt_init,leds-gpio,thermal,gpio-fan,pwm-fan,dwc2,xhci-hcd,smsc95xx,usb_ernet,rndis_host,cdc_ether,usb-storage,sdhci-iproc,i2c-bcm2835,spi-bcm2835,bcm2835-rng,brcmstb_thermal'
+    '-append', 'console=ttyAMA0,115200 loglevel=1 lpj=7000000 nokaslr mitigations=off nowatchdog nosoftlockup audit=0 cgroup_disable=memory ipv6.disable=1 cryptomgr.notests initcall_blacklist=bcm2835_pm_driver_init,bcm2835_cpufreq_init,bcm2835_wdt_init,leds-gpio,thermal,gpio-fan,pwm-fan,dwc2,xhci-hcd,smsc95xx,usb_ernet,rndis_host,cdc_ether,usb-storage,sdhci-iproc,i2c-bcm2835,spi-bcm2835,bcm2835-rng,brcmstb_thermal,snd_bcm2835,vchiq,snd_pcm,snd_timer,snd,soundcore,joydev,rfkill,bcm2835_v4l2,cfg80211,rfkill_gpio'
 ];
 (function () {
     const here = (document.currentScript && document.currentScript.src) || location.href;

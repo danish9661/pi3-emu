@@ -5,6 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Raspberry Pi 3 (BCM2837) — Linux on QEMU Wasm</title>
     <link rel="icon" href="data:," />
+    <!-- Preload the 24 MB data file (DTB + kernel + rootfs) so the browser
+         starts fetching it immediately instead of waiting for the JS engine
+         to boot and load.js to issue the XHR. Saves ~1-3 s on fast links. -->
+    <link rel="preload" href="qemu-system-aarch64.data" as="fetch" crossorigin="anonymous" />
+    <!-- Preload the 73 MB wasm engine (the single biggest download). The
+         browser begins compiling it in parallel with the data fetch. -->
+    <link rel="preload" href="qemu-system-aarch64.wasm" as="fetch" crossorigin="anonymous" />
     <link rel="stylesheet" href="./vendor/xterm.css" />
     <style>
       html, body { margin: 0; height: 100%; background: #0c0c0c; color: #ddd;
