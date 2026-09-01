@@ -15,6 +15,8 @@
 // The guest's byte at +0x40 is cleared after every slice, so repeated
 // identical characters are still detected (the window-diff pitfall).
 
+import { readU32, writeU32 } from './perf.js';
+
 export function createUart1(uc, ucMod, base, emit) {
   const IO = base + 0x40;
   const LSR = base + 0x54;
@@ -58,11 +60,4 @@ export function createUart1(uc, ucMod, base, emit) {
   return { state, syncOut, syncIn };
 }
 
-function writeU32(uc, addr, v) {
-  uc.mem_write(addr, [v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff]);
-}
 
-function readU32(uc, addr) {
-  const b = uc.mem_read(addr, 4);
-  return b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24);
-}

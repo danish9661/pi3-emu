@@ -439,7 +439,7 @@ function boot(ucMod, uc, board, elf, opts = {}) {
   rngSyncOut = rng.syncOut;
   rngSyncIn = rng.syncIn;
 
-  const temp = createTempSensor(RNG_BASE);
+  const temp = createTempSensor(RNG_BASE, rng.state);
   tempSyncOut = temp.syncOut;
 
   const clk = createClockMgr(uc, ucMod, CLK_BASE);

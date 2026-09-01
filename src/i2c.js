@@ -20,6 +20,8 @@
 // the FIFO window (DLEN bytes), runs the slave, and for reads writes the
 // response into the FIFO window; the guest reads it directly.
 
+import { readU32, writeU32 } from './perf.js';
+
 export function createI2c(uc, ucMod, base, onBridgeData) {
   const C = base + 0x00;
   const S = base + 0x04;
@@ -119,11 +121,4 @@ export function createI2c(uc, ucMod, base, onBridgeData) {
   return { state, syncOut, syncIn, bridgeRx };
 }
 
-function writeU32(uc, addr, v) {
-  uc.mem_write(addr, [v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff]);
-}
 
-function readU32(uc, addr) {
-  const b = uc.mem_read(addr, 4);
-  return b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24);
-}

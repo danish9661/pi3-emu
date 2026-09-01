@@ -24,6 +24,8 @@
 //     slice boundaries, plus a real-time de-assert when a DR read drains
 //     the last RX byte (onIrqChange).
 
+import { readU32, writeU32 } from './perf.js';
+
 export function createUart0(uc, ucMod, base, emit, onIrqChange) {
   const DR = base + 0x00;
   const FR = base + 0x18;
@@ -39,13 +41,6 @@ export function createUart0(uc, ucMod, base, emit, onIrqChange) {
 
   const state = { cr: 0, lcrh: 0, ibrd: 0, fbrd: 0, imsc: 0, rx: [], cap: 16 };
 
-  const readU32 = (uc, addr) => {
-    const b = uc.mem_read(addr, 4);
-    return b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24);
-  };
-  const writeU32 = (uc, addr, v) => {
-    uc.mem_write(addr, [v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff]);
-  };
   // The guest has enabled the UART? Read the CR window cell, which holds
   // the guest's own write (host mem_read does not trigger hooks).
   const txEnabled = () => (readU32(uc, base + 0x30) & 1) !== 0;

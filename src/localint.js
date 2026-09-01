@@ -29,6 +29,8 @@
 // MAILBOX_CTRL bits. Writing CONTROL bit n clears core n's local timer
 // (W1C, host-tracked).
 
+import { readU32, writeU32 } from './perf.js';
+
 export function createLocalInt(uc, ucMod, base, getLines) {
   const CONTROL = base + 0x00;
   const PRESCALER = base + 0x08;
@@ -59,15 +61,6 @@ export function createLocalInt(uc, ucMod, base, getLines) {
     coreTimer: [0, 0, 0, 0],
     mailbox: [0, 0, 0, 0],
     ltimer: [0, 0, 0, 0],
-  };
-
-  const readU32 = (uc, addr) => {
-    const b = uc.mem_read(addr, 4);
-    return b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24);
-  };
-
-  const writeU32 = (uc, addr, v) => {
-    uc.mem_write(addr, [v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff]);
   };
 
   // Cache lines across syncOut/syncIrq to avoid redundant arm64_debug calls.

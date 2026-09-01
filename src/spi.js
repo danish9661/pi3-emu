@@ -15,6 +15,8 @@
 // its own response writes (state.guard) so they don't re-enter the TX
 // queue. CLEAR (guest) resets the session so repeated transactions work.
 
+import { readU32, writeU32 } from './perf.js';
+
 export function createSpi(uc, ucMod, base, onBridgeData) {
   const CS = base + 0x00;
   const FIFO = base + 0x04;
@@ -140,11 +142,4 @@ export function createSpi(uc, ucMod, base, onBridgeData) {
   return { state, syncOut, syncIn, bridgeRx };
 }
 
-function readU32(uc, addr) {
-  const b = uc.mem_read(addr, 4);
-  return b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24);
-}
 
-function writeU32(uc, addr, v) {
-  uc.mem_write(addr, [v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff]);
-}

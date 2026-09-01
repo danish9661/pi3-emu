@@ -8,7 +8,9 @@
 //   +0x0C INTACK   write-1-to-acknowledge
 //   +0x10 INTEN    bit 0: data-ready interrupt enable
 
-export function createRng(uc, ucMod, base) {
+import { readU32, writeU32 } from './perf.js';
+
+export function createRng(uc, ucMod, base, peers = []) {
   const CTRL = base + 0x00;
   const STATUS = base + 0x04;
   const DATA = base + 0x08;
@@ -20,6 +22,8 @@ export function createRng(uc, ucMod, base) {
     fifo: [],
     inten: 0,
     dataReady: false,
+    touched: false,
+    inited: false,
   };
 
   function generateWord() {
@@ -31,7 +35,14 @@ export function createRng(uc, ucMod, base) {
   // Pre-fill FIFO with 1 word so the first read succeeds immediately.
   state.fifo.push(generateWord());
 
+  function onWrite() {
+    state.touched = true;
+    for (const p of peers) p.touched = true;
+  }
+  uc.hook_add(ucMod.HOOK_MEM_WRITE, onWrite, null, base, base + 0xFFF);
+
   function syncOut(uc) {
+    if (!state.touched && state.inited) return;
     const status = state.fifo.length > 0 ? 1 : 0;
     writeU32(uc, STATUS, status);
     if (state.fifo.length > 0) {
@@ -40,9 +51,12 @@ export function createRng(uc, ucMod, base) {
     if (state.dataReady) {
       writeU32(uc, DATA, state.fifo[0] || 0);
     }
+    state.inited = true;
+    state.touched = false;
   }
 
   function syncIn(uc) {
+    if (!state.touched) return;
     const ctrl = readU32(uc, CTRL);
     state.enabled = (ctrl & 1) !== 0;
     state.inten = readU32(uc, INTEN) & 1;
@@ -61,11 +75,4 @@ export function createRng(uc, ucMod, base) {
   return { state, syncOut, syncIn };
 }
 
-function readU32(uc, addr) {
-  const b = uc.mem_read(addr, 4);
-  return b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24);
-}
 
-function writeU32(uc, addr, v) {
-  uc.mem_write(addr, [v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff]);
-}

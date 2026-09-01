@@ -25,6 +25,8 @@
 // limited to [DAT1, FIFO+4) so the host's own STA/CTL refreshes (outside
 // that range) never look like guest writes.
 
+import { readU32, writeU32 } from './perf.js';
+
 export function createPwm(uc, ucMod, base, onBridgeData) {
   const CTL = base + 0x00;
   const STA = base + 0x04;
@@ -97,11 +99,4 @@ export function createPwm(uc, ucMod, base, onBridgeData) {
   return { state, syncOut, syncIn, bridgeRx };
 }
 
-function writeU32(uc, addr, v) {
-  uc.mem_write(addr, [v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff]);
-}
 
-function readU32(uc, addr) {
-  const b = uc.mem_read(addr, 4);
-  return b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24);
-}

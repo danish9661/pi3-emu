@@ -21,6 +21,8 @@
 // pending-and-enabled legacy bit. getLines() returns the host-tracked device
 // lines: { timer: C0-C3 match bits, dma0, pl011, sdhci, gpio0, gpio1, aux }.
 
+import { readU32, writeU32 } from './perf.js';
+
 export function createIc(uc, ucMod, base, getLines) {
   const PENDING_BASIC = base + 0x00;
   const PENDING1 = base + 0x04;
@@ -47,14 +49,6 @@ export function createIc(uc, ucMod, base, getLines) {
   const SC2_MASK = (1 << 21) | (1 << 22) | (1 << 23) | (1 << 24) | (1 << 25) | (1 << 30);
 
   const state = { enabled1: 0, enabled2: 0, enabledBasic: 0 };
-
-  const readU32 = (uc, addr) => {
-    const b = uc.mem_read(addr, 4);
-    return b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24);
-  };
-  const writeU32 = (uc, addr, v) => {
-    uc.mem_write(addr, [v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff]);
-  };
 
   // Host device lines -> raw bank lines.
   function rawLines() {
