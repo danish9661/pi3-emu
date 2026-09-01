@@ -11,6 +11,13 @@ import { createSdhci } from './sdhci.js';
 import { createLocalInt } from './localint.js';
 import { createIc } from './ic.js';
 import { createGpio } from './gpio.js';
+import { createRng } from './rng.js';
+import { createTempSensor } from './temp.js';
+import { createClockMgr } from './clockmgr.js';
+import { createI2s } from './i2s.js';
+import { createSpi1 } from './spi1.js';
+import { createUart25 } from './uart25.js';
+import { createUsb } from './usb.js';
 
 const UART_WINDOW = 0x1000;
 const RAM_BASE = 0x0;
@@ -203,6 +210,27 @@ let sdSyncIn = null;
 let sdState = null;
 let sdIrqActive = null;
 
+// New peripherals (M30): RNG + Temperature (share 0x3F104000 window),
+// Clock Manager (0x3F100000), I2S/PCM audio (0x3F203000),
+// AUX SPI1 (0x3F215080), USB DWC2 (0x3F980000), UART2–5 (soft bases).
+const RNG_BASE = 0x3F104000;
+const CLK_BASE = 0x3F100000;
+const I2S_BASE = 0x3F203000;
+const SPI1_BASE = 0x3F215000; // AUX block base; SPI1 regs at +0x80
+const USB_BASE = 0x3F980000;
+const UART2_BASE = 0x3F216000;
+const UART3_BASE = 0x3F217000;
+const UART4_BASE = 0x3F218000;
+const UART5_BASE = 0x3F219000;
+
+let rngSyncOut = null, rngSyncIn = null;
+let tempSyncOut = null;
+let clkSyncOut = null, clkSyncIn = null;
+let i2sSyncOut = null, i2sSyncIn = null;
+let spi1SyncOut = null, spi1SyncIn = null;
+let usbSyncOut = null, usbSyncIn = null;
+let uart25SyncOut = [], uart25SyncIn = [];
+
 export const PROGRAMS = {
   shell: 'shell.elf',
   sum: 'sum.elf',
@@ -221,6 +249,7 @@ export const PROGRAMS = {
   sd: 'sd.elf',
   uart0: 'uart0.elf',
   lirq: 'lirq.elf',
+  periphs: 'periphs.elf',
 };
 
 const term = document.getElementById('term');
@@ -298,6 +327,16 @@ function boot(ucMod, uc, board, elf, opts = {}) {
   uc.mem_map(UART1_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(SD_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(LOCAL_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  // M30: new peripheral windows
+  uc.mem_map(RNG_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  uc.mem_map(CLK_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  uc.mem_map(I2S_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  // SPI1 shares the AUX block at UART1_BASE (0x3F215000) — no separate map needed
+  uc.mem_map(USB_BASE, 0x40000, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  uc.mem_map(UART2_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  uc.mem_map(UART3_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  uc.mem_map(UART4_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+  uc.mem_map(UART5_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   gpio = createGpio(uc, ucMod, GPIO_BASE, {
     getBtn: () => gpioBtn << GPIO_BTN,
     onIrqChange: () => rearmGpuLine(uc),
@@ -395,6 +434,42 @@ function boot(ucMod, uc, board, elf, opts = {}) {
   sdState = sd.state;
   sdIrqActive = sd.irqActive;
 
+  // M30: new peripherals
+  const rng = createRng(uc, ucMod, RNG_BASE);
+  rngSyncOut = rng.syncOut;
+  rngSyncIn = rng.syncIn;
+
+  const temp = createTempSensor(RNG_BASE);
+  tempSyncOut = temp.syncOut;
+
+  const clk = createClockMgr(uc, ucMod, CLK_BASE);
+  clkSyncOut = clk.syncOut;
+  clkSyncIn = clk.syncIn;
+
+  const i2s = createI2s(uc, ucMod, I2S_BASE);
+  i2sSyncOut = i2s.syncOut;
+  i2sSyncIn = i2s.syncIn;
+
+  const spi1 = createSpi1(uc, ucMod, SPI1_BASE, opts.linux ? onBridgeData : null);
+  spi1SyncOut = spi1.syncOut;
+  spi1SyncIn = spi1.syncIn;
+
+  const usb = createUsb(uc, ucMod, USB_BASE);
+  usbSyncOut = usb.syncOut;
+  usbSyncIn = usb.syncIn;
+
+  const uart25Bases = [UART2_BASE, UART3_BASE, UART4_BASE, UART5_BASE];
+  uart25SyncOut = [];
+  uart25SyncIn = [];
+  for (let i = 0; i < uart25Bases.length; i++) {
+    const u = createUart25(uc, ucMod, uart25Bases[i], i + 2, (idx, ch) => {
+      stats.chars++;
+      board.pi_cons_push(ch);
+    });
+    uart25SyncOut.push(u.syncOut);
+    uart25SyncIn.push(u.syncIn);
+  }
+
   if (opts.linux) {
     // Map every peripheral address outside the modeled windows as plain
     // zeroed RAM — a driver probing an unmodeled device reads 0 and fails
@@ -417,6 +492,15 @@ function boot(ucMod, uc, board, elf, opts = {}) {
         [UART1_BASE, 0x1000],
         [SD_BASE, 0x1000],
         [I2C_BASE, 0x1000],
+        [RNG_BASE, 0x1000],
+        [CLK_BASE, 0x1000],
+        [I2S_BASE, 0x1000],
+        // SPI1 is inside UART1_BASE window — already skipped
+        [USB_BASE, 0x40000],
+        [UART2_BASE, 0x1000],
+        [UART3_BASE, 0x1000],
+        [UART4_BASE, 0x1000],
+        [UART5_BASE, 0x1000],
       ]
     );
     const { image, dtb: dtbRaw } = opts.linux;
@@ -1095,6 +1179,13 @@ function runSlice(count) {
   if (spiSyncOut) spiSyncOut(uc);
   if (sdSyncOut) sdSyncOut(uc);
   if (uart1SyncOut) uart1SyncOut(uc);
+  if (rngSyncOut) rngSyncOut(uc);
+  if (tempSyncOut) tempSyncOut(uc);
+  if (clkSyncOut) clkSyncOut(uc);
+  if (i2sSyncOut) i2sSyncOut(uc);
+  if (spi1SyncOut) spi1SyncOut(uc);
+  if (usbSyncOut) usbSyncOut(uc);
+  for (const s of uart25SyncOut) s(uc);
   const t0 = performance.now();
   uc.emu_start(pc, 0, 0, count);
   stats.emuMs += performance.now() - t0;
@@ -1120,6 +1211,12 @@ function runSlice(count) {
   if (sdSyncIn) sdSyncIn(uc);
   if (uart0SyncIn) uart0SyncIn(uc);
   if (uart1SyncIn) uart1SyncIn(uc);
+  if (rngSyncIn) rngSyncIn(uc);
+  if (clkSyncIn) clkSyncIn(uc);
+  if (i2sSyncIn) i2sSyncIn(uc);
+  if (spi1SyncIn) spi1SyncIn(uc);
+  if (usbSyncIn) usbSyncIn(uc);
+  for (const s of uart25SyncIn) s(uc);
   const out = drain(board);
   irqDeliver(uc);
   return out;
