@@ -15,7 +15,7 @@ import { createGpio } from './gpio.js';
 const UART_WINDOW = 0x1000;
 const RAM_BASE = 0x0;
 const RAM_SIZE = 0x400000;
-const SLICE_INSNS = 512;
+const SLICE_INSNS = 4096;
 const MAX_SLICES = 5000;
 
 // Linux boot (M23): a real arm64 kernel Image loaded at 0x200000 (the entry
@@ -1085,7 +1085,7 @@ function runSlice(count) {
     // LIRQ_MODE ticks it so Phase A's CNTP_CTL compare can fire, and Linux
     // reads CNTPCT for timekeeping (the clockevent needs it to advance too).
     const us = (performance.now() - tmrWall0) * 1000;
-    uc.arm64_timer_tick(Math.floor(us * 19.2));
+    uc.arm64_timer_tick(BigInt(Math.floor(us * 19.2)));
   }
   syncMmuOut(uc);
   syncDmaOut(uc);

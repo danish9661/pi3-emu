@@ -70,9 +70,12 @@ export function createLocalInt(uc, ucMod, base, getLines) {
     uc.mem_write(addr, [v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff]);
   };
 
+  // Cache lines across syncOut/syncIrq to avoid redundant arm64_debug calls.
+  let _cachedLines = null;
+
   // The raw pending bits for one core (before CONTROL-side masking).
-  function coreSource(core) {
-    const l = getLines();
+  function coreSource(core, cached) {
+    const l = cached || getLines();
     let s = 0;
     if (l.cntps) s |= 1 << B_CNTPS;
     if (l.cntpns) s |= 1 << B_CNTPNS;
@@ -89,14 +92,15 @@ export function createLocalInt(uc, ucMod, base, getLines) {
   }
 
   // The bits the host line tracks (arch-timer bits are owned by the core).
-  function lineSource(core) {
-    const s = coreSource(core);
+  function lineSource(core, cached) {
+    const s = coreSource(core, cached);
     return s & ~((1 << B_CNTPS) | (1 << B_CNTPNS) | (1 << B_CNTHP) | (1 << B_CNTV));
   }
 
   function syncOut(uc) {
+    _cachedLines = getLines();
     for (let i = 0; i < 4; i++) {
-      writeU32(uc, CORE_IRQ_SRC + i * 4, coreSource(i));
+      writeU32(uc, CORE_IRQ_SRC + i * 4, coreSource(i, _cachedLines));
       writeU32(uc, CORE_FIQ_SRC + i * 4, 0);
       writeU32(uc, CORE_TIMER_CTRL + i * 4, state.coreTimer[i]);
       writeU32(uc, MAILBOX_CTRL + i * 4, state.mailbox[i]);
@@ -130,7 +134,8 @@ export function createLocalInt(uc, ucMod, base, getLines) {
   // without this). Guests must de-assert through the peripheral ack paths,
   // which the host re-checks in real time via write hooks.
   function syncIrq(uc, setIrq) {
-    const src = lineSource(0);
+    const src = lineSource(0, _cachedLines);
+    _cachedLines = null;
     const want = src !== 0 ? 1 : 0;
     if (want !== state.lastLine) {
       state.lastLine = want;
