@@ -84,8 +84,6 @@ const want = {
   passed: chars.includes('sd: all checks passed'),
   parked: chars.includes('sd: parked'),
   hostDone: state.done,
-  // The exact SD init sequence then three single-block reads: sector 0
-  // (boot), 3 (root dir), 4 (data).
   initSeq: seq === '0,8,55,41,2,3,7,17,17,17',
   sectors: sectors.join(',') === '0,3,4',
   resp0: state.resp[0] === 0x900,
@@ -102,9 +100,7 @@ if (!pass) {
   console.log(chars.replace(/\r/g, ''));
 }
 
-// Phase 2: the IRQ line semantics (IRPT_EN 0x34 / IRPT_MASK 0x38). The
-// guest is parked, so drive the window directly: a fresh command sets the
-// raw status; the line is (raw & IRPT_EN & IRPT_MASK).
+// Phase 2: IRQ line semantics
 console.log('sd-probe IRQ model:');
 const IRPT_EN = SD_BASE + 0x34;
 const IRPT_MASK = SD_BASE + 0x38;
@@ -114,23 +110,18 @@ const irqCheck = (label, cond) => {
   irqChecks.push(cond);
   console.log('  ' + (cond ? 'ok ' : 'FAIL') + ' ' + label);
 };
-// Default: no enables -> no line even with raw status set.
-state.irq = IRPT_CMD_COMPLETE; // raw status via the model state
+state.irq = IRPT_CMD_COMPLETE;
 irqCheck('line low with IRPT_EN=0 (raw set)', irqActive() === false);
 state.irq = 0;
-// Enable status + signal, then a fresh command raises the line.
 writeU32(uc, IRPT_EN, IRPT_CMD_COMPLETE);
 writeU32(uc, IRPT_MASK, IRPT_CMD_COMPLETE);
 syncIn(uc);
-sd.exec(7, 0); // a guest-style CMD7 write -> exec() (host mem_write does not
-// fire the write hook, so call the model directly)
+sd.exec(7, 0);
 irqCheck('line high after CMD with EN|MASK set', irqActive() === true);
 syncOut(uc);
 irqCheck('INTERRUPT window shows CMD_COMPLETE', readU32(uc, SD_BASE + 0x30) & IRPT_CMD_COMPLETE);
-// W1C clears the raw bit -> line drops.
 sd.w1c(IRPT_CMD_COMPLETE);
 irqCheck('W1C clears the line', irqActive() === false);
-// Signal-enable off: status still latches but the line stays low.
 writeU32(uc, IRPT_MASK, 0);
 syncIn(uc);
 sd.exec(7, 0);

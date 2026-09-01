@@ -46,7 +46,15 @@
           <option value="sd">sd (FAT12 card)</option>
           <option value="uart0">uart0 (PL011)</option>
           <option value="periphs">periphs (M30 peripherals)</option>
+          <option value="debug">debug (diagnostic report)</option>
+          <option value="bench">bench (performance)</option>
           <option value="linux">linux (kernel boot)</option>
+        </select>
+        <select id="linuxConfig" style="display:none">
+          <option value="minimal" selected>minimal (fast boot)</option>
+          <option value="standard">standard (default drivers)</option>
+          <option value="full">full (all drivers)</option>
+          <option value="custom">custom (edit cmdline)</option>
         </select>
         <button id="run">Run</button>
         <span id="status">loading...</span>

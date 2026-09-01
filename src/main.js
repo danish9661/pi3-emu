@@ -250,12 +250,22 @@ export const PROGRAMS = {
   uart0: 'uart0.elf',
   lirq: 'lirq.elf',
   periphs: 'periphs.elf',
+  debug: 'debug.elf',
+  bench: 'bench.elf',
 };
 
 const term = document.getElementById('term');
 const status = document.getElementById('status');
 const runBtn = document.getElementById('run');
 const progSel = document.getElementById('prog');
+const linuxConfigSel = document.getElementById('linuxConfig');
+// Show linux config dropdown only when "linux" is selected
+if (progSel && linuxConfigSel) {
+  linuxConfigSel.hidden = progSel.value !== LINUX_MODE;
+  progSel.addEventListener('change', () => {
+    linuxConfigSel.hidden = progSel.value !== LINUX_MODE;
+  });
+}
 const statsEl = document.getElementById('stats');
 const hint = document.getElementById('hint');
 const gpioPanel = document.getElementById('gpiopanel');
@@ -449,6 +459,7 @@ function boot(ucMod, uc, board, elf, opts = {}) {
   const i2s = createI2s(uc, ucMod, I2S_BASE);
   i2sSyncOut = i2s.syncOut;
   i2sSyncIn = i2s.syncIn;
+  i2s.setAudioCallback(audioPush);
 
   const spi1 = createSpi1(uc, ucMod, SPI1_BASE, opts.linux ? onBridgeData : null);
   spi1SyncOut = spi1.syncOut;
@@ -1465,6 +1476,9 @@ function runLinux() {
   if (oskEl) oskEl.hidden = true;
   const linuxBoot = document.getElementById('linuxBoot');
   if (linuxBoot) { linuxBoot.hidden = false; linuxBoot.textContent = 'booting Linux…'; }
+  // Pass selected boot config to the iframe via window.__linuxConfig
+  const cfg = linuxConfigSel ? linuxConfigSel.value : 'minimal';
+  window.__linuxConfig = cfg;
   let frame = document.getElementById('linuxframe');
   if (!frame) {
     frame = document.createElement('iframe');
@@ -1473,8 +1487,6 @@ function runLinux() {
     frame.style.height = '82vh';
     frame.style.border = '0';
     frame.style.background = '#111';
-    // Insert where the terminal was (right after the hidden <pre>), not at
-    // the end of <main> — this keeps the bar/controls below the iframe.
     term.parentNode.insertBefore(frame, term.nextSibling);
   }
   const loaded = frame.src && frame.src.indexOf('linux/index.html') !== -1;
@@ -1484,7 +1496,7 @@ function runLinux() {
     frame.src = './linux/index.html';
   }
   frame.hidden = false;
-  setStatus('booting Linux — qemu-wasm raspi3ap (Pi 3 B+, 4× Cortex-A53, 512 MB) — serial console in the frame below');
+  setStatus('booting Linux (' + cfg + ') — qemu-wasm raspi3ap — serial console in the frame below');
   hint.textContent = 'Linux runs in the embedded frame (cross-origin isolated for threads). Press Reboot to reload the VM.';
   runBtn.textContent = 'Reboot';
   runBtn.disabled = false;

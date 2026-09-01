@@ -1,8 +1,9 @@
 // BCM2835 I2S (PCM) audio interface (0x3F203000): serial audio bus used
 // for HDMI audio, codec connections, and Hifiberry-style DACs.
 //
-// Performance: dirty-flag gated — syncOut/syncIn only run when the guest
-// writes to the I2S window or when there's FIFO data to drain.
+// Performance: dirty-flag gated. Audio output: when enabled and TXON,
+// drained samples are forwarded via an optional callback (wired to
+// Web Audio API in main.js).
 
 import { readU32, writeU32 } from './perf.js';
 
@@ -23,6 +24,8 @@ export function createI2s(uc, ucMod, base) {
   const RXR = 1 << 16;
   const TXE = 1 << 26;
 
+  let audioCallback = null;
+
   const state = {
     cs: 0,
     mode: 0,
@@ -35,6 +38,7 @@ export function createI2s(uc, ucMod, base) {
     enabled: false,
     touched: false,
     inited: false,
+    drained: 0,
   };
 
   function syncOut(uc) {
@@ -69,6 +73,14 @@ export function createI2s(uc, ucMod, base) {
     const ack = readU32(uc, INTSTC_A);
     if (ack & (1 << 9)) state.cs &= ~(1 << 9);
     if (ack & (1 << 10)) state.cs &= ~(1 << 10);
+    // Drain TX FIFO when enabled and TXON
+    if (state.enabled && (state.cs & TXON) && state.txFifo.length > 0 && audioCallback) {
+      const take = Math.min(state.txFifo.length, 64);
+      for (let i = 0; i < take; i++) {
+        audioCallback(state.txFifo.shift());
+      }
+      state.drained += take;
+    }
   }
 
   function onWrite() { state.touched = true; }
@@ -84,5 +96,5 @@ export function createI2s(uc, ucMod, base) {
   uc.hook_add(ucMod.HOOK_MEM_WRITE, onFifoWrite, null, FIFO_A, FIFO_A + 4);
   uc.hook_add(ucMod.HOOK_MEM_WRITE, onWrite, null, base, base + 0xFFF);
 
-  return { state, syncOut, syncIn };
+  return { state, syncOut, syncIn, setAudioCallback: (cb) => { audioCallback = cb; } };
 }
