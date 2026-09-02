@@ -33,19 +33,18 @@ static void snapshot_bridge_write(void *opaque, hwaddr off, uint64_t val, unsign
         s->ctrl = (uint32_t)val;
         if (val & 1) { // SAVE
             s->status = 1; // busy
-            // savevm to /tmp/pi3-snap.vmstate (MEMFS). qemu_savevm_state etc.
-            // We use the high-level snapshot API: save_snapshot("pi3-snap", ...)
             Error *err = NULL;
-            // save_snapshot("name", false, NULL, false, 0, &err) is the QAPI path;
-            // for the wasm build without block layer snapshot, we fallback to
-            // qemu_savevm_state_header + qemu_savevm_state_complete_precopy.
-            // Stub: mark ok; real impl wired during build.
-            s->status = 0x80000000; // ok (stub; real save happens in patched build)
+            bool ok = save_snapshot("pi3-snap", true, NULL, false, NULL, &err);
+            if (ok) s->status = 0x80000000;
+            else { s->status = 0x80000001; error_free(err); }
             s->ctrl &= ~1u;
         }
         if (val & 2) { // LOAD
             s->status = 1;
-            s->status = 0x80000000;
+            Error *err = NULL;
+            bool ok = load_snapshot("pi3-snap", NULL, false, NULL, &err);
+            if (ok) s->status = 0x80000000;
+            else { s->status = 0x80000001; error_free(err); }
             s->ctrl &= ~2u;
         }
     }

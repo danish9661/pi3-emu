@@ -124,7 +124,8 @@ patch(
     '#include "hw/misc/pi3ctl.h"\n'
     '#include "hw/misc/pwm-bridge.h"\n'
     '#include "hw/misc/spi-bridge.h"\n'
-    '#include "hw/misc/i2c-bridge.h"',
+    '#include "hw/misc/i2c-bridge.h"\n'
+    '#include "hw/misc/snapshot-bridge.h"',
 )
 
 # 7) raspi.c: instantiate + wire pi3-ctl and PWM/SPI/I2C bridge devices
@@ -169,6 +170,12 @@ patch(
         object_property_add_child(OBJECT(machine), "i2c-bridge", OBJECT(i2c));
         qdev_realize(i2c, NULL, &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(i2c), 0, 0x3F804000);
+
+        /* Snapshot bridge at 0x3F300800 (EMMC gap) — true VM savevm/loadvm */
+        DeviceState *snap = qdev_new(TYPE_SNAPSHOT_BRIDGE);
+        object_property_add_child(OBJECT(machine), "snapshot-bridge", OBJECT(snap));
+        qdev_realize(snap, NULL, &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(snap), 0, 0x3F300800);
     }
 """,
 )
