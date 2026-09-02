@@ -12,12 +12,15 @@ const RNG_CTRL: u32 = 0x3F10_4000;
 const CLK_PWMCLK: u32 = 0x3F10_00A0;
 const I2S_CS: u32 = 0x3F20_3000;
 const SPI1_CS: u32 = 0x3F21_5080;
+const SPI2_CS: u32 = 0x3F21_50C0;
+const I2C0_C: u32 = 0x3F20_5000;
 const USB_GSNPSID: u32 = 0x3F98_0040;
+const USB_DONE: u32 = 0x3F98_0FF0;
 const UART2_LSR: u32 = 0x3F21_6054;
 const UART3_LSR: u32 = 0x3F21_7054;
 const UART4_LSR: u32 = 0x3F21_8054;
 const UART5_LSR: u32 = 0x3F21_9054;
-const USB_DONE: u32 = 0x3F98_0054;
+
 
 #[inline(always)]
 fn mmio_read(a: u32) -> u32 {
@@ -103,6 +106,27 @@ pub extern "C" fn rust_main() -> ! {
         pass += 1;
     } else {
         puts("periphs: SPI1 ENABLES FAIL\r\n");
+        fail += 1;
+    }
+
+    // --- SPI2: AUX_ENABLES bit 2 (SPI2) ---
+    mmio_write(SPI2_CS - 0xBC, 0x04); // ENABLES at +0x04 (bit 2)
+    let spi2en = mmio_read(SPI2_CS - 0xBC);
+    if spi2en != 0 {
+        pass += 1;
+    } else {
+        puts("periphs: SPI2 ENABLES FAIL\r\n");
+        fail += 1;
+    }
+
+    // --- I2C0 (BSC0): C register should be readable ---
+    let i2c0c = mmio_read(I2C0_C);
+    if i2c0c <= 0x00FF_FFFF {
+        pass += 1;
+    } else {
+        puts("periphs: I2C0 FAIL (");
+        putx(i2c0c as u64);
+        puts(")\r\n");
         fail += 1;
     }
 

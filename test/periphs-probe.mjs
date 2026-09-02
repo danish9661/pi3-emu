@@ -13,6 +13,8 @@ const { createTempSensor } = await import(join(__dirname, '..', 'src', 'temp.js'
 const { createClockMgr } = await import(join(__dirname, '..', 'src', 'clockmgr.js'));
 const { createI2s } = await import(join(__dirname, '..', 'src', 'i2s.js'));
 const { createSpi1 } = await import(join(__dirname, '..', 'src', 'spi1.js'));
+const { createSpi2 } = await import(join(__dirname, '..', 'src', 'spi2.js'));
+const { createI2c } = await import(join(__dirname, '..', 'src', 'i2c.js'));
 const { createUart25 } = await import(join(__dirname, '..', 'src', 'uart25.js'));
 const { createUsb } = await import(join(__dirname, '..', 'src', 'usb.js'));
 
@@ -25,6 +27,8 @@ const RNG_BASE   = 0x3F104000;
 const CLK_BASE   = 0x3F100000;
 const I2S_BASE   = 0x3F203000;
 const SPI1_BASE  = 0x3F215000;
+const I2C0_BASE  = 0x3F205000;
+const SPI2_BASE  = 0x3F215000;
 const USB_BASE   = 0x3F980000;
 const UART2_BASE = 0x3F216000;
 const UART3_BASE = 0x3F217000;
@@ -39,6 +43,7 @@ uc.mem_map(RNG_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
 uc.mem_map(CLK_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
 uc.mem_map(I2S_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
 uc.mem_map(SPI1_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
+uc.mem_map(I2C0_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
 uc.mem_map(USB_BASE, 0x40000, ucMod.PROT_READ | ucMod.PROT_WRITE);
 uc.mem_map(UART2_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
 uc.mem_map(UART3_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
@@ -74,6 +79,8 @@ const temp = createTempSensor(RNG_BASE);
 const clk = createClockMgr(uc, ucMod, CLK_BASE);
 const i2s = createI2s(uc, ucMod, I2S_BASE);
 const spi1 = createSpi1(uc, ucMod, SPI1_BASE);
+const spi2 = createSpi2(uc, ucMod, SPI2_BASE);
+const i2c0 = createI2c(uc, ucMod, I2C0_BASE);
 const usb = createUsb(uc, ucMod, USB_BASE);
 const uart25Bases = [UART2_BASE, UART3_BASE, UART4_BASE, UART5_BASE];
 const uart25s = uart25Bases.map((b, i) => createUart25(uc, ucMod, b, i + 2));
@@ -87,6 +94,8 @@ function slice() {
   clk.syncOut(uc);
   i2s.syncOut(uc);
   spi1.syncOut(uc);
+  spi2.syncOut(uc);
+  i2c0.syncOut(uc);
   usb.syncOut(uc);
   for (const u of uart25s) u.syncOut(uc);
   uart0.syncOut(uc);
@@ -95,16 +104,20 @@ function slice() {
   clk.syncIn(uc);
   i2s.syncIn(uc);
   spi1.syncIn(uc);
+  spi2.syncIn(uc);
+  i2c0.syncIn(uc);
   usb.syncIn(uc);
   for (const u of uart25s) u.syncIn(uc);
   uart0.syncIn(uc);
   chars += drain();
-  // Check USB_DONE (0x3F980054)
-  const d = uc.mem_read(USB_BASE + 0x54, 4);
+  // Check USB_DONE (0x3F980FF0, moved from 0x54 to avoid GLPMCFG)
+  const d = uc.mem_read(USB_BASE + 0xFF0, 4);
   if (d[0] & 1) usbDone = true;
 }
 
 for (let i = 0; i < 30000 && !usbDone; i++) slice();
+// drain any remaining chars after DONE
+for (let i = 0; i < 5; i++) chars += drain();
 
 const want = {
   rngCtrl: chars.includes('periphs: RNG CTRL OK'),

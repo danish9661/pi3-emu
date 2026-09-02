@@ -16,6 +16,7 @@ import { createTempSensor } from './temp.js';
 import { createClockMgr } from './clockmgr.js';
 import { createI2s } from './i2s.js';
 import { createSpi1 } from './spi1.js';
+import { createSpi2 } from './spi2.js';
 import { createUart25 } from './uart25.js';
 import { createUsb } from './usb.js';
 
@@ -217,6 +218,8 @@ const RNG_BASE = 0x3F104000;
 const CLK_BASE = 0x3F100000;
 const I2S_BASE = 0x3F203000;
 const SPI1_BASE = 0x3F215000; // AUX block base; SPI1 regs at +0x80
+const I2C0_BASE = 0x3F205000; // BSC0
+const SPI2_BASE = 0x3F215000; // AUX block base; SPI2 regs at +0xC0
 const USB_BASE = 0x3F980000;
 const UART2_BASE = 0x3F216000;
 const UART3_BASE = 0x3F217000;
@@ -228,6 +231,11 @@ let tempSyncOut = null;
 let clkSyncOut = null, clkSyncIn = null;
 let i2sSyncOut = null, i2sSyncIn = null;
 let spi1SyncOut = null, spi1SyncIn = null;
+let spi1BridgeRx = null;
+let spi2SyncOut = null, spi2SyncIn = null;
+let spi2BridgeRx = null;
+let i2c0SyncOut = null, i2c0SyncIn = null;
+let i2c0BridgeRx = null;
 let usbSyncOut = null, usbSyncIn = null;
 let uart25SyncOut = [], uart25SyncIn = [];
 
@@ -341,7 +349,8 @@ function boot(ucMod, uc, board, elf, opts = {}) {
   uc.mem_map(RNG_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(CLK_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(I2S_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
-  // SPI1 shares the AUX block at UART1_BASE (0x3F215000) — no separate map needed
+  // SPI1/SPI2 share the AUX block at UART1_BASE (0x3F215000) — no separate map needed
+  uc.mem_map(I2C0_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(USB_BASE, 0x40000, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(UART2_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
   uc.mem_map(UART3_BASE, UART_WINDOW, ucMod.PROT_READ | ucMod.PROT_WRITE);
@@ -464,6 +473,17 @@ function boot(ucMod, uc, board, elf, opts = {}) {
   const spi1 = createSpi1(uc, ucMod, SPI1_BASE, opts.linux ? onBridgeData : null);
   spi1SyncOut = spi1.syncOut;
   spi1SyncIn = spi1.syncIn;
+  spi1BridgeRx = spi1.bridgeRx;
+
+  const spi2 = createSpi2(uc, ucMod, SPI2_BASE, opts.linux ? onBridgeData : null);
+  spi2SyncOut = spi2.syncOut;
+  spi2SyncIn = spi2.syncIn;
+  spi2BridgeRx = spi2.bridgeRx;
+
+  const i2c0 = createI2c(uc, ucMod, I2C0_BASE, opts.linux ? onBridgeData : null);
+  i2c0SyncOut = i2c0.syncOut;
+  i2c0SyncIn = i2c0.syncIn;
+  i2c0BridgeRx = i2c0.bridgeRx;
 
   const usb = createUsb(uc, ucMod, USB_BASE);
   usbSyncOut = usb.syncOut;
@@ -503,10 +523,11 @@ function boot(ucMod, uc, board, elf, opts = {}) {
         [UART1_BASE, 0x1000],
         [SD_BASE, 0x1000],
         [I2C_BASE, 0x1000],
+        [I2C0_BASE, 0x1000],
         [RNG_BASE, 0x1000],
         [CLK_BASE, 0x1000],
         [I2S_BASE, 0x1000],
-        // SPI1 is inside UART1_BASE window — already skipped
+        // SPI1/SPI2 share UART1_BASE window — already skipped
         [USB_BASE, 0x40000],
         [UART2_BASE, 0x1000],
         [UART3_BASE, 0x1000],
@@ -1195,6 +1216,8 @@ function runSlice(count) {
   if (clkSyncOut) clkSyncOut(uc);
   if (i2sSyncOut) i2sSyncOut(uc);
   if (spi1SyncOut) spi1SyncOut(uc);
+  if (spi2SyncOut) spi2SyncOut(uc);
+  if (i2c0SyncOut) i2c0SyncOut(uc);
   if (usbSyncOut) usbSyncOut(uc);
   for (const s of uart25SyncOut) s(uc);
   const t0 = performance.now();
@@ -1226,6 +1249,8 @@ function runSlice(count) {
   if (clkSyncIn) clkSyncIn(uc);
   if (i2sSyncIn) i2sSyncIn(uc);
   if (spi1SyncIn) spi1SyncIn(uc);
+  if (spi2SyncIn) spi2SyncIn(uc);
+  if (i2c0SyncIn) i2c0SyncIn(uc);
   if (usbSyncIn) usbSyncIn(uc);
   for (const s of uart25SyncIn) s(uc);
   const out = drain(board);
@@ -1761,16 +1786,14 @@ window.addEventListener('error', (e) => {
 });
 
 // ---- PWM/SPI/I2C device bridge: accept browser→device commands ----
-// The parent page (or Linux iframe) can postMessage({ type: 'bridge-rx',
-// device: 'spi'|'i2c', ... }) to inject data into the running device model.
 window.addEventListener('message', (e) => {
   const d = e.data;
   if (!d || typeof d !== 'object') return;
-  if (d.type === 'bridge-rx' && d.device === 'spi' && spiBridgeRx) {
-    spiBridgeRx(d);
-  } else if (d.type === 'bridge-rx' && d.device === 'i2c' && i2cBridgeRx) {
-    i2cBridgeRx(d);
-  }
+  if (d.type === 'bridge-rx' && d.device === 'spi' && spiBridgeRx) spiBridgeRx(d);
+  else if (d.type === 'bridge-rx' && d.device === 'spi1' && spi1BridgeRx) spi1BridgeRx?.(d);
+  else if (d.type === 'bridge-rx' && d.device === 'spi2' && spi2BridgeRx) spi2BridgeRx(d);
+  else if (d.type === 'bridge-rx' && d.device === 'i2c' && i2cBridgeRx) i2cBridgeRx(d);
+  else if (d.type === 'bridge-rx' && d.device === 'i2c0' && i2c0BridgeRx) i2c0BridgeRx(d);
 });
 
 runBtn.addEventListener('click', run);
