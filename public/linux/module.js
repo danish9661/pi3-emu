@@ -38,8 +38,8 @@ Module['arguments'] = [
     '-accel', 'tcg,tb-size=500,thread=multi', '-smp', '4,sockets=4',
     '-dtb', '/pack/bcm2710-rpi-3-b-plus.dtb',
     '-kernel', '/pack/kernel8.img',
-    '-initrd', '/pack/rootfs.bin',
-    '-append', KERNEL_COMMON + ' ' + LOGLEVEL + ' ' + (BLACKLISTS[bootConfig] || BLACKLISTS.minimal)
+    '-drive', 'file=/pack/rootfs.bin,format=raw,if=sd',
+    '-append', KERNEL_COMMON + ' root=/dev/mmcblk0 rootwait ' + LOGLEVEL + ' ' + (BLACKLISTS[bootConfig] || BLACKLISTS.minimal)
 ];
 
 (function () {

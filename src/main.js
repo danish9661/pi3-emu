@@ -269,9 +269,9 @@ const progSel = document.getElementById('prog');
 const linuxConfigSel = document.getElementById('linuxConfig');
 // Show linux config dropdown only when "linux" is selected
 if (progSel && linuxConfigSel) {
-  linuxConfigSel.hidden = progSel.value !== LINUX_MODE;
+  linuxConfigSel.style.display = progSel.value === LINUX_MODE ? 'inline-block' : 'none';
   progSel.addEventListener('change', () => {
-    linuxConfigSel.hidden = progSel.value !== LINUX_MODE;
+    linuxConfigSel.style.display = progSel.value === LINUX_MODE ? 'inline-block' : 'none';
   });
 }
 const statsEl = document.getElementById('stats');

@@ -120,6 +120,7 @@
       import initEmscriptenModule from './out.js';
       const xterm = new Terminal({ fontSize: 13, cursorBlink: true });
       xterm.open(document.getElementById("terminal"));
+      window.xterm = xterm; window.sendLine = (s) => { xterm.focus(); xterm.paste(s + "\r"); };
       xterm.focus();
 
       // ---- terminal auto-fit: size the pty grid to the container ----
