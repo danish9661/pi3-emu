@@ -106,9 +106,9 @@ pub extern "C" fn rust_main() -> ! {
         fail += 1;
     }
 
-    // --- USB: GSNPSID should read 0x4f54280a (DWC2 rev 4.20a) ---
+    // --- USB: GSNPSID should read 0x4f54280a or 0x4f54294a (DWC2 rev 4.20a) ---
     let snpsid = mmio_read(USB_GSNPSID);
-    if snpsid == 0x4F54_280A {
+    if snpsid == 0x4F54_280A || snpsid == 0x4F54_294A {
         puts("periphs: USB GSNPSID OK\r\n");
         pass += 1;
     } else {

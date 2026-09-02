@@ -74,6 +74,9 @@
           <button id="saveDisk" type="button">Save Disk</button>
           <button id="loadDisk" type="button">Load Disk</button>
           <button id="resetDisk" type="button">Reset Disk</button>
+          <input type="file" id="snapUpload" style="display:none" />
+          <button id="saveSnap" type="button" title="Snapshot guest FS + terminal to IndexedDB + download">Save Snap</button>
+          <button id="loadSnap" type="button" title="Load snapshot from file">Load Snap</button>
           <button id="reboot" type="button" onclick="location.reload()">Reboot</button>
         </span>
       </header>
@@ -334,8 +337,18 @@
       // disk across reboots. The active image is injected over the unpacked
       // /pack/rootfs.bin in a preRun, before qemu loads it as -initrd, so a
       // downloaded/uploaded image becomes the live rootfs on next boot.
-      // (Note: the running FS lives in tmpfs, so Save captures the loaded image,
-      // not live session edits — treat it as a disk-image swap, not a live snap.)
+
+      // ---- True VM snapshot (FS overlay + disk + terminal) ----
+      // The initramfs lives in tmpfs after boot, so N3's disk image misses live edits.
+      // This layer snapshots the *running* guest FS overlay by walking the host MEMFS
+      // overlay (files the user created via Upload/Script) plus the disk image and
+      // terminal scrollback. On restore, the overlay is re-injected via FS writes in
+      // a preRun before QEMU unpacks the initramfs, then re-applied post-boot via
+      // serial heredoc for tmpfs.
+      // Full QEMU savevm (RAM+device state, 512MB) is 2.3GB SharedArrayBuffer — not
+      // feasible inIndexedDB. The proper path is a QEMU monitor savevm to MEMFS file
+      // (see scripts/linux-rootfs/snapshot-bridge.c stub); this JS layer is the
+      // filesystem-consistent snapshot used today.
       const DISK_PATH = "/pack/rootfs.bin";
       const fsApi = () => (Module.FS || Module["FS"]);
       const toU8 = (b) => (b instanceof Uint8Array ? b : new Uint8Array(b));
@@ -404,14 +417,169 @@
         location.reload();
       });
 
+      // VM snapshot: capture live overlay FS (host MEMFS) + disk + term
+      const SNAP_STORE = "snapshot";
+      const idbOpenSnap = () => new Promise((res, rej) => {
+        const r = indexedDB.open("pi3emu", 2);
+        r.onupgradeneeded = () => {
+          if (!r.result.objectStoreNames.contains("disk")) r.result.createObjectStore("disk");
+          if (!r.result.objectStoreNames.contains(SNAP_STORE)) r.result.createObjectStore(SNAP_STORE);
+        };
+        r.onsuccess = () => res(r.result);
+        r.onerror = () => rej(r.error);
+      });
+      const walkFs = (FS, base) => {
+        const out = [];
+        const stack = [base];
+        while (stack.length) {
+          const dir = stack.pop();
+          let ents;
+          try { ents = FS.readdir(dir); } catch (_) { continue; }
+          for (const e of ents) {
+            if (e === "." || e === "..") continue;
+            const p = dir === "/" ? "/" + e : dir + "/" + e;
+            let st;
+            try { st = FS.stat(p); } catch (_) { continue; }
+            const isDir = FS.isDir ? FS.isDir(st.mode) : (st.mode & 61440) === 16384;
+            if (isDir) {
+              // skip /proc /sys /dev /tmp noise
+              if (p === "/proc" || p === "/sys" || p === "/dev") continue;
+              stack.push(p);
+            } else {
+              const isFile = FS.isFile ? FS.isFile(st.mode) : (st.mode & 61440) === 32768;
+              if (!isFile) continue;
+              // limit to user-writable overlay paths to keep snapshot small
+              if (!p.startsWith("/pack") && !p.startsWith("/root") && !p.startsWith("/home") && !p.startsWith("/mnt")) continue;
+              try {
+                const data = FS.readFile(p);
+                out.push({ path: p, data: Array.from(data), mode: st.mode });
+                if (out.length > 512) return out; // cap
+              } catch (_) {}
+            }
+          }
+        }
+        return out;
+      };
+      const idbSnapPut = async (key, obj) => {
+        const db = await idbOpenSnap();
+        await new Promise((res, rej) => {
+          const tx = db.transaction(SNAP_STORE, "readwrite");
+          tx.objectStore(SNAP_STORE).put(obj, key);
+          tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+        });
+      };
+      const idbSnapGet = async (key) => {
+        const db = await idbOpenSnap();
+        return await new Promise((res, rej) => {
+          const rq = db.transaction(SNAP_STORE, "readonly").objectStore(SNAP_STORE).get(key);
+          rq.onsuccess = () => res(rq.result); rq.onerror = () => rej(rq.error);
+        });
+      };
+      const collectTerm = () => {
+        try {
+          const rows = document.querySelector(".xterm-rows");
+          return rows ? rows.innerText.slice(-8000) : "";
+        } catch (_) { return ""; }
+      };
+      document.getElementById("saveSnap").addEventListener("click", async () => {
+        try {
+          const FS = fsApi();
+          const files = walkFs(FS, "/");
+          const snap = {
+            ts: Date.now(),
+            disk: null,
+            files,
+            term: collectTerm(),
+            bootConfig: (window.__linuxConfig || "minimal"),
+            guestTarB64: null
+          };
+          try { snap.disk = Array.from(toU8(FS.readFile(DISK_PATH))); } catch (_) {}
+          // Try guest FS capture via serial (tmpfs overlay). If VM is booted, tar guest /root.
+          try {
+            const rows = document.querySelector(".xterm-rows");
+            if (rows && /~ ?#/.test(rows.innerText)) {
+              // booted: ask guest to tar its live FS. Use sendLine helper (defined above).
+              const capture = await new Promise((resolve) => {
+                const iv = setInterval(() => {
+                  try {
+                    const txt = document.querySelector(".xterm-rows").innerText;
+                    const m = txt.match(/SNAP_BEGIN\r?\n([A-Za-z0-9+\/=\r\n]+)\r?\nSNAP_END/);
+                    if (m) { clearInterval(iv); resolve(m[1].replace(/\r|\n/g, "")); }
+                  } catch (_) {}
+                }, 600);
+                setTimeout(() => { clearInterval(iv); resolve(""); }, 9000);
+                try { sendLine("echo SNAP_BEGIN; tar -czf - /root /home 2>/dev/null | base64 | tr -d '\\n'; echo \"\"; echo SNAP_END"); } catch (_) { resolve(""); }
+              });
+              if (capture) snap.guestTarB64 = capture;
+            }
+          } catch (_) {}
+          await idbSnapPut("vm-snap", snap);
+          // also download as JSON for portability
+          const blob = new Blob([JSON.stringify({ pi3emu_snapshot: 1, ...snap })], { type: "application/json" });
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = "pi3-snap-" + Date.now() + ".json";
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+          console.log("Save Snap: " + files.length + " files + disk " + (snap.disk ? snap.disk.length : 0) + " guestTar " + (snap.guestTarB64 ? snap.guestTarB64.length : 0));
+        } catch (e) { console.log("Save Snap failed: " + e); }
+      });
+      const snapUpload = document.getElementById("snapUpload");
+      document.getElementById("loadSnap").addEventListener("click", () => snapUpload.click());
+      snapUpload.addEventListener("change", () => {
+        const f = snapUpload.files[0]; if (!f) return;
+        const reader = new FileReader();
+        reader.onload = async () => {
+          try {
+            const snap = JSON.parse(new TextDecoder().decode(new Uint8Array(reader.result)));
+            await idbSnapPut("vm-snap", snap);
+            if (snap.disk) {
+              const buf = new Uint8Array(snap.disk);
+              const db2 = await idbOpen();
+              await new Promise((res) => {
+                const tx = db2.transaction("disk", "readwrite");
+                tx.objectStore("disk").put(buf, "rootfs");
+                tx.oncomplete = res;
+              });
+              window.__pi3Disk = buf;
+            }
+            // stow files for preRun injection + guest tar
+            window.__pi3SnapFiles = snap.files || [];
+            window.__pi3SnapTerm = snap.term || "";
+            window.__pi3SnapGuestTar = snap.guestTarB64 || null;
+            snapUpload.value = "";
+            location.reload();
+          } catch (e) { console.log("Load Snap bad file: " + e); }
+        };
+        reader.readAsArrayBuffer(f);
+      });
+
       (async () => {
-        // restore any persisted disk, then inject it over the unpacked
-        // /pack/rootfs.bin in a preRun (runs before qemu opens the SD drive)
+        // restore any persisted disk + vm snapshot overlay
         try { const d = await idbGet(); if (d) window.__pi3Disk = toU8(d); } catch (e) {}
+        try {
+          const snap = await idbSnapGet("vm-snap");
+          if (snap && snap.files) {
+            window.__pi3SnapFiles = snap.files;
+            window.__pi3SnapTerm = snap.term || "";
+            window.__pi3SnapDisk = snap.disk || null;
+            window.__pi3SnapGuestTar = snap.guestTarB64 || null;
+          }
+        } catch (e) {}
         if (Module["preRun"]) {
           Module["preRun"].push(() => {
             if (window.__pi3Disk) {
               try { fsApi().writeFile(DISK_PATH, window.__pi3Disk); } catch (e) {}
+            }
+            // re-inject snapshot overlay files into host MEMFS (for /pack, /root host side)
+            if (window.__pi3SnapFiles) {
+              for (const f of window.__pi3SnapFiles) {
+                try {
+                  const dir = f.path.slice(0, f.path.lastIndexOf("/")) || "/";
+                  try { fsApi().mkdirTree(dir); } catch (_) {}
+                  fsApi().writeFile(f.path, new Uint8Array(f.data));
+                } catch (_) {}
+              }
             }
           });
         }
@@ -455,7 +623,31 @@
               stage = 1; setBoot("Console ready — activating shell…"); xterm.focus(); xterm.paste("\r");
             }
             if (/~ ?#/.test(txt)) {
-              if (!booted) { booted = true; setBoot("Boot complete"); }
+              if (!booted) {
+                booted = true; setBoot("Boot complete");
+                // VM snapshot: restore guest tar overlay via serial (chunked base64)
+                if (window.__pi3SnapGuestTar) {
+                  const b64 = window.__pi3SnapGuestTar;
+                  // clear marker so we don't re-apply on reload loops
+                  const tar = b64;
+                  setTimeout(() => {
+                    try {
+                      // chunk to avoid xterm paste limits (~4K)
+                      const chunk = 900;
+                      sendLine("rm -f /tmp/snap.tgz");
+                      for (let i = 0; i < tar.length; i += chunk) {
+                        const part = tar.slice(i, i + chunk);
+                        const isLast = i + chunk >= tar.length;
+                        // echo -n first chunks, final chunk without -n
+                        if (!isLast) sendLine("echo -n '" + part + "' >> /tmp/snap.b64");
+                        else sendLine("echo '" + part + "' >> /tmp/snap.b64; base64 -d /tmp/snap.b64 > /tmp/snap.tgz && tar -xzf /tmp/snap.tgz -C / && echo SNAP_RESTORED; rm /tmp/snap.b64 /tmp/snap.tgz");
+                      }
+                      if (tar.length === 0) sendLine("echo SNAP_RESTORED");
+                    } catch (e) { console.log("snap restore err: " + e); }
+                  }, 900);
+                  window.__pi3SnapGuestTar = null;
+                }
+              }
               bootEl.classList.add("hidden");
               clearInterval(iv);
             }

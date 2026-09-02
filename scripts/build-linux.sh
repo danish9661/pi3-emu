@@ -91,6 +91,7 @@ fi
 #     devices, register them in meson, and apply the board/gpio wiring patches.
 #     pi3-ctl is wired directly to the bcm2835_gpio input/output lines (no MMIO);
 #     the bridge devices have MMIO at the BCM2835 peripheral addresses.
+#     Snapshot bridge (true VM savevm) is a stub MMIO at 0x3F300800.
 $DOCKER cp "$ROOT/scripts/linux-rootfs/pi3ctl.c"  "$CTN:/qemu/hw/misc/pi3ctl.c"
 $DOCKER cp "$ROOT/scripts/linux-rootfs/pi3ctl.h"  "$CTN:/qemu/include/hw/misc/pi3ctl.h"
 $DOCKER cp "$ROOT/scripts/linux-rootfs/pwm-bridge.c" "$CTN:/qemu/hw/misc/pwm-bridge.c"
@@ -99,8 +100,10 @@ $DOCKER cp "$ROOT/scripts/linux-rootfs/spi-bridge.c" "$CTN:/qemu/hw/misc/spi-bri
 $DOCKER cp "$ROOT/scripts/linux-rootfs/spi-bridge.h" "$CTN:/qemu/include/hw/misc/spi-bridge.h"
 $DOCKER cp "$ROOT/scripts/linux-rootfs/i2c-bridge.c" "$CTN:/qemu/hw/misc/i2c-bridge.c"
 $DOCKER cp "$ROOT/scripts/linux-rootfs/i2c-bridge.h" "$CTN:/qemu/include/hw/misc/i2c-bridge.h"
+$DOCKER cp "$ROOT/scripts/linux-rootfs/snapshot-bridge.c" "$CTN:/qemu/hw/misc/snapshot-bridge.c"
+$DOCKER cp "$ROOT/scripts/linux-rootfs/snapshot-bridge.h" "$CTN:/qemu/include/hw/misc/snapshot-bridge.h"
 $DOCKER cp "$ROOT/scripts/linux-rootfs/apply-n4-patches.py" "$CTN:/qemu/apply-n4-patches.py"
-for f in pi3ctl pwm-bridge spi-bridge i2c-bridge; do
+for f in pi3ctl pwm-bridge spi-bridge i2c-bridge snapshot-bridge; do
   $DOCKER exec "$CTN" bash -c "grep -q \"files('${f}.c')\" /qemu/hw/misc/meson.build || printf \"system_ss.add(files('${f}.c'))\n\" >> /qemu/hw/misc/meson.build"
 done
 echo "[*] applying N4 patches"

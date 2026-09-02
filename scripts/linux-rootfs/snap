@@ -1,0 +1,22 @@
+#!/bin/sh
+# /bin/snap — guest-side helper for VM snapshot (FS overlay)
+# Usage: snap save  -> tar /root /home /etc/mnt to /tmp/snap.tgz + base64 to stdout
+#        snap load  -> expects base64 on stdin, restores to /
+# Called from host harness via serial: `snap save` then capture SNAP_BEGIN..SNAP_END
+set -e
+case "$1" in
+  save)
+    echo "SNAP_BEGIN"
+    tar -czf - /root /home /etc 2>/dev/null | base64 | tr -d '\n'
+    echo ""
+    echo "SNAP_END"
+    ;;
+  load)
+    base64 -d > /tmp/snap.tgz
+    tar -xzf /tmp/snap.tgz -C /
+    echo "restored"
+    ;;
+  *)
+    echo "usage: snap save|load"
+    ;;
+esac

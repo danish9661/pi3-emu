@@ -18,9 +18,14 @@ if (bootConfig === 'minimal' && location.hash) {
 const KERNEL_COMMON = 'console=ttyAMA0,115200 lpj=7000000 nokaslr mitigations=off nowatchdog nosoftlockup audit=0 cgroup_disable=memory ipv6.disable=1 cryptomgr.notests';
 
 const BLACKLISTS = {
+  // minimal: fastest boot, USB fully blacklisted (OTG PHY not needed)
   minimal: 'initcall_blacklist=bcm2835_pm_driver_init,bcm2835_cpufreq_init,bcm2835_wdt_init,leds-gpio,thermal,gpio-fan,pwm-fan,dwc2,xhci-hcd,smsc95xx,usb_ernet,rndis_host,cdc_ether,usb-storage,sdhci-iproc,i2c-bcm2835,spi-bcm2835,bcm2835-rng,brcmstb_thermal,snd_bcm2835,vchiq,snd_pcm,snd_timer,snd,soundcore,joydev,rfkill,bcm2835_v4l2,cfg80211,rfkill_gpio',
+  // standard: balanced, USB still blacklisted (needs OTG PHY, slow)
   standard: 'initcall_blacklist=bcm2835_pm_driver_init,bcm2835_cpufreq_init,bcm2835_wdt_init,thermal,gpio-fan,pwm-fan,dwc2,xhci-hcd,smsc95xx,usb_ernet,rndis_host,cdc_ether,usb-storage,brcmstb_thermal,snd_bcm2835,vchiq,joydev,rfkill,bcm2835_v4l2,cfg80211,rfkill_gpio',
-  full: 'initcall_blacklist=dwc2,xhci-hcd,smsc95xx,usb_ernet,rndis_host,cdc_ether,usb-storage',
+  // usb: enables dwc2 host stack (needs our OTG PHY in src/usb.js / QEMU dwc2). Slower (~+5-8s), enables downstream usb-storage/ernet.
+  usb: 'initcall_blacklist=bcm2835_pm_driver_init,bcm2835_cpufreq_init,leds-gpio,thermal,gpio-fan,pwm-fan,smsc95xx,usb_ernet,rndis_host,cdc_ether,usb-storage,sdhci-iproc,i2c-bcm2835,spi-bcm2835,bcm2835-rng,brcmstb_thermal,snd_bcm2835,vchiq,joydev,rfkill,bcm2835_v4l2,cfg80211,rfkill_gpio',
+  // full: all drivers (includes dwc2 + usb-storage + xhci). Slowest, most complete. OTG PHY must handle VBUS/session.
+  full: 'initcall_blacklist=bcm2835_pm_driver_init,bcm2835_cpufreq_init,thermal,gpio-fan,pwm-fan,brcmstb_thermal,snd_bcm2835,vchiq,joydev,rfkill,bcm2835_v4l2,cfg80211,rfkill_gpio',
   custom: 'initcall_blacklist=bcm2835_pm_driver_init,bcm2835_cpufreq_init,bcm2835_wdt_init,thermal,gpio-fan,pwm-fan,dwc2,xhci-hcd,smsc95xx,usb_ernet,rndis_host,cdc_ether,usb-storage,sdhci-iproc,brcmstb_thermal,snd_bcm2835,vchiq,joydev,rfkill,bcm2835_v4l2,cfg80211,rfkill_gpio',
 };
 
