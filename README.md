@@ -581,7 +581,13 @@ Benchmark it yourself (needs a browser + the dev server; ~1–2 min per run):
 ```sh
 node test/linux-boot-bench.mjs             # auto  -> MTTCG numbers (SAB on)
 node test/linux-boot-bench.mjs threads=off # single-thread numbers (needs linux-st/)
+node test/linux-tb-matrix.mjs 128,256,500  # tb-size sweep (?tb=, default 500)
 ```
+
+Swept `tb-size` 128/256/500 on the MT engine: 38 s / 40 s / 40 s to shell —
+no meaningful delta (host-load variance dominates), so the default stays
+500 for translation-cache headroom. The knob remains (`?tb=`, `#tb=`,
+`window.__linuxTb`) for weak devices where a smaller cache may help.
 
 Measured here (headless Chrome, dev server, warm cache):
 

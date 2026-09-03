@@ -910,6 +910,10 @@ Linux tab → bridge readout + send).
   tb-size + overhead).
 - **Bench table lives in README** ("SharedArrayBuffer on/off"); ST column
   stays "blocked" until the backend work lands.
+- **Do NOT move the wasm/.data blobs to Git LFS** (GH001 warning
+  notwithstanding): GitHub Pages serves LFS pointers instead of file
+  contents, which would break the live emulator. Large binaries in plain
+  git are the deliberate trade-off.
 
 ## Key risks
 

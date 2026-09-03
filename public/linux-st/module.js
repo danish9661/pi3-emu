@@ -9,6 +9,7 @@ if (typeof Module === 'undefined') {
 let bootConfig = 'minimal';
 let threadsRequested = 'auto'; // auto | on | off
 let threadsFromDefault = true; // set false by any explicit source below
+let tbSize = '500'; // TCG translation-block cache in MB (tunable ?tb=)
 try {
   if (window.parent && window.parent !== window) {
     if (window.parent.__linuxConfig) bootConfig = window.parent.__linuxConfig;
@@ -16,12 +17,14 @@ try {
       threadsRequested = window.parent.__linuxThreads;
       threadsFromDefault = false;
     }
+    if (window.parent.__linuxTb) tbSize = window.parent.__linuxTb;
   }
 } catch (_) {}
 try {
   const q = new URLSearchParams(location.search || '');
   if (q.get('cfg')) bootConfig = q.get('cfg');
   if (q.get('threads')) { threadsRequested = q.get('threads'); threadsFromDefault = false; }
+  if (q.get('tb')) tbSize = q.get('tb');
 } catch (_) {}
 if (location.hash) {
   const h = location.hash.replace(/^#/, '');
@@ -32,9 +35,11 @@ if (location.hash) {
       const hp = new URLSearchParams(h);
       if (hp.get('cfg')) bootConfig = hp.get('cfg');
       if (hp.get('threads')) { threadsRequested = hp.get('threads'); threadsFromDefault = false; }
+      if (hp.get('tb')) tbSize = hp.get('tb');
     } catch (_) {}
   }
 }
+if (!/^[0-9]{2,4}$/.test(tbSize)) tbSize = '500';
 if (['auto', 'on', 'off'].indexOf(threadsRequested) === -1) threadsRequested = 'auto';
 // Direct loads with no explicit source honor the stored user pick (set by
 // SabToggle.bindSelect/setPreference on any page using this library).
@@ -111,7 +116,7 @@ Module['arguments'] = IS_ST_ENGINE ? [
     '-nic', 'none',
     '-M', 'raspi3ap', '-nographic',
     '-m', '512M',
-    '-accel', 'tcg,tb-size=500,thread=' + threadsEffective, '-smp', '4,sockets=4',
+    '-accel', 'tcg,tb-size=' + tbSize + ',thread=' + threadsEffective, '-smp', '4,sockets=4',
     '-dtb', '/pack/bcm2710-rpi-3-b-plus.dtb',
     '-kernel', '/pack/kernel8.img',
     '-initrd', '/pack/rootfs.bin',
@@ -120,7 +125,7 @@ Module['arguments'] = IS_ST_ENGINE ? [
     '-nic', 'none',
     '-M', 'raspi3ap', '-nographic',
     '-m', '512M',
-    '-accel', 'tcg,tb-size=500,thread=' + threadsEffective, '-smp', '4,sockets=4',
+    '-accel', 'tcg,tb-size=' + tbSize + ',thread=' + threadsEffective, '-smp', '4,sockets=4',
     '-dtb', '/pack/bcm2710-rpi-3-b-plus.dtb',
     '-kernel', '/pack/kernel8.img',
     '-drive', 'file=/pack/rootfs.bin,format=raw,if=sd',
