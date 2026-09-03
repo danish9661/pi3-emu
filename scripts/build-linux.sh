@@ -62,15 +62,22 @@ CTN="build-qemu-wasm"
 # passed via --extra-cflags AND --extra-ldflags so they reach both compile and
 # link (qemu's final link only uses LDFLAGS).
 PTY_LIB="/opt/xterm-pty/node_modules/xterm-pty/emscripten-pty.js"
-# mt: ktock exact flags incl. pthreads. st: same minus thread support, so the
-# engine instantiates a plain (non-shared) WebAssembly.Memory and runs TCG on
-# the main thread — slower, but boots anywhere (iOS, file://, no COOP/COEP).
+# mt: ktock exact flags incl. pthreads. st: same minus proxy/pthread support,
+# so the engine instantiates a plain (non-shared) WebAssembly.Memory; QEMU
+# runs thread=single (one RR vCPU thread, backend init via apply-st-patches).
+# Goal: boot anywhere (iOS, file://, no COOP/COEP) — slower, but universal.
 if [ "$THREADS" = "st" ]; then
   EXTRA_CFLAGS="-O3 -g -Wno-error=unused-command-line-argument -mbulk-memory -DNDEBUG -DG_DISABLE_ASSERT -D_GNU_SOURCE -sASYNCIFY=1 -sFORCE_FILESYSTEM -sALLOW_TABLE_GROWTH -sTOTAL_MEMORY=2300MB -sWASM_BIGINT -sMALLOC=mimalloc --js-library=$PTY_LIB -sEXPORT_ES6=1 -sASYNCIFY_IMPORTS=ffi_call_js"
 else
   EXTRA_CFLAGS="-O3 -g -Wno-error=unused-command-line-argument -matomics -mbulk-memory -DNDEBUG -DG_DISABLE_ASSERT -D_GNU_SOURCE -sASYNCIFY=1 -pthread -sPROXY_TO_PTHREAD=1 -sFORCE_FILESYSTEM -sALLOW_TABLE_GROWTH -sTOTAL_MEMORY=2300MB -sWASM_BIGINT -sMALLOC=mimalloc --js-library=$PTY_LIB -sEXPORT_ES6=1 -sASYNCIFY_IMPORTS=ffi_call_js"
 fi
 EXTRA_LDFLAGS="$EXTRA_CFLAGS -L/build/target/lib -sEXPORTED_RUNTIME_METHODS=getTempRet0,setTempRet0,addFunction,removeFunction,TTY,FS,ccall"
+if [ "$THREADS" = "st" ]; then
+  # No worker pre-spawn: the default pool (4 workers x private 2.3 GB heaps =
+  # 9 GB+ and instant incoherence without shared memory) must never start.
+  # The single RR vCPU thread is spawned on demand by QEMU itself.
+  EXTRA_LDFLAGS="$EXTRA_LDFLAGS -sPTHREAD_POOL_SIZE=0"
+fi
 
 mkdir -p "$LINUX_DIR"
 
@@ -135,6 +142,15 @@ for f in pi3ctl pwm-bridge spi-bridge i2c-bridge snapshot-bridge; do
 done
 echo "[*] applying N4 patches"
 $DOCKER exec -w /qemu "$CTN" python3 /qemu/apply-n4-patches.py
+
+# 3c) ST-only: backend init on the single-thread (RR) path. ktock's wasm32 JIT
+#     installs Module.__wasm32_tb only in mttcg_cpu_thread_fn; without this the
+#     first hot TB on thread=single dies in instantiate_wasm(). Idempotent.
+if [ "$THREADS" = "st" ]; then
+  $DOCKER cp "$ROOT/scripts/linux-rootfs/apply-st-patches.py" "$CTN:/qemu/apply-st-patches.py"
+  echo "[*] applying ST patches"
+  $DOCKER exec -w /qemu "$CTN" python3 /qemu/apply-st-patches.py
+fi
 
 # 4) configure. Build in /qb (NOT /build) so we never disturb the image-provided
 #    /build/target sysroot (glib/zlib/pixman built for wasm32). Reuse /qb only if

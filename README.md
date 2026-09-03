@@ -588,8 +588,8 @@ Measured here (headless Chrome, dev server, warm cache):
 | Engine | Time to `~ #` shell | Status |
 |--------|--------------------|--------|
 | MTTCG pthread (`threads=auto`, SAB on) | **~40–70 s** (e.g. `download T+0s, engine T+0s, kernel T+38s, userspace T+38s, shell T+39s`, zero page errors) | works |
-| No-proxy rebuild + `thread=single` | never boots — worker dies on `tb_ptr_ptr` | blocked (see below) |
-| No-proxy rebuild + `thread=multi` | never boots — 4 workers × private 2.3 GB heaps swap the machine (CDP timeouts) | blocked (see below) |
+| No-proxy rebuild + `thread=single` | runs ~5 min silent, then dies on uncaught `Infinity` (see below) | blocked |
+| No-proxy rebuild + `thread=multi` | never boots — 4 workers × private 2.3 GB heaps swap the machine (CDP timeouts) | blocked |
 
 The true A/B was attempted end-to-end (`scripts/build-linux.sh --threads=st`
 builds, links 1895/1895, and packages a real `public/linux-st/`, fixing three
@@ -601,13 +601,17 @@ ktock's TCG→Wasm backend — both verified against source and crash logs:
 
 1. **The JIT backend is MTTCG-only.** `init_wasm32()` (which installs the
    per-thread `Module.__wasm32_tb` every compiled TB needs) is called only
-   from `mttcg_cpu_thread_fn` (`accel/tcg/tcg-accel-ops-mttcg.c`). On the
-   `thread=single` path it never runs, so the first hot TB calls
-   `instantiate_wasm()` with `__wasm32_tb` undefined → worker crash.
+   from `mttcg_cpu_thread_fn` (`accel/tcg/tcg-accel-ops-mttcg.c`). A new
+   `apply-st-patches.py` mirrors that init onto `rr_cpu_thread_fn`, which
+   gets past the immediate `tb_ptr_ptr` crash — the engine then executes
+   silently for ~5 min before dying on an uncaught `Infinity`, i.e. an
+   escaped setjmp/longjmp (`__emscripten_throw_longjmp`; QEMU uses
+   siglongjmp for CPU exception exits).
 2. **Workers without SAB get private heaps.** Even RR mode spawns a host
-   thread for its vCPUs, and the emscripten pool pre-spawns 4 workers; with a
-   non-shared 2.3 GB heap each, guest RAM is incoherent across threads by
-   construction (and 9 GB+ of heaps swap most machines).
+   thread for its vCPUs, and the emscripten pool pre-spawns workers; with a
+   non-shared 2.3 GB heap each, guest RAM and jmpbufs are incoherent across
+   threads by construction (hence the escaped longjmp, and the 9 GB+
+   swap-death under `thread=multi`).
 
 So a no-SAB boot needs upstream work (RR-path backend init + main-thread-only
 execution), not just a build flag. Until then `threads=off`/`auto`-without-SAB

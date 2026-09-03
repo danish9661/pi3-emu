@@ -891,11 +891,15 @@ Linux tab → bridge readout + send).
   (`scripts/build-linux.sh --threads=st` → `public/linux-st/`, non-proxy
   link, initrd boot via engine-aware module.js) compiles/links/packages
   rc=0 — but cannot execute: ktock's wasm32 JIT calls `init_wasm32()` only
-  from `mttcg_cpu_thread_fn`, so `thread=single` dies on `tb_ptr_ptr`
-  (worker crash); `thread=multi` on the non-shared heap spawns 4 workers ×
-  private 2.3 GB heaps (swap death, CDP timeouts). No-SAB needs upstream
-  backend work (RR init + main-thread-only execution). Harness routes to
-  linux-st/ only on a `.bootable` sentinel (build script won't create it).
+  from `mttcg_cpu_thread_fn`. Mirroring it onto `rr_cpu_thread_fn` (new
+  `apply-st-patches.py`, ST-only) gets past the `tb_ptr_ptr` crash — the
+  engine then runs ~5 min silent and dies on uncaught `Infinity` (escaped
+  setjmp/longjmp; QEMU uses siglongjmp for CPU exception exits, incoherent
+  across private heaps). `thread=multi` on the non-shared heap spawns
+  4 workers × private 2.3 GB heaps (swap death, CDP timeouts). No-SAB needs
+  upstream backend work (RR init done, main-thread-only execution still
+  open). Harness routes to linux-st/ only on a `.bootable` sentinel (build
+  script won't create it).
 - **Build fixes found by the ST attempt (all committed):** bogus
   `sysbus_init_child_obj` removed from pwm/spi/i2c-bridge.c (never existed
   in QEMU 8.2 — the M29 C devices had never compiled); `apply-n4-patches.py`
