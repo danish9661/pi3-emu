@@ -1,0 +1,818 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Raspberry Pi 3 (BCM2837) — Linux on QEMU Wasm</title>
+    <link rel="icon" href="data:," />
+    <!-- Preload the 24 MB data file (DTB + kernel + rootfs) so the browser
+         starts fetching it immediately instead of waiting for the JS engine
+         to boot and load.js to issue the XHR. Saves ~1-3 s on fast links. -->
+    <link rel="preload" href="qemu-system-aarch64.data" as="fetch" crossorigin="anonymous" />
+    <!-- Preload the 73 MB wasm engine (the single biggest download). The
+         browser begins compiling it in parallel with the data fetch. -->
+    <link rel="preload" href="qemu-system-aarch64.wasm" as="fetch" crossorigin="anonymous" />
+    <link rel="stylesheet" href="./vendor/xterm.css" />
+    <style>
+      html, body { margin: 0; height: 100%; background: #0c0c0c; color: #ddd;
+        font-family: system-ui, sans-serif; }
+      #app { display: flex; flex-direction: column; height: 100vh; }
+      header { padding: 6px 10px; font-size: 13px; background: #161616;
+        border-bottom: 1px solid #2a2a2a; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+      header b { color: #fff; font-weight: 600; }
+      header .hint { color: #888; font-size: 12px; }
+      .tools { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+      .tools input[type=text] { background: #0e0e0e; color: #ddd; border: 1px solid #333;
+        border-radius: 4px; padding: 3px 6px; font-size: 12px; width: 200px; }
+      .tools button { background: #2a2a2a; color: #ddd; border: 1px solid #3a3a3a;
+        border-radius: 4px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
+      .tools button:hover { background: #333; }
+      .tools button.gpioBtn { min-width: 30px; padding: 3px 6px; }
+      .tools button.gpioBtn.on { background: #2c5; color: #041; border-color: #2c5; }
+      #terminal { flex: 1 1 auto; padding: 6px; }
+      #terminal .xterm { height: 100%; }
+      #coi { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+        background: #0c0c0c; color: #aaa; font-size: 14px; z-index: 10; }
+      #coi.hidden { display: none; }
+      #boot { position: fixed; inset: 0; z-index: 5; display: flex; flex-direction: column;
+        align-items: center; justify-content: center; gap: 14px; background: #0c0c0c; color: #ddd; }
+      #boot.hidden { display: none; }
+      #boot .title { font-size: 18px; font-weight: 600; color: #fff; }
+      #boot .sub { font-size: 13px; color: #9a9a9a; }
+      #boot .status { font-size: 13px; color: #6cc; margin-top: 6px; min-height: 1em; }
+      #boot .phases { font-size: 12px; color: #888; min-height: 1em; }
+      #boot .phases b { color: #6cc; font-weight: 600; }
+      #boot .clock { font-size: 12px; color: #666; font-variant-numeric: tabular-nums; }
+      #boot .thread { font-size: 12px; color: #9a9a9a; border: 1px solid #333; border-radius: 4px; padding: 2px 8px; }
+      #boot .thread.single { color: #fc6; border-color: #664d1a; }
+      #boot .fallback { display: flex; flex-direction: column; gap: 8px; align-items: center;
+        max-width: 520px; text-align: center; font-size: 13px; color: #ddd;
+        border: 1px solid #5a2a2a; border-radius: 6px; padding: 12px 16px; background: #1a1010; }
+      #boot .fallback[hidden] { display: none; }
+      #boot .fallback code { color: #f99; font-size: 12px; word-break: break-all; }
+      #boot .fallback .row { display: flex; gap: 8px; }
+      #boot .fallback button { background: #2a2a2a; color: #ddd; border: 1px solid #3a3a3a;
+        border-radius: 4px; padding: 4px 12px; font-size: 12px; cursor: pointer; }
+      #boot .spin { width: 28px; height: 28px; border: 3px solid #2a2a2a; border-top-color: #6cc;
+        border-radius: 50%; animation: spin 0.9s linear infinite; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <b>Raspberry Pi 3 (BCM2837)</b>
+        <span class="hint">Linux on QEMU Wasm · raspi3ap · 4× Cortex-A53 · 512 MB — serial console</span>
+        <span class="tools">
+          <input type="file" id="upload" style="display:none" />
+          <button id="uploadBtn" type="button">Upload ▸ /mnt/incoming</button>
+           <input type="text" id="cmd" placeholder="type a command, e.g. hw" />
+           <button id="cmdBtn" type="button">Run</button>
+           <button id="scriptToggle" type="button">Script</button>
+          <span class="hint">GPIO:</span>
+          <button class="gpioBtn" data-pin="17" type="button">17</button>
+          <button class="gpioBtn" data-pin="18" type="button">18</button>
+          <button class="gpioBtn" data-pin="21" type="button">21</button>
+          <button class="gpioBtn" data-pin="22" type="button">22</button>
+          <span class="hint">Bridge:</span>
+          <button class="gpioBtn bridgeIn" data-pin="23" type="button">23</button>
+          <button class="gpioBtn bridgeIn" data-pin="24" type="button">24</button>
+          <button class="gpioBtn bridgeIn" data-pin="25" type="button">25</button>
+          <button class="gpioBtn bridgeIn" data-pin="26" type="button">26</button>
+          <button class="gpioBtn bridgeIn" data-pin="27" type="button">27</button>
+          <button id="bridgeTest" type="button">Echo Test</button>
+          <span id="bridgeState" class="hint"></span>
+          <span id="bridgeData" class="hint" style="max-width:320px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+          <input type="file" id="diskUpload" style="display:none" />
+          <button id="saveDisk" type="button">Save Disk</button>
+          <button id="loadDisk" type="button">Load Disk</button>
+          <button id="resetDisk" type="button">Reset Disk</button>
+          <input type="file" id="snapUpload" style="display:none" />
+          <button id="saveSnap" type="button" title="Snapshot guest FS + terminal to IndexedDB + download">Save Snap</button>
+          <button id="loadSnap" type="button" title="Load snapshot from file">Load Snap</button>
+          <button id="reboot" type="button" onclick="location.reload()">Reboot</button>
+        </span>
+      </header>
+      <div id="scriptPanel" style="display:none; padding:6px; background:#161616; border-bottom:1px solid #2a2a2a;">
+        <div style="display:flex; gap:6px; align-items:flex-start;">
+          <textarea id="scriptText" placeholder="paste a shell script or C source here…"
+            style="flex:1; height:96px; background:#0e0e0e; color:#ddd; border:1px solid #333; border-radius:4px; font-family:monospace; font-size:12px; padding:4px; resize:vertical;"></textarea>
+          <div style="display:flex; flex-direction:column; gap:4px;">
+            <input id="scriptName" value="prog.c" title="filename under /root/"
+              style="background:#0e0e0e; color:#ddd; border:1px solid #333; border-radius:4px; padding:3px 6px; font-size:12px; width:120px;" />
+            <button id="scriptSave" type="button">Save to file</button>
+            <button id="scriptPaste" type="button">Paste</button>
+            <button id="scriptClose" type="button">Close</button>
+          </div>
+        </div>
+        <div class="hint" style="color:#888; font-size:11px; margin-top:3px;">
+          “Save to file” writes the text to /root/&lt;name&gt; via a quoted heredoc (safe for $ and backticks) — then compile with
+          <code>tcc -o prog prog.c &amp;&amp; ./prog</code>. “Paste” streams it straight into the console.
+        </div>
+      </div>
+      <div id="terminal"></div>
+    </div>
+    <div id="coi">Establishing cross-origin isolation (threads) — one-time reload…</div>
+    <div id="boot">
+      <div class="spin"></div>
+      <div class="title">Raspberry Pi 3 — booting Linux</div>
+      <div class="sub">QEMU (TCG→WebAssembly) · raspi3ap · 4× Cortex-A53 · 512 MB</div>
+      <div class="status" id="boot-status">Downloading engine…</div>
+      <div class="phases" id="boot-phases"></div>
+      <div class="clock" id="boot-clock">T+0s</div>
+      <div class="thread" id="thread-badge">threads: …</div>
+      <div class="fallback" id="boot-fallback" hidden>
+        <div><b>Linux engine failed to start.</b></div>
+        <div id="fallback-detail"><code></code></div>
+        <div id="fallback-hint"></div>
+        <div class="row">
+          <button id="fallback-retry-mt" type="button">Retry multi-thread</button>
+          <button id="fallback-retry-st" type="button">Retry single-thread</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Register the SITE-ROOT coi Service Worker (public/coi-serviceworker.js,
+         scope /pi3-emu/) so this frame is covered by the same origin-wide SW the
+         main app registers. A nested per-frame SW is fragile on GitHub Pages;
+         one root-scoped SW avoids the iframe reload race. -->
+    <script src="../coi-serviceworker.js"></script>
+    <script src="../sab-toggle.js"></script>
+    <script src="./vendor/xterm.js"></script>
+    <script src="./vendor/xterm-pty.js"></script>
+    <script src="./module.js"></script>
+    <script src="./load.js"></script>
+    <script type="module">
+      import initEmscriptenModule from './out.js';
+      // ---- phased boot progress (T+ clock + milestone chips) ----
+      // Phases: download (load.js XHR via Module.setStatus) → engine
+      // (wasm compile/instantiate) → kernel (first serial output) →
+      // userspace (login/getty) → shell (~ #). Every phase posts to the
+      // parent window so the outer UI's #linuxBoot mirrors it.
+      const T0 = performance.now();
+      const bootEl0 = document.getElementById("boot");
+      const bootStatus0 = document.getElementById("boot-status");
+      const bootPhases = document.getElementById("boot-phases");
+      const bootClock = document.getElementById("boot-clock");
+      const threadBadge = document.getElementById("thread-badge");
+      const phaseTimes = {};
+      const tPlus = () => "T+" + Math.round((performance.now() - T0) / 1000) + "s";
+      setInterval(() => { if (bootClock) bootClock.textContent = tPlus(); }, 500);
+      function renderPhases() {
+        if (!bootPhases) return;
+        const order = ["download", "engine", "kernel", "userspace", "shell"];
+        bootPhases.innerHTML = order.map((p) =>
+          phaseTimes[p] ? "<b>✓ " + p + "</b> " + phaseTimes[p] + "  " : "· " + p + "  ").join("");
+      }
+      function markPhase(p, msg) {
+        if (!phaseTimes[p]) { phaseTimes[p] = tPlus(); renderPhases(); }
+        if (msg && bootStatus0) bootStatus0.textContent = msg;
+        try { window.parent.postMessage({ type: "linux-boot", phase: (msg || p) + " (" + tPlus() + ")" }, "*"); } catch (e) {}
+      }
+      renderPhases();
+      // Thread badge via the reusable SabToggle (../sab-toggle.js); effective
+      // mode comes from module.js (window.__pi3*). Inline strings kept as the
+      // fallback if the library failed to load.
+      const SAB = window.SabToggle || null;
+      const __modeBadge = {
+        requested: window.__pi3ThreadsRequested || "auto",
+        effective: window.__pi3ThreadsEffective || "multi",
+      };
+      const isStE = !!window.__pi3IsStEngine;
+      if (threadBadge) {
+        if (SAB) {
+          const d = SAB.describe(__modeBadge, { isSt: isStE });
+          threadBadge.textContent = d.text;
+          if (d.single) threadBadge.classList.add("single");
+        } else {
+          const effT = __modeBadge.effective;
+          threadBadge.textContent = effT === "multi"
+            ? "threads: MTTCG-4 (SharedArrayBuffer)"
+            : isStE ? "threads: single (dedicated ST engine)"
+            : "threads: single — needs linux-st build";
+          if (effT === "single") threadBadge.classList.add("single");
+        }
+      }
+      // load.js reports data-file XHR via Module.setStatus — surface it.
+      Module["setStatus"] = (s) => { markPhase("download", s || "Downloading engine…"); };
+      markPhase("download", "Downloading engine…");
+      // Fallback panel: out.js throws (e.g. "bad memory" without SAB) instead
+      // of hanging on the spinner — show why + one-click retries that never
+      // 404 (same page, different ?threads=).
+      function showFallback(detail, hint) {
+        const fb = document.getElementById("boot-fallback");
+        const det = document.querySelector("#fallback-detail code");
+        const h = document.getElementById("fallback-hint");
+        if (det) det.textContent = String(detail || "unknown error").slice(0, 300);
+        if (h) h.textContent = hint || "";
+        if (fb) fb.hidden = false;
+        const spin = bootEl0 ? bootEl0.querySelector(".spin") : null;
+        if (spin) spin.style.display = "none";
+      }
+      function reloadWithThreads(t) {
+        const u = new URL(location.href);
+        u.searchParams.set("threads", t);
+        location.href = u.toString();
+      }
+      document.getElementById("fallback-retry-mt").addEventListener("click", () => reloadWithThreads("on"));
+      document.getElementById("fallback-retry-st").addEventListener("click", () => reloadWithThreads("off"));
+      // ---- single-thread routing via SabToggle.pickVariant: the pthread
+      // engine cannot run single (see module.js __pi3NeedSt). If a VERIFIED ST
+      // build exists next door (public/linux-st/ with a .bootable sentinel =
+      // proof of a shell boot), hand off to it (params preserved); else stop
+      // before touching the engine and say how to build it. The async boot
+      // section below checks window.__pi3HaltNoEngine and returns early.
+      // Without the library, fall back to the build panel directly.
+      const ST_MISSING_HINT = "threads=off (or auto without SharedArrayBuffer) needs the dedicated single-thread engine: run scripts/build-linux.sh --threads=st, then reload. Or pick threads:on/auto on a cross-origin-isolated browser for the fast MTTCG engine.";
+      if (window.__pi3NeedSt) {
+        if (SAB) {
+          let r = null;
+          try {
+            // stEntry is a bootability sentinel, NOT out.js: an unbootable ST
+            // build must not receive the redirect (it would crash async past
+            // the init try/catch). See README "SharedArrayBuffer on/off".
+            r = await SAB.pickVariant({ mode: __modeBadge, isSt: isStE,
+              stEntry: "../linux-st/.bootable" });
+          } catch (_) { r = null; }
+          if (r && r.url) {
+            markPhase("download", "Handing off to single-thread engine…");
+            location.href = r.url;
+          } else {
+            markPhase("download", "Single-thread engine not built");
+            showFallback("public/linux-st/out.js missing (HTTP 404)", ST_MISSING_HINT);
+            window.__pi3HaltNoEngine = true;
+          }
+        } else {
+          markPhase("download", "Single-thread engine not built");
+          showFallback("sab-toggle.js missing + single-thread requested", ST_MISSING_HINT);
+          window.__pi3HaltNoEngine = true;
+        }
+      }
+      const xterm = new Terminal({ fontSize: 13, cursorBlink: true });
+      xterm.open(document.getElementById("terminal"));
+      window.xterm = xterm; window.sendLine = (s) => { xterm.focus(); xterm.paste(s + "\r"); };
+      xterm.focus();
+
+      // ---- terminal auto-fit: size the pty grid to the container ----
+      // Measure the actual rendered cell from .xterm-rows, then derive cols/rows
+      // from the container's client size. xterm-pty picks up term.onResize.
+      function fitTerminal() {
+        const container = document.getElementById("terminal");
+        const rowEl = xterm.element && xterm.element.querySelector(".xterm-rows > div");
+        if (!rowEl || !container || !xterm.cols) return;
+        const cellW = rowEl.getBoundingClientRect().width / xterm.cols;
+        const cellH = rowEl.getBoundingClientRect().height;
+        if (!cellW || !cellH) return;
+        const cols = Math.max(1, Math.floor(container.clientWidth / cellW));
+        const rows = Math.max(1, Math.floor(container.clientHeight / cellH));
+        if (cols !== xterm.cols || rows !== xterm.rows) xterm.resize(cols, rows);
+      }
+      requestAnimationFrame(() => fitTerminal());
+      setTimeout(fitTerminal, 300);
+      window.addEventListener("resize", fitTerminal);
+      if (typeof ResizeObserver !== "undefined") {
+        new ResizeObserver(fitTerminal).observe(document.getElementById("terminal"));
+      }
+
+      const { master, slave } = openpty();
+      xterm.loadAddon(master);
+      Module.pty = slave;
+      // Strip query/hash: runLinux() passes cfg+threads via the URL hash, and
+      // any "?…#…" suffix here would poison the pthread worker import URL
+      // (out.js resolves qemu-system-aarch64.worker.js against this base).
+      Module["mainScriptUrlOrBlob"] = location.href.split("#")[0].split("?")[0].replace(/index\.html$/, "") + "out.js";
+
+      // hide the COI splash once isolated
+      const coiEl = document.getElementById("coi");
+      const hideCoi = () => { if (window.crossOriginIsolated) coiEl.classList.add("hidden"); };
+      hideCoi();
+      setInterval(hideCoi, 500);
+
+      // send a line (with trailing CR) to the guest over the serial console
+      const sendLine = (s) => { xterm.focus(); xterm.paste(s + "\r"); };
+
+      // ---- C3: upload a file into the VM via base64 piped through busybox ----
+      const upload = document.getElementById("upload");
+      document.getElementById("uploadBtn").addEventListener("click", () => upload.click());
+      upload.addEventListener("change", () => {
+        const f = upload.files[0]; if (!f) return;
+        const name = f.name.replace(/[^A-Za-z0-9._-]/g, "_");
+        const reader = new FileReader();
+        reader.onload = () => {
+          const b64 = Buffer.from(new Uint8Array(reader.result)).toString("base64");
+          sendLine("echo " + b64 + " | base64 -d > /mnt/incoming/" + name);
+          upload.value = "";
+        };
+        reader.readAsArrayBuffer(f);
+      });
+
+      // ---- C4/N4: browser -> real emulated GPIO pins (sysfs over serial) ----
+      const cmd = document.getElementById("cmd");
+      const runCmd = () => { if (cmd.value.trim()) { sendLine(cmd.value); cmd.value = ""; } };
+      document.getElementById("cmdBtn").addEventListener("click", runCmd);
+      cmd.addEventListener("keydown", (e) => { if (e.key === "Enter") runCmd(); });
+
+      // ---- multi-line script runner (companion to the in-guest tcc) ----
+      const scriptPanel = document.getElementById("scriptPanel");
+      const scriptText = document.getElementById("scriptText");
+      const scriptName = document.getElementById("scriptName");
+      document.getElementById("scriptToggle").addEventListener("click", () => {
+        scriptPanel.style.display = scriptPanel.style.display === "none" ? "block" : "none";
+      });
+      document.getElementById("scriptClose").addEventListener("click", () => {
+        scriptPanel.style.display = "none";
+      });
+      document.getElementById("scriptPaste").addEventListener("click", () => {
+        const t = scriptText.value;
+        if (t) { xterm.focus();
+          // stream the text into the console (newlines act as Enter)
+          xterm.paste(t.endsWith("\n") ? t : t + "\n");
+        }
+      });
+      document.getElementById("scriptSave").addEventListener("click", () => {
+        const t = scriptText.value;
+        if (!t) return;
+        // sanitize to a bare filename under /root/ (no path traversal)
+        const name = (scriptName.value || "prog.c").replace(/[^\w.\-]/g, "_");
+        const marker = "PI3SCRIPT_EOF_" + Date.now();
+        // quoted heredoc: content is literal ($, backticks, etc. preserved)
+        const heredoc = "cat > /root/" + name + " <<'" + marker + "'\n" + t + "\n" + marker + "\n";
+        xterm.focus();
+        xterm.paste(heredoc);
+      });
+      const gpioSet = (pin, v) =>
+        sendLine("echo " + pin + " > /sys/class/gpio/export 2>/dev/null; " +
+                 "echo out > /sys/class/gpio/gpio" + pin + "/direction 2>/dev/null; " +
+                 "echo " + v + " > /sys/class/gpio/gpio" + pin + "/value 2>/dev/null");
+      document.querySelectorAll(".gpioBtn").forEach((b) => {
+        let on = false;
+        b.addEventListener("click", () => {
+          on = !on;
+          gpioSet(b.dataset.pin, on ? 1 : 0);
+          b.classList.toggle("on", on);
+          b.textContent = b.dataset.pin + (on ? "*" : "");
+        });
+      });
+
+      // ---- N4 (true device bridge): pi3-ctl <-> browser over postMessage ----
+      // The patched qemu engine (if built with pi3-ctl) forwards guest GPIO
+      // OUTPUT writes to the browser as "S <line> <0|1>\n" (worker->main via
+      // postMessage), and accepts "I <line> <0|1>\n" from the browser to drive
+      // a real emulated GPIO INPUT the guest can read via GPLEV. Guarded: the
+      // stock prebuilt engine has no pi3_rx, so this stays inert there.
+      const bridgeLevels = {};
+      // Indicate whether the running engine supports the pi3-ctl device (the
+      // rebuilt live engine does; the stock ktock prebuilt does not export
+      // ccall, so the bridge stays inert there). This is the quickest way to
+      // confirm N4 wiring from the browser without a kernel round-trip.
+      const bridgeStateEl = document.getElementById("bridgeState");
+      const bridgeSupported = () =>
+        typeof Module !== "undefined" && typeof Module.ccall === "function";
+      if (bridgeStateEl) {
+        bridgeStateEl.textContent =
+          bridgeSupported() ? "pi3-ctl: ready" : "pi3-ctl: n/a (stock engine)";
+      }
+      const pi3Send = (line, v) => {
+        try {
+          if (typeof Module !== "undefined" && typeof Module.ccall === "function") {
+            Module.ccall("pi3_rx", "void", ["string"], ["I " + line + " " + (v ? 1 : 0)]);
+          }
+        } catch (e) { /* pi3_rx not exported in this engine */ }
+      };
+      window.addEventListener("message", (e) => {
+        if (typeof e.data !== "string") return;
+        const m = /^S (\d+) (\d+)\s*$/.exec(e.data);
+        if (!m) return;
+        const line = m[1], v = m[2] === "1";
+        bridgeLevels[line] = v;
+        const el = document.getElementById("bridgeState");
+        if (el) el.textContent =
+          "guest→browser: " +
+          Object.keys(bridgeLevels).map((k) => "G" + k + (bridgeLevels[k] ? "=1" : "=0")).join(" ");
+      });
+
+      // ---- PWM/SPI/I2C device bridge readout ----
+      // When the QEMU C bridge devices forward peripheral data to the browser,
+      // display a compact summary in the toolbar.  The C devices communicate
+      // via postMessage strings: "PWM <count>", "SPI_TX <hex bytes>",
+      // "I2C_TX <addr> <reg> <data>", "I2C_RX <data>".
+      const bridgeDataEl = document.getElementById("bridgeData");
+      const bridgeLog = { pwm: 0, spi: '', i2c: '' };
+      window.addEventListener("message", (e) => {
+        if (typeof e.data !== "string") return;
+        const mp = /^PWM (\d+)$/.exec(e.data);
+        if (mp) { bridgeLog.pwm += parseInt(mp[1], 10); if (bridgeDataEl) bridgeDataEl.textContent = "PWM: " + bridgeLog.pwm + " samples"; return; }
+        const ms = /^SPI_TX (.+)$/.exec(e.data);
+        if (ms) { bridgeLog.spi = ms[1]; if (bridgeDataEl) bridgeDataEl.textContent = "SPI TX: " + ms[1]; return; }
+        const mi = /^I2C_TX (\S+) (\S+) (.+)$/.exec(e.data);
+        if (mi) { bridgeLog.i2c = "wr @" + mi[1] + " reg=" + mi[2] + " " + mi[3]; if (bridgeDataEl) bridgeDataEl.textContent = "I2C: " + bridgeLog.i2c; return; }
+        const mr = /^I2C_RX (.+)$/.exec(e.data);
+        if (mr) { bridgeLog.i2c = "rd [" + mr[1] + "]"; if (bridgeDataEl) bridgeDataEl.textContent = "I2C: " + bridgeLog.i2c; return; }
+      });
+
+      // Browser → device bridge: send data back to the QEMU C device.
+      // GPIO uses pi3_rx; SPI/I2C have dedicated rx functions.
+      const bridgeSend = (msg) => {
+        try {
+          if (typeof Module !== "undefined" && typeof Module.ccall === "function") {
+            Module.ccall("pi3_rx", "void", ["string"], [msg]);
+          }
+        } catch (e) {}
+      };
+      const spiBridgeSend = (hex) => {
+        try {
+          if (typeof Module !== "undefined" && typeof Module.ccall === "function") {
+            Module.ccall("spi_bridge_rx", "void", ["string"], [hex]);
+          }
+        } catch (e) {}
+      };
+      const i2cBridgeSend = (hex) => {
+        try {
+          if (typeof Module !== "undefined" && typeof Module.ccall === "function") {
+            Module.ccall("i2c_bridge_rx", "void", ["string"], [hex]);
+          }
+        } catch (e) {}
+      };
+      window.bridgeSend = bridgeSend;
+      window.spiBridgeSend = spiBridgeSend;
+      window.i2cBridgeSend = i2cBridgeSend;
+      document.querySelectorAll(".bridgeIn").forEach((b) => {
+        let on = false;
+        b.addEventListener("click", () => {
+          on = !on;
+          pi3Send(b.dataset.pin, on ? 1 : 0);
+          b.classList.toggle("on", on);
+          b.textContent = b.dataset.pin + (on ? "*" : "");
+        });
+      });
+
+      // N4 Echo Test: pulse Bridge pin 23 (browser->guest) and, if the guest
+      // runs `bridge-demo`, it echoes pin23 -> pin21 (guest->browser). The
+      // toolbar readout will show G21 go high then low, proving a full
+      // round-trip through the pi3-ctl device.
+      const bridgeTest = document.getElementById("bridgeTest");
+      if (bridgeTest) {
+        let busy = false;
+        bridgeTest.addEventListener("click", () => {
+          if (busy) return;
+          busy = true;
+          bridgeTest.classList.add("on");
+          pi3Send(23, 1);
+          setTimeout(() => {
+            pi3Send(23, 0);
+            bridgeTest.classList.remove("on");
+            busy = false;
+          }, 900);
+        });
+      }
+
+      // ---- N3: snapshot the initramfs image (rootfs.bin) to IndexedDB + file ----
+      // Download/Upload gives a portable disk file; IndexedDB persists the loaded
+      // disk across reboots. The active image is injected over the unpacked
+      // /pack/rootfs.bin in a preRun, before qemu loads it as -initrd, so a
+      // downloaded/uploaded image becomes the live rootfs on next boot.
+
+      // ---- True VM snapshot (FS overlay + disk + terminal) ----
+      // The initramfs lives in tmpfs after boot, so N3's disk image misses live edits.
+      // This layer snapshots the *running* guest FS overlay by walking the host MEMFS
+      // overlay (files the user created via Upload/Script) plus the disk image and
+      // terminal scrollback. On restore, the overlay is re-injected via FS writes in
+      // a preRun before QEMU unpacks the initramfs, then re-applied post-boot via
+      // serial heredoc for tmpfs.
+      // Full QEMU savevm (RAM+device state, 512MB) is 2.3GB SharedArrayBuffer — not
+      // feasible inIndexedDB. The proper path is a QEMU monitor savevm to MEMFS file
+      // (see scripts/linux-rootfs/snapshot-bridge.c stub); this JS layer is the
+      // filesystem-consistent snapshot used today.
+      const DISK_PATH = "/pack/rootfs.bin";
+      const fsApi = () => (Module.FS || Module["FS"]);
+      const toU8 = (b) => (b instanceof Uint8Array ? b : new Uint8Array(b));
+      const idbOpen = () => new Promise((res, rej) => {
+        const r = indexedDB.open("pi3emu", 1);
+        r.onupgradeneeded = () => r.result.createObjectStore("disk");
+        r.onsuccess = () => res(r.result);
+        r.onerror = () => rej(r.error);
+      });
+      const idbGet = async () => {
+        const db = await idbOpen();
+        return await new Promise((res, rej) => {
+          const rq = db.transaction("disk", "readonly").objectStore("disk").get("rootfs");
+          rq.onsuccess = () => res(rq.result); rq.onerror = () => rej(rq.error);
+        });
+      };
+      const idbPut = async (buf) => {
+        const db = await idbOpen();
+        await new Promise((res) => {
+          const tx = db.transaction("disk", "readwrite");
+          tx.objectStore("disk").put(buf, "rootfs");
+          tx.oncomplete = res;
+        });
+      };
+      const idbDel = async () => {
+        const db = await idbOpen();
+        await new Promise((res) => {
+          const tx = db.transaction("disk", "readwrite");
+          tx.objectStore("disk").delete("rootfs");
+          tx.oncomplete = res;
+        });
+      };
+      const downloadBuf = (buf, name) => {
+        const blob = new Blob([buf], { type: "application/octet-stream" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = name; a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+      };
+
+      document.getElementById("saveDisk").addEventListener("click", async () => {
+        try {
+          const buf = toU8(fsApi().readFile(DISK_PATH));
+          await idbPut(buf);
+          window.__pi3Disk = buf;
+          downloadBuf(buf, "pi3-rootfs-" + Date.now() + ".bin");
+        } catch (e) { console.log("Save Disk failed: " + e); }
+      });
+      const diskUpload = document.getElementById("diskUpload");
+      document.getElementById("loadDisk").addEventListener("click", () => diskUpload.click());
+      diskUpload.addEventListener("change", () => {
+        const f = diskUpload.files[0]; if (!f) return;
+        const reader = new FileReader();
+        reader.onload = async () => {
+          const buf = new Uint8Array(reader.result);
+          await idbPut(buf);
+          window.__pi3Disk = buf;
+          diskUpload.value = "";
+          location.reload();
+        };
+        reader.readAsArrayBuffer(f);
+      });
+      document.getElementById("resetDisk").addEventListener("click", async () => {
+        await idbDel();
+        window.__pi3Disk = null;
+        location.reload();
+      });
+
+      // VM snapshot: capture live overlay FS (host MEMFS) + disk + term
+      const SNAP_STORE = "snapshot";
+      const idbOpenSnap = () => new Promise((res, rej) => {
+        const r = indexedDB.open("pi3emu", 2);
+        r.onupgradeneeded = () => {
+          if (!r.result.objectStoreNames.contains("disk")) r.result.createObjectStore("disk");
+          if (!r.result.objectStoreNames.contains(SNAP_STORE)) r.result.createObjectStore(SNAP_STORE);
+        };
+        r.onsuccess = () => res(r.result);
+        r.onerror = () => rej(r.error);
+      });
+      const walkFs = (FS, base) => {
+        const out = [];
+        const stack = [base];
+        while (stack.length) {
+          const dir = stack.pop();
+          let ents;
+          try { ents = FS.readdir(dir); } catch (_) { continue; }
+          for (const e of ents) {
+            if (e === "." || e === "..") continue;
+            const p = dir === "/" ? "/" + e : dir + "/" + e;
+            let st;
+            try { st = FS.stat(p); } catch (_) { continue; }
+            const isDir = FS.isDir ? FS.isDir(st.mode) : (st.mode & 61440) === 16384;
+            if (isDir) {
+              // skip /proc /sys /dev /tmp noise
+              if (p === "/proc" || p === "/sys" || p === "/dev") continue;
+              stack.push(p);
+            } else {
+              const isFile = FS.isFile ? FS.isFile(st.mode) : (st.mode & 61440) === 32768;
+              if (!isFile) continue;
+              // limit to user-writable overlay paths to keep snapshot small
+              if (!p.startsWith("/pack") && !p.startsWith("/root") && !p.startsWith("/home") && !p.startsWith("/mnt")) continue;
+              try {
+                const data = FS.readFile(p);
+                out.push({ path: p, data: Array.from(data), mode: st.mode });
+                if (out.length > 512) return out; // cap
+              } catch (_) {}
+            }
+          }
+        }
+        return out;
+      };
+      const idbSnapPut = async (key, obj) => {
+        const db = await idbOpenSnap();
+        await new Promise((res, rej) => {
+          const tx = db.transaction(SNAP_STORE, "readwrite");
+          tx.objectStore(SNAP_STORE).put(obj, key);
+          tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+        });
+      };
+      const idbSnapGet = async (key) => {
+        const db = await idbOpenSnap();
+        return await new Promise((res, rej) => {
+          const rq = db.transaction(SNAP_STORE, "readonly").objectStore(SNAP_STORE).get(key);
+          rq.onsuccess = () => res(rq.result); rq.onerror = () => rej(rq.error);
+        });
+      };
+      const collectTerm = () => {
+        try {
+          const rows = document.querySelector(".xterm-rows");
+          return rows ? rows.innerText.slice(-8000) : "";
+        } catch (_) { return ""; }
+      };
+      document.getElementById("saveSnap").addEventListener("click", async () => {
+        try {
+          const FS = fsApi();
+          const files = walkFs(FS, "/");
+          const snap = {
+            ts: Date.now(),
+            disk: null,
+            files,
+            term: collectTerm(),
+            bootConfig: (window.__linuxConfig || "minimal"),
+            guestTarB64: null
+          };
+          try { snap.disk = Array.from(toU8(FS.readFile(DISK_PATH))); } catch (_) {}
+          // Try guest FS capture via serial (tmpfs overlay). If VM is booted, tar guest /root.
+          try {
+            const rows = document.querySelector(".xterm-rows");
+            if (rows && /~ ?#/.test(rows.innerText)) {
+              // booted: ask guest to tar its live FS. Use sendLine helper (defined above).
+              const capture = await new Promise((resolve) => {
+                const iv = setInterval(() => {
+                  try {
+                    const txt = document.querySelector(".xterm-rows").innerText;
+                    const m = txt.match(/SNAP_BEGIN\r?\n([A-Za-z0-9+\/=\r\n]+)\r?\nSNAP_END/);
+                    if (m) { clearInterval(iv); resolve(m[1].replace(/\r|\n/g, "")); }
+                  } catch (_) {}
+                }, 600);
+                setTimeout(() => { clearInterval(iv); resolve(""); }, 9000);
+                try { sendLine("echo SNAP_BEGIN; tar -czf - /root /home 2>/dev/null | base64 | tr -d '\\n'; echo \"\"; echo SNAP_END"); } catch (_) { resolve(""); }
+              });
+              if (capture) snap.guestTarB64 = capture;
+            }
+          } catch (_) {}
+          await idbSnapPut("vm-snap", snap);
+          // also download as JSON for portability
+          const blob = new Blob([JSON.stringify({ pi3emu_snapshot: 1, ...snap })], { type: "application/json" });
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = "pi3-snap-" + Date.now() + ".json";
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+          console.log("Save Snap: " + files.length + " files + disk " + (snap.disk ? snap.disk.length : 0) + " guestTar " + (snap.guestTarB64 ? snap.guestTarB64.length : 0));
+        } catch (e) { console.log("Save Snap failed: " + e); }
+      });
+      const snapUpload = document.getElementById("snapUpload");
+      document.getElementById("loadSnap").addEventListener("click", () => snapUpload.click());
+      snapUpload.addEventListener("change", () => {
+        const f = snapUpload.files[0]; if (!f) return;
+        const reader = new FileReader();
+        reader.onload = async () => {
+          try {
+            const snap = JSON.parse(new TextDecoder().decode(new Uint8Array(reader.result)));
+            await idbSnapPut("vm-snap", snap);
+            if (snap.disk) {
+              const buf = new Uint8Array(snap.disk);
+              const db2 = await idbOpen();
+              await new Promise((res) => {
+                const tx = db2.transaction("disk", "readwrite");
+                tx.objectStore("disk").put(buf, "rootfs");
+                tx.oncomplete = res;
+              });
+              window.__pi3Disk = buf;
+            }
+            // stow files for preRun injection + guest tar
+            window.__pi3SnapFiles = snap.files || [];
+            window.__pi3SnapTerm = snap.term || "";
+            window.__pi3SnapGuestTar = snap.guestTarB64 || null;
+            snapUpload.value = "";
+            location.reload();
+          } catch (e) { console.log("Load Snap bad file: " + e); }
+        };
+        reader.readAsArrayBuffer(f);
+      });
+
+      (async () => {
+        // Gated boot: threads=off (or auto without SAB) with no linux-st
+        // build stops here — the fallback panel above is already visible.
+        if (window.__pi3HaltNoEngine) return;
+        // restore any persisted disk + vm snapshot overlay
+        try { const d = await idbGet(); if (d) window.__pi3Disk = toU8(d); } catch (e) {}
+        try {
+          const snap = await idbSnapGet("vm-snap");
+          if (snap && snap.files) {
+            window.__pi3SnapFiles = snap.files;
+            window.__pi3SnapTerm = snap.term || "";
+            window.__pi3SnapDisk = snap.disk || null;
+            window.__pi3SnapGuestTar = snap.guestTarB64 || null;
+          }
+        } catch (e) {}
+        if (Module["preRun"]) {
+          Module["preRun"].push(() => {
+            if (window.__pi3Disk) {
+              try { fsApi().writeFile(DISK_PATH, window.__pi3Disk); } catch (e) {}
+            }
+            // re-inject snapshot overlay files into host MEMFS (for /pack, /root host side)
+            if (window.__pi3SnapFiles) {
+              for (const f of window.__pi3SnapFiles) {
+                try {
+                  const dir = f.path.slice(0, f.path.lastIndexOf("/")) || "/";
+                  try { fsApi().mkdirTree(dir); } catch (_) {}
+                  fsApi().writeFile(f.path, new Uint8Array(f.data));
+                } catch (_) {}
+              }
+            }
+          });
+        }
+        markPhase("engine", "Compiling engine…");
+        try {
+          await initEmscriptenModule(Module);
+        } catch (e) {
+          const msg = (e && (e.message || e)) || e;
+          const noSAB = /shared|bad memory|SharedArrayBuffer/i.test(String(msg));
+          markPhase("engine", "Engine failed to start");
+          showFallback(msg, noSAB
+            ? "This browser has no SharedArrayBuffer (no cross-origin isolation). Retry single-thread — and if that also fails, this engine needs the dedicated single-thread build: scripts/build-linux.sh --threads=st."
+            : "Unexpected engine failure. Retry, or try the other threading mode.");
+          throw e;
+        }
+        markPhase("engine", "Engine ready — booting kernel…");
+
+        var oldPoll = Module["TTY"].stream_ops.poll;
+        var pty = Module["pty"];
+        Module["TTY"].stream_ops.poll = function (stream, timeout) {
+          if (!pty.readable) return (pty.readable ? 1 : 0) | (pty.writable ? 4 : 0);
+          return oldPoll.call(stream, timeout);
+        };
+
+        // ---- C2: real login flow (getty + login). Auto-fill credentials so the
+        // user lands at the shell without typing. Also tolerate the legacy
+        // "Please press Enter" path in case getty isn't active. ----
+        var stage = 0, booted = false;
+        var bootEl = document.getElementById("boot");
+        var bootStatus = document.getElementById("boot-status");
+        // Route milestones through the phased tracker (T+ stamps + chips);
+        // the message text selects the phase bucket.
+        var setBoot = function (m) {
+          var phase = null;
+          if (/Kernel up/.test(m)) phase = "kernel";
+          else if (/Console ready|logging in|activating/.test(m)) phase = "userspace";
+          else if (/Boot complete/.test(m)) phase = "shell";
+          if (phase) { try { markPhase(phase, m); } catch (_) {} }
+          if (bootStatus) bootStatus.textContent = m;
+          try { window.parent.postMessage({ type: "linux-boot", phase: m }, "*"); } catch (e) {}
+        };
+        bootEl.addEventListener("click", function () { bootEl.classList.add("hidden"); });
+        var iv = setInterval(function () {
+          try {
+            var rows = document.querySelector(".xterm-rows");
+            if (!rows) return;
+            var txt = rows.innerText;
+            // Reveal the terminal as soon as the guest starts printing: the boot
+            // overlay is opaque and would otherwise hide the kernel boot log (and
+            // block the toolbar) for the whole boot. Dismiss it on first output.
+            if (txt && txt.trim().length) {
+              bootEl.classList.add("hidden");
+              try { markPhase("kernel", "Kernel up — starting userspace…"); } catch (_) {}
+            }
+            if (/Linux version|Please press Enter to activate this console\./.test(txt)) setBoot("Kernel up — starting userspace…");
+            if (/login:/.test(txt) && stage === 0) {
+              stage = 1; setBoot("Console ready — logging in…"); xterm.focus(); xterm.paste("root\r");
+            } else if (/Password:/.test(txt) && stage === 1) {
+              stage = 2; xterm.paste("raspberry\r");
+            } else if (/Login incorrect/.test(txt)) {
+              stage = 0;
+            } else if (/Please press Enter to activate this console\./.test(txt) && stage === 0) {
+              stage = 1; setBoot("Console ready — activating shell…"); xterm.focus(); xterm.paste("\r");
+            }
+            if (/~ ?#/.test(txt)) {
+              if (!booted) {
+                booted = true; setBoot("Boot complete");
+                // VM snapshot: restore guest tar overlay via serial (chunked base64)
+                if (window.__pi3SnapGuestTar) {
+                  const b64 = window.__pi3SnapGuestTar;
+                  // clear marker so we don't re-apply on reload loops
+                  const tar = b64;
+                  setTimeout(() => {
+                    try {
+                      // chunk to avoid xterm paste limits (~4K)
+                      const chunk = 900;
+                      sendLine("rm -f /tmp/snap.tgz");
+                      for (let i = 0; i < tar.length; i += chunk) {
+                        const part = tar.slice(i, i + chunk);
+                        const isLast = i + chunk >= tar.length;
+                        // echo -n first chunks, final chunk without -n
+                        if (!isLast) sendLine("echo -n '" + part + "' >> /tmp/snap.b64");
+                        else sendLine("echo '" + part + "' >> /tmp/snap.b64; base64 -d /tmp/snap.b64 > /tmp/snap.tgz && tar -xzf /tmp/snap.tgz -C / && echo SNAP_RESTORED; rm /tmp/snap.b64 /tmp/snap.tgz");
+                      }
+                      if (tar.length === 0) sendLine("echo SNAP_RESTORED");
+                    } catch (e) { console.log("snap restore err: " + e); }
+                  }, 900);
+                  window.__pi3SnapGuestTar = null;
+                }
+              }
+              bootEl.classList.add("hidden");
+              clearInterval(iv);
+            }
+          } catch (e) { console.log("AUTOACTIVATE err: " + e); }
+        }, 1000);
+      })();
+    </script>
+  </body>
+</html>

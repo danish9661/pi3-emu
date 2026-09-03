@@ -553,6 +553,99 @@ site-root COI service worker) so the pthread/MTTCG qemu worker can start.
 Rebuild from source with `scripts/build-linux.sh` (podman), or rely on the
 committed engine + `.data` under `public/linux/`.
 
+## SharedArrayBuffer on/off (`public/sab-toggle.js`)
+
+The pthread/MTTCG engine is ~2–4× faster than single-thread TCG (4 vCPUs in
+parallel, emulation off the main thread), but it needs `SharedArrayBuffer`:
+a secure context + cross-origin isolation (COOP/COEP headers or the bundled
+`coi-serviceworker.js`). Platforms without it (iOS Safari, `file://`, VPNs
+stripping the headers) can't run that build at all — `out.js` throws `bad
+memory` instead of booting slowly.
+
+The **threads** dropdown next to the boot config controls this:
+
+| Setting | Behavior |
+|---------|----------|
+| `auto` (default) | MTTCG when shared memory is usable, else the single-thread engine. Safe for shared links — never a black screen. |
+| `on` | Force multi-thread; fails loudly with the reason where isolation is missing. |
+| `off` | Force single-thread; needs the ST build (`scripts/build-linux.sh --threads=st` → `public/linux-st/`), else a panel tells you how to build it. |
+
+The boot overlay shows the live mode (`MTTCG-4` vs `single` badge), phased
+progress (`download → engine → kernel → userspace → shell` with a `T+` clock,
+mirrored to the parent status line), and a fallback panel with one-click
+retries instead of a stuck spinner. The pick persists across sessions
+(`localStorage`) and is deep-linkable (`?threads=off`, also `#threads=`).
+
+Benchmark it yourself (needs a browser + the dev server; ~1–2 min per run):
+
+```sh
+node test/linux-boot-bench.mjs             # auto  -> MTTCG numbers (SAB on)
+node test/linux-boot-bench.mjs threads=off # single-thread numbers (needs linux-st/)
+```
+
+Measured here (headless Chrome, dev server, warm cache):
+
+| Engine | Time to `~ #` shell | Status |
+|--------|--------------------|--------|
+| MTTCG pthread (`threads=auto`, SAB on) | **~40–70 s** (e.g. `download T+0s, engine T+0s, kernel T+38s, userspace T+38s, shell T+39s`, zero page errors) | works |
+| No-proxy rebuild + `thread=single` | never boots — worker dies on `tb_ptr_ptr` | blocked (see below) |
+| No-proxy rebuild + `thread=multi` | never boots — 4 workers × private 2.3 GB heaps swap the machine (CDP timeouts) | blocked (see below) |
+
+The true A/B was attempted end-to-end (`scripts/build-linux.sh --threads=st`
+builds, links 1895/1895, and packages a real `public/linux-st/`, fixing three
+latent bugs on the way: a hallucinated `sysbus_init_child_obj` in the
+PWM/SPI/I2C bridge devices, a non-idempotent N4 patch script that triple-
+applied on rebuilds, and a missing `cpio` that silently produced a 20-byte
+rootfs). But the ST engine cannot execute, for two architectural reasons in
+ktock's TCG→Wasm backend — both verified against source and crash logs:
+
+1. **The JIT backend is MTTCG-only.** `init_wasm32()` (which installs the
+   per-thread `Module.__wasm32_tb` every compiled TB needs) is called only
+   from `mttcg_cpu_thread_fn` (`accel/tcg/tcg-accel-ops-mttcg.c`). On the
+   `thread=single` path it never runs, so the first hot TB calls
+   `instantiate_wasm()` with `__wasm32_tb` undefined → worker crash.
+2. **Workers without SAB get private heaps.** Even RR mode spawns a host
+   thread for its vCPUs, and the emscripten pool pre-spawns 4 workers; with a
+   non-shared 2.3 GB heap each, guest RAM is incoherent across threads by
+   construction (and 9 GB+ of heaps swap most machines).
+
+So a no-SAB boot needs upstream work (RR-path backend init + main-thread-only
+execution), not just a build flag. Until then `threads=off`/`auto`-without-SAB
+shows the build panel instead of a doomed boot — the harness only routes to
+`linux-st/` when it finds a `.bootable` sentinel there (proof of a verified
+shell boot; `build-linux.sh` deliberately does not create it).
+
+### Reusing this in another project
+
+`sab-toggle.js` is dependency-free with no build step — copy the one file:
+
+```html
+<script src="./sab-toggle.js"></script>
+<select id="threads">
+  <option value="auto" selected>threads: auto</option>
+  <option value="on">threads: on</option>
+  <option value="off">threads: off</option>
+</select>
+<script>
+  SabToggle.bindSelect("#threads"); // init from ?threads=/storage + persist
+  const mode = SabToggle.resolve(); // { requested, effective: multi|single,
+                                    //   sab, reason } + sab:mode event
+  if (mode.effective === "multi") start pthread build (needs isolation);
+  else start single-thread build (runs anywhere);
+</script>
+```
+
+API: `detect()` (never-throws capability probe) · `getPreference()` /
+`setPreference()` (explicit › `?threads=` › hash › `localStorage` › `auto`) ·
+`decide(requested)` (pure decision for hosts with their own sources, e.g. a
+parent window) · `resolve()` · `ensureIsolation(swUrl)` (registers the COI
+worker only when threads could be on — skips the reload loop otherwise) ·
+`probeFile()` / `pickVariant({mode, isSt, stEntry, stPage})` (redirect to the
+ST build when present, else a `{missing}` signal for your fallback UI) ·
+`bindSelect()` · `describe()` (badge strings). Regression test:
+`node test/linux-threads-toggle.mjs` (17 checks: library on both pages,
+routing, persistence, fallback, zero page errors).
+
 ## Tests (no browser needed — same wasm driven from node)
 
 ```sh
@@ -574,6 +667,8 @@ node test/spi-probe.mjs          # SPI: JEDEC ID transaction, CLEAR resets, r1 =
 node test/uart1-probe.mjs        # UART1: mini UART config, [u1]-tagged stream, TX-empty pacing
 node test/sd-probe.mjs           # SD: init sequence, FAT12 boot/root parse, HELLO.TXT payload
 node test/uart0-probe.mjs        # UART0: PL011 config latched, FR TX-ready, RXINTR via IC, RX echo
+node test/linux-threads-toggle.mjs # SAB toggle: lib on both pages, routing, persistence, fallback, no errors (17)
+node test/linux-boot-bench.mjs     # Linux boot benchmark: phase T+ times + time-to-shell as JSON
 ```
 
 ## Build
@@ -616,6 +711,7 @@ test/smoke.mjs        guest-driven end-to-end test (node)
 public/programs/*.elf built guest programs (committed)
 public/pi_board.wasm  built board (committed)
 public/unicorn.js     unicorn.js all-arch build (committed)
+public/sab-toggle.js  reusable SharedArrayBuffer on/off (drop into any project)
 dist/                 production bundle
 ```
 

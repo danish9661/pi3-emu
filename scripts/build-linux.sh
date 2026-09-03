@@ -16,7 +16,27 @@
 #   QEMU_WASM_SRC=<dir>   existing ktock/qemu-wasm checkout (default: clones a
 #                          shallow copy into scripts/.build/qemu-wasm)
 #   QEMU_WASM_REF=HEAD     ref/branch/tag to check out
+#   THREADS=mt|st          threading target (default: mt). Also settable as the
+#                          first CLI arg: scripts/build-linux.sh --threads=st.
+#                          mt = pthread/MTTCG engine (needs SharedArrayBuffer,
+#                          installs to public/linux). st = single-thread engine
+#                          (no pthreads, runs without cross-origin isolation,
+#                          installs to public/linux-st); the harness
+#                          auto-selects it when SAB is unavailable.
 set -euo pipefail
+
+THREADS="${THREADS:-mt}"
+for _a in "$@"; do
+  case "$_a" in
+    --threads=mt) THREADS="mt" ;;
+    --threads=st) THREADS="st" ;;
+    --threads=*) echo "unknown $_a (want --threads=mt|st)" >&2; exit 1 ;;
+  esac
+done
+if [ "$THREADS" != "mt" ] && [ "$THREADS" != "st" ]; then
+  echo "THREADS must be mt|st (got $THREADS)" >&2; exit 1
+fi
+echo "[*] threading target: $THREADS"
 
 DOCKER="${DOCKER:-podman}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -42,7 +62,14 @@ CTN="build-qemu-wasm"
 # passed via --extra-cflags AND --extra-ldflags so they reach both compile and
 # link (qemu's final link only uses LDFLAGS).
 PTY_LIB="/opt/xterm-pty/node_modules/xterm-pty/emscripten-pty.js"
-EXTRA_CFLAGS="-O3 -g -Wno-error=unused-command-line-argument -matomics -mbulk-memory -DNDEBUG -DG_DISABLE_ASSERT -D_GNU_SOURCE -sASYNCIFY=1 -pthread -sPROXY_TO_PTHREAD=1 -sFORCE_FILESYSTEM -sALLOW_TABLE_GROWTH -sTOTAL_MEMORY=2300MB -sWASM_BIGINT -sMALLOC=mimalloc --js-library=$PTY_LIB -sEXPORT_ES6=1 -sASYNCIFY_IMPORTS=ffi_call_js"
+# mt: ktock exact flags incl. pthreads. st: same minus thread support, so the
+# engine instantiates a plain (non-shared) WebAssembly.Memory and runs TCG on
+# the main thread — slower, but boots anywhere (iOS, file://, no COOP/COEP).
+if [ "$THREADS" = "st" ]; then
+  EXTRA_CFLAGS="-O3 -g -Wno-error=unused-command-line-argument -mbulk-memory -DNDEBUG -DG_DISABLE_ASSERT -D_GNU_SOURCE -sASYNCIFY=1 -sFORCE_FILESYSTEM -sALLOW_TABLE_GROWTH -sTOTAL_MEMORY=2300MB -sWASM_BIGINT -sMALLOC=mimalloc --js-library=$PTY_LIB -sEXPORT_ES6=1 -sASYNCIFY_IMPORTS=ffi_call_js"
+else
+  EXTRA_CFLAGS="-O3 -g -Wno-error=unused-command-line-argument -matomics -mbulk-memory -DNDEBUG -DG_DISABLE_ASSERT -D_GNU_SOURCE -sASYNCIFY=1 -pthread -sPROXY_TO_PTHREAD=1 -sFORCE_FILESYSTEM -sALLOW_TABLE_GROWTH -sTOTAL_MEMORY=2300MB -sWASM_BIGINT -sMALLOC=mimalloc --js-library=$PTY_LIB -sEXPORT_ES6=1 -sASYNCIFY_IMPORTS=ffi_call_js"
+fi
 EXTRA_LDFLAGS="$EXTRA_CFLAGS -L/build/target/lib -sEXPORTED_RUNTIME_METHODS=getTempRet0,setTempRet0,addFunction,removeFunction,TTY,FS,ccall"
 
 mkdir -p "$LINUX_DIR"
@@ -156,21 +183,38 @@ echo "[*] packaging qemu-system-aarch64.data (preload /pack)"
 $DOCKER exec -it -w "$BUILD" "$CTN" /bin/sh -c \
   "/emsdk/upstream/emscripten/tools/file_packager.py qemu-system-aarch64.data --preload /pack > load.js"
 
-# 8) install the rebuilt engine + initramfs bundle into the LIVE public/linux/.
-#    The .data (dtb + kernel + gzipped-cpio rootfs) and load.js are rebuilt as
-#    part of this pipeline (steps 6/7) so the deploy is self-consistent with
-#    module.js' -initrd boot. NOTE: this is a from-source build, so the kernel is
-#    ktock's upstream bcm2711_defconfig kernel (slower than the raspi prebuilt
-#    fast kernel). To keep the fast prebuilt kernel, re-stitch it after this step
-#    using the manual repack recipe in AGENTS.md (M27): the .data layout is
-#    dtb[0:32753] | kernel[32753:22505969] | rootfs[22505969:end], and both the
-#    repacked .data and load.js must be updated together.
-BUILT_DIR="$ROOT/public/linux"
+# 8) install the rebuilt engine + initramfs bundle.
+#    mt installs into the LIVE public/linux/ (pthread/MTTCG + pi3-ctl).
+#    st installs into public/linux-st/ (single-thread fallback the harness
+#    auto-selects when SharedArrayBuffer is unavailable); copy the committed
+#    harness (index.html/module.js/load.js/vendor) alongside on first build so
+#    the directory is bootable, then repoint its module.js accel flag via the
+#    harness auto-detect (no manual edit needed).
+if [ "$THREADS" = "st" ]; then
+  BUILT_DIR="$ROOT/public/linux-st"
+else
+  BUILT_DIR="$ROOT/public/linux"
+fi
 mkdir -p "$BUILT_DIR"
-echo "[*] installing rebuilt engine + initramfs bundle into LIVE $BUILT_DIR"
+echo "[*] installing rebuilt $THREADS engine + initramfs bundle into $BUILT_DIR"
 $DOCKER cp "$CTN:$BUILD/qemu-system-aarch64" "$BUILT_DIR/out.js"
 for f in qemu-system-aarch64.wasm qemu-system-aarch64.worker.js qemu-system-aarch64.data load.js; do
   $DOCKER cp "$CTN:$BUILD/$f" "$BUILT_DIR/$f"
 done
+if [ "$THREADS" = "st" ]; then
+  # Seed the fallback dir with the committed harness so it boots standalone;
+  # module.js auto-detects threads=off there (no SAB needed by the engine).
+  # Clear first: re-running the seed over an existing dir would nest
+  # vendor/ inside vendor/.
+  rm -rf "$BUILT_DIR/vendor" "$BUILT_DIR/index.html" "$BUILT_DIR/module.js"
+  for f in index.html module.js vendor; do
+    [ -e "$ROOT/public/linux/$f" ] && cp -r "$ROOT/public/linux/$f" "$BUILT_DIR/$f"
+  done
+  # Deliberately do NOT create $BUILT_DIR/.bootable: the harness only routes
+  # threads=off to linux-st/ when that sentinel exists, and it means "a shell
+  # boot was verified here". Create it (e.g. `: > public/linux-st/.bootable`)
+  # only after test/linux-boot-bench.mjs threads=off reports a shell.
+  echo "[note] single-thread fallback ready in $BUILT_DIR (harness auto-selects it without SAB)"
+fi
 
-echo "[done] rebuilt live engine (pthread/MTTCG + pi3-ctl) + initramfs installed in $BUILT_DIR"
+echo "[done] rebuilt $THREADS engine + initramfs installed in $BUILT_DIR"

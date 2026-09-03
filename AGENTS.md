@@ -878,6 +878,35 @@ container (need QEMU headers); verify with `scripts/build-linux.sh`.
 Full bridge round-trip requires browser verification (`npm run dev` →
 Linux tab → bridge readout + send).
 
+### M32 — SAB on/off toggle + ST build attempt (A/B blocked by arch)
+
+- **Reusable `public/sab-toggle.js`** (no deps, classic script): detect() /
+  getPreference() (`?threads=` › hash › localStorage › auto) /
+  setPreference() / decide() / resolve() / ensureIsolation() / probeFile() /
+  pickVariant() / bindSelect() / describe(). Root page persists the threads
+  dropdown; `public/linux/` consumes it (module.js delegates, index.html
+  badge + routing + fallback panel). Tests: `test/linux-threads-toggle.mjs`
+  (17 checks), `test/linux-boot-bench.mjs` (phase JSON for A/B).
+- **A/B outcome:** MT boots to `~ #` in ~40–70 s. The ST build
+  (`scripts/build-linux.sh --threads=st` → `public/linux-st/`, non-proxy
+  link, initrd boot via engine-aware module.js) compiles/links/packages
+  rc=0 — but cannot execute: ktock's wasm32 JIT calls `init_wasm32()` only
+  from `mttcg_cpu_thread_fn`, so `thread=single` dies on `tb_ptr_ptr`
+  (worker crash); `thread=multi` on the non-shared heap spawns 4 workers ×
+  private 2.3 GB heaps (swap death, CDP timeouts). No-SAB needs upstream
+  backend work (RR init + main-thread-only execution). Harness routes to
+  linux-st/ only on a `.bootable` sentinel (build script won't create it).
+- **Build fixes found by the ST attempt (all committed):** bogus
+  `sysbus_init_child_obj` removed from pwm/spi/i2c-bridge.c (never existed
+  in QEMU 8.2 — the M29 C devices had never compiled); `apply-n4-patches.py`
+  now checks `new`-before-`old` (insert-before anchors re-applied every
+  rebuild → triple `bcm2835_gpio_in_set`); image.Dockerfile installs `cpio`
+  + asserts rootfs > 1 MB (missing cpio silently made a 20-byte rootfs);
+  ST link needs `-sTOTAL_MEMORY=2300MB` (1500 MB OOMs: 512 MB guest + 500 MB
+  tb-size + overhead).
+- **Bench table lives in README** ("SharedArrayBuffer on/off"); ST column
+  stays "blocked" until the backend work lands.
+
 ## Key risks
 
 - Core patch (Phase 1) is the big unknown: if the unicorn.js build can't

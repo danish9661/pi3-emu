@@ -154,8 +154,6 @@ static void pwm_bridge_realize(DeviceState *dev, Error **errp)
     current_pwm = s;
     memory_region_init_io(&s->mmio, OBJECT(dev), &pwm_bridge_ops,
                           s, TYPE_PWM_BRIDGE, PWM_BRIDGE_SIZE);
-    sysbus_init_child_obj(OBJECT(dev), "pwm-bridge-mmio", &s->mmio,
-                          sizeof(s->mmio), &memory_region_ops);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
 }
 

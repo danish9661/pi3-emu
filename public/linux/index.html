@@ -40,6 +40,19 @@
       #boot .title { font-size: 18px; font-weight: 600; color: #fff; }
       #boot .sub { font-size: 13px; color: #9a9a9a; }
       #boot .status { font-size: 13px; color: #6cc; margin-top: 6px; min-height: 1em; }
+      #boot .phases { font-size: 12px; color: #888; min-height: 1em; }
+      #boot .phases b { color: #6cc; font-weight: 600; }
+      #boot .clock { font-size: 12px; color: #666; font-variant-numeric: tabular-nums; }
+      #boot .thread { font-size: 12px; color: #9a9a9a; border: 1px solid #333; border-radius: 4px; padding: 2px 8px; }
+      #boot .thread.single { color: #fc6; border-color: #664d1a; }
+      #boot .fallback { display: flex; flex-direction: column; gap: 8px; align-items: center;
+        max-width: 520px; text-align: center; font-size: 13px; color: #ddd;
+        border: 1px solid #5a2a2a; border-radius: 6px; padding: 12px 16px; background: #1a1010; }
+      #boot .fallback[hidden] { display: none; }
+      #boot .fallback code { color: #f99; font-size: 12px; word-break: break-all; }
+      #boot .fallback .row { display: flex; gap: 8px; }
+      #boot .fallback button { background: #2a2a2a; color: #ddd; border: 1px solid #3a3a3a;
+        border-radius: 4px; padding: 4px 12px; font-size: 12px; cursor: pointer; }
       #boot .spin { width: 28px; height: 28px; border: 3px solid #2a2a2a; border-top-color: #6cc;
         border-radius: 50%; animation: spin 0.9s linear infinite; }
       @keyframes spin { to { transform: rotate(360deg); } }
@@ -104,7 +117,19 @@
       <div class="spin"></div>
       <div class="title">Raspberry Pi 3 — booting Linux</div>
       <div class="sub">QEMU (TCG→WebAssembly) · raspi3ap · 4× Cortex-A53 · 512 MB</div>
-      <div class="status" id="boot-status">Booting kernel…</div>
+      <div class="status" id="boot-status">Downloading engine…</div>
+      <div class="phases" id="boot-phases"></div>
+      <div class="clock" id="boot-clock">T+0s</div>
+      <div class="thread" id="thread-badge">threads: …</div>
+      <div class="fallback" id="boot-fallback" hidden>
+        <div><b>Linux engine failed to start.</b></div>
+        <div id="fallback-detail"><code></code></div>
+        <div id="fallback-hint"></div>
+        <div class="row">
+          <button id="fallback-retry-mt" type="button">Retry multi-thread</button>
+          <button id="fallback-retry-st" type="button">Retry single-thread</button>
+        </div>
+      </div>
     </div>
 
     <!-- Register the SITE-ROOT coi Service Worker (public/coi-serviceworker.js,
@@ -112,12 +137,117 @@
          main app registers. A nested per-frame SW is fragile on GitHub Pages;
          one root-scoped SW avoids the iframe reload race. -->
     <script src="../coi-serviceworker.js"></script>
+    <script src="../sab-toggle.js"></script>
     <script src="./vendor/xterm.js"></script>
     <script src="./vendor/xterm-pty.js"></script>
     <script src="./module.js"></script>
     <script src="./load.js"></script>
     <script type="module">
       import initEmscriptenModule from './out.js';
+      // ---- phased boot progress (T+ clock + milestone chips) ----
+      // Phases: download (load.js XHR via Module.setStatus) → engine
+      // (wasm compile/instantiate) → kernel (first serial output) →
+      // userspace (login/getty) → shell (~ #). Every phase posts to the
+      // parent window so the outer UI's #linuxBoot mirrors it.
+      const T0 = performance.now();
+      const bootEl0 = document.getElementById("boot");
+      const bootStatus0 = document.getElementById("boot-status");
+      const bootPhases = document.getElementById("boot-phases");
+      const bootClock = document.getElementById("boot-clock");
+      const threadBadge = document.getElementById("thread-badge");
+      const phaseTimes = {};
+      const tPlus = () => "T+" + Math.round((performance.now() - T0) / 1000) + "s";
+      setInterval(() => { if (bootClock) bootClock.textContent = tPlus(); }, 500);
+      function renderPhases() {
+        if (!bootPhases) return;
+        const order = ["download", "engine", "kernel", "userspace", "shell"];
+        bootPhases.innerHTML = order.map((p) =>
+          phaseTimes[p] ? "<b>✓ " + p + "</b> " + phaseTimes[p] + "  " : "· " + p + "  ").join("");
+      }
+      function markPhase(p, msg) {
+        if (!phaseTimes[p]) { phaseTimes[p] = tPlus(); renderPhases(); }
+        if (msg && bootStatus0) bootStatus0.textContent = msg;
+        try { window.parent.postMessage({ type: "linux-boot", phase: (msg || p) + " (" + tPlus() + ")" }, "*"); } catch (e) {}
+      }
+      renderPhases();
+      // Thread badge via the reusable SabToggle (../sab-toggle.js); effective
+      // mode comes from module.js (window.__pi3*). Inline strings kept as the
+      // fallback if the library failed to load.
+      const SAB = window.SabToggle || null;
+      const __modeBadge = {
+        requested: window.__pi3ThreadsRequested || "auto",
+        effective: window.__pi3ThreadsEffective || "multi",
+      };
+      const isStE = !!window.__pi3IsStEngine;
+      if (threadBadge) {
+        if (SAB) {
+          const d = SAB.describe(__modeBadge, { isSt: isStE });
+          threadBadge.textContent = d.text;
+          if (d.single) threadBadge.classList.add("single");
+        } else {
+          const effT = __modeBadge.effective;
+          threadBadge.textContent = effT === "multi"
+            ? "threads: MTTCG-4 (SharedArrayBuffer)"
+            : isStE ? "threads: single (dedicated ST engine)"
+            : "threads: single — needs linux-st build";
+          if (effT === "single") threadBadge.classList.add("single");
+        }
+      }
+      // load.js reports data-file XHR via Module.setStatus — surface it.
+      Module["setStatus"] = (s) => { markPhase("download", s || "Downloading engine…"); };
+      markPhase("download", "Downloading engine…");
+      // Fallback panel: out.js throws (e.g. "bad memory" without SAB) instead
+      // of hanging on the spinner — show why + one-click retries that never
+      // 404 (same page, different ?threads=).
+      function showFallback(detail, hint) {
+        const fb = document.getElementById("boot-fallback");
+        const det = document.querySelector("#fallback-detail code");
+        const h = document.getElementById("fallback-hint");
+        if (det) det.textContent = String(detail || "unknown error").slice(0, 300);
+        if (h) h.textContent = hint || "";
+        if (fb) fb.hidden = false;
+        const spin = bootEl0 ? bootEl0.querySelector(".spin") : null;
+        if (spin) spin.style.display = "none";
+      }
+      function reloadWithThreads(t) {
+        const u = new URL(location.href);
+        u.searchParams.set("threads", t);
+        location.href = u.toString();
+      }
+      document.getElementById("fallback-retry-mt").addEventListener("click", () => reloadWithThreads("on"));
+      document.getElementById("fallback-retry-st").addEventListener("click", () => reloadWithThreads("off"));
+      // ---- single-thread routing via SabToggle.pickVariant: the pthread
+      // engine cannot run single (see module.js __pi3NeedSt). If a VERIFIED ST
+      // build exists next door (public/linux-st/ with a .bootable sentinel =
+      // proof of a shell boot), hand off to it (params preserved); else stop
+      // before touching the engine and say how to build it. The async boot
+      // section below checks window.__pi3HaltNoEngine and returns early.
+      // Without the library, fall back to the build panel directly.
+      const ST_MISSING_HINT = "threads=off (or auto without SharedArrayBuffer) needs the dedicated single-thread engine: run scripts/build-linux.sh --threads=st, then reload. Or pick threads:on/auto on a cross-origin-isolated browser for the fast MTTCG engine.";
+      if (window.__pi3NeedSt) {
+        if (SAB) {
+          let r = null;
+          try {
+            // stEntry is a bootability sentinel, NOT out.js: an unbootable ST
+            // build must not receive the redirect (it would crash async past
+            // the init try/catch). See README "SharedArrayBuffer on/off".
+            r = await SAB.pickVariant({ mode: __modeBadge, isSt: isStE,
+              stEntry: "../linux-st/.bootable" });
+          } catch (_) { r = null; }
+          if (r && r.url) {
+            markPhase("download", "Handing off to single-thread engine…");
+            location.href = r.url;
+          } else {
+            markPhase("download", "Single-thread engine not built");
+            showFallback("public/linux-st/out.js missing (HTTP 404)", ST_MISSING_HINT);
+            window.__pi3HaltNoEngine = true;
+          }
+        } else {
+          markPhase("download", "Single-thread engine not built");
+          showFallback("sab-toggle.js missing + single-thread requested", ST_MISSING_HINT);
+          window.__pi3HaltNoEngine = true;
+        }
+      }
       const xterm = new Terminal({ fontSize: 13, cursorBlink: true });
       xterm.open(document.getElementById("terminal"));
       window.xterm = xterm; window.sendLine = (s) => { xterm.focus(); xterm.paste(s + "\r"); };
@@ -147,7 +277,10 @@
       const { master, slave } = openpty();
       xterm.loadAddon(master);
       Module.pty = slave;
-      Module["mainScriptUrlOrBlob"] = location.href.replace(/index\.html$/, "") + "out.js";
+      // Strip query/hash: runLinux() passes cfg+threads via the URL hash, and
+      // any "?…#…" suffix here would poison the pthread worker import URL
+      // (out.js resolves qemu-system-aarch64.worker.js against this base).
+      Module["mainScriptUrlOrBlob"] = location.href.split("#")[0].split("?")[0].replace(/index\.html$/, "") + "out.js";
 
       // hide the COI splash once isolated
       const coiEl = document.getElementById("coi");
@@ -556,6 +689,9 @@
       });
 
       (async () => {
+        // Gated boot: threads=off (or auto without SAB) with no linux-st
+        // build stops here — the fallback panel above is already visible.
+        if (window.__pi3HaltNoEngine) return;
         // restore any persisted disk + vm snapshot overlay
         try { const d = await idbGet(); if (d) window.__pi3Disk = toU8(d); } catch (e) {}
         try {
@@ -584,7 +720,19 @@
             }
           });
         }
-        await initEmscriptenModule(Module);
+        markPhase("engine", "Compiling engine…");
+        try {
+          await initEmscriptenModule(Module);
+        } catch (e) {
+          const msg = (e && (e.message || e)) || e;
+          const noSAB = /shared|bad memory|SharedArrayBuffer/i.test(String(msg));
+          markPhase("engine", "Engine failed to start");
+          showFallback(msg, noSAB
+            ? "This browser has no SharedArrayBuffer (no cross-origin isolation). Retry single-thread — and if that also fails, this engine needs the dedicated single-thread build: scripts/build-linux.sh --threads=st."
+            : "Unexpected engine failure. Retry, or try the other threading mode.");
+          throw e;
+        }
+        markPhase("engine", "Engine ready — booting kernel…");
 
         var oldPoll = Module["TTY"].stream_ops.poll;
         var pty = Module["pty"];
@@ -599,7 +747,14 @@
         var stage = 0, booted = false;
         var bootEl = document.getElementById("boot");
         var bootStatus = document.getElementById("boot-status");
+        // Route milestones through the phased tracker (T+ stamps + chips);
+        // the message text selects the phase bucket.
         var setBoot = function (m) {
+          var phase = null;
+          if (/Kernel up/.test(m)) phase = "kernel";
+          else if (/Console ready|logging in|activating/.test(m)) phase = "userspace";
+          else if (/Boot complete/.test(m)) phase = "shell";
+          if (phase) { try { markPhase(phase, m); } catch (_) {} }
           if (bootStatus) bootStatus.textContent = m;
           try { window.parent.postMessage({ type: "linux-boot", phase: m }, "*"); } catch (e) {}
         };
@@ -612,7 +767,10 @@
             // Reveal the terminal as soon as the guest starts printing: the boot
             // overlay is opaque and would otherwise hide the kernel boot log (and
             // block the toolbar) for the whole boot. Dismiss it on first output.
-            if (txt && txt.trim().length) bootEl.classList.add("hidden");
+            if (txt && txt.trim().length) {
+              bootEl.classList.add("hidden");
+              try { markPhase("kernel", "Kernel up — starting userspace…"); } catch (_) {}
+            }
             if (/Linux version|Please press Enter to activate this console\./.test(txt)) setBoot("Kernel up — starting userspace…");
             if (/login:/.test(txt) && stage === 0) {
               stage = 1; setBoot("Console ready — logging in…"); xterm.focus(); xterm.paste("root\r");

@@ -212,8 +212,6 @@ static void i2c_bridge_realize(DeviceState *dev, Error **errp)
     current_i2c = s;
     memory_region_init_io(&s->mmio, OBJECT(dev), &i2c_bridge_ops,
                           s, TYPE_I2C_BRIDGE, I2C_BRIDGE_SIZE);
-    sysbus_init_child_obj(OBJECT(dev), "i2c-bridge-mmio", &s->mmio,
-                          sizeof(s->mmio), &i2c_bridge_ops);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
 }
 

@@ -57,6 +57,11 @@
           <option value="full">full (all drivers)</option>
           <option value="custom">custom (edit cmdline)</option>
         </select>
+        <select id="linuxThreads" title="Threading: auto picks MTTCG when SharedArrayBuffer is available, else single-thread" style="display:none">
+          <option value="auto" selected>threads: auto</option>
+          <option value="on">threads: on (MTTCG)</option>
+          <option value="off">threads: off (single)</option>
+        </select>
         <button id="run">Run</button>
         <span id="status">loading...</span>
       </div>
@@ -69,6 +74,9 @@
          which also covers the embedded Linux iframe. Registered early so the
          first navigation is already isolated (no iframe reload race). -->
     <script src="./coi-serviceworker.js"></script>
+    <!-- Reusable SharedArrayBuffer on/off (any project can drop this in:
+         SabToggle.detect/resolve/bindSelect — see public/sab-toggle.js) -->
+    <script src="./sab-toggle.js"></script>
     <script src="./unicorn.js"></script>
     <script type="module" src="/src/main.js"></script>
   </body>

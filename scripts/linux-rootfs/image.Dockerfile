@@ -2,7 +2,7 @@ ARG BUSYBOX_VERSION=1.36.1
 ARG KERNEL_TAG=1.20230405
 
 FROM ubuntu:22.04 AS rootfs-dev
-RUN apt-get update && apt-get install -y gcc gcc-aarch64-linux-gnu linux-libc-dev-arm64-cross git make fakeroot
+RUN apt-get update && apt-get install -y gcc gcc-aarch64-linux-gnu linux-libc-dev-arm64-cross git make fakeroot cpio
 ARG BUSYBOX_VERSION
 RUN apt-get update -y && apt-get install -y gcc bzip2 wget fakeroot libc6-dev-arm64-cross
 WORKDIR /work
@@ -54,6 +54,10 @@ RUN cp -f tcc /rootfs/bin/tcc && chmod 755 /rootfs/bin/tcc && \
 # /dev is excluded — the guest mounts devtmpfs over it at boot.
 RUN printf '#!/bin/sh\nmount -t devtmpfs none /dev 2>/dev/null || true\nmount -t proc none /proc 2>/dev/null || true\nmount -t sysfs none /sys 2>/dev/null || true\nexec /bin/init\n' > /rootfs/init && chmod 755 /rootfs/init
 RUN mkdir -p /out && cd /rootfs && find . -path './dev' -prune -o -print0 | cpio --null -o -H newc | gzip -9 > /out/rootfs.bin
+# Fail loudly on an empty archive: without `cpio` installed (or a broken
+# find pipe) gzip still exits 0, producing a ~20-byte rootfs that only dies
+# later at guest VFS-mount time. A real dev rootfs is tens of MB.
+RUN test $(stat -c%s /out/rootfs.bin) -gt 1000000
 
 FROM ubuntu:24.04 AS kernel-dev
 ARG KERNEL_TAG

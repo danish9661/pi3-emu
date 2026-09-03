@@ -267,12 +267,24 @@ const status = document.getElementById('status');
 const runBtn = document.getElementById('run');
 const progSel = document.getElementById('prog');
 const linuxConfigSel = document.getElementById('linuxConfig');
-// Show linux config dropdown only when "linux" is selected
+const linuxThreadsSel = document.getElementById('linuxThreads');
+// Persist the user's SAB/threads pick across sessions (SabToggle storage,
+// shared with the Linux iframe). One-line binding; falls back to plain
+// behavior if the library failed to load.
+try {
+  if (window.SabToggle && linuxThreadsSel) {
+    window.SabToggle.bindSelect(linuxThreadsSel);
+  }
+} catch (_) {}
+// Show linux config + threads dropdowns only when "linux" is selected
+function syncLinuxSels() {
+  const show = progSel.value === LINUX_MODE ? 'inline-block' : 'none';
+  if (linuxConfigSel) linuxConfigSel.style.display = show;
+  if (linuxThreadsSel) linuxThreadsSel.style.display = show;
+}
 if (progSel && linuxConfigSel) {
-  linuxConfigSel.style.display = progSel.value === LINUX_MODE ? 'inline-block' : 'none';
-  progSel.addEventListener('change', () => {
-    linuxConfigSel.style.display = progSel.value === LINUX_MODE ? 'inline-block' : 'none';
-  });
+  syncLinuxSels();
+  progSel.addEventListener('change', syncLinuxSels);
 }
 const statsEl = document.getElementById('stats');
 const hint = document.getElementById('hint');
@@ -1501,28 +1513,32 @@ function runLinux() {
   if (oskEl) oskEl.hidden = true;
   const linuxBoot = document.getElementById('linuxBoot');
   if (linuxBoot) { linuxBoot.hidden = false; linuxBoot.textContent = 'booting Linux…'; }
-  // Pass selected boot config to the iframe via window.__linuxConfig
+  // Pass selected boot config + threading mode to the iframe via
+  // window.__linuxConfig/__linuxThreads AND the URL hash (the hash survives
+  // iframe reloads; the window props cover the first load).
   const cfg = linuxConfigSel ? linuxConfigSel.value : 'minimal';
+  const threads = linuxThreadsSel ? linuxThreadsSel.value : 'auto';
   window.__linuxConfig = cfg;
+  window.__linuxThreads = threads;
+  const linuxUrl = './linux/index.html#cfg=' + encodeURIComponent(cfg) +
+    '&threads=' + encodeURIComponent(threads);
+  // Always boot a FRESH iframe: reusing one via src=/location assignment is
+  // unreliable when only the hash changes (cfg/threads live in the hash) —
+  // same-document fragment navigations don't reload, so the engine would keep
+  // stale argv. Recreation also drops stale wasm workers from the last boot.
   let frame = document.getElementById('linuxframe');
-  if (!frame) {
-    frame = document.createElement('iframe');
-    frame.id = 'linuxframe';
-    frame.style.width = '100%';
-    frame.style.height = '82vh';
-    frame.style.border = '0';
-    frame.style.background = '#111';
-    term.parentNode.insertBefore(frame, term.nextSibling);
-  }
-  const loaded = frame.src && frame.src.indexOf('linux/index.html') !== -1;
-  if (loaded) {
-    try { frame.contentWindow.location.reload(); } catch (e) { frame.src = './linux/index.html'; }
-  } else {
-    frame.src = './linux/index.html';
-  }
+  if (frame) frame.remove();
+  frame = document.createElement('iframe');
+  frame.id = 'linuxframe';
+  frame.style.width = '100%';
+  frame.style.height = '82vh';
+  frame.style.border = '0';
+  frame.style.background = '#111';
+  term.parentNode.insertBefore(frame, term.nextSibling);
+  frame.src = linuxUrl;
   frame.hidden = false;
-  setStatus('booting Linux (' + cfg + ') — qemu-wasm raspi3ap — serial console in the frame below');
-  hint.textContent = 'Linux runs in the embedded frame (cross-origin isolated for threads). Press Reboot to reload the VM.';
+  setStatus('booting Linux (' + cfg + ' / threads ' + threads + ') — qemu-wasm raspi3ap — serial console in the frame below');
+  hint.textContent = 'Linux runs in the embedded frame (threads: auto = MTTCG when isolated, else single-thread fallback). Press Reboot to reload the VM.';
   runBtn.textContent = 'Reboot';
   runBtn.disabled = false;
 }

@@ -190,8 +190,6 @@ static void spi_bridge_realize(DeviceState *dev, Error **errp)
     current_spi = s;
     memory_region_init_io(&s->mmio, OBJECT(dev), &spi_bridge_ops,
                           s, TYPE_SPI_BRIDGE, SPI_BRIDGE_SIZE);
-    sysbus_init_child_obj(OBJECT(dev), "spi-bridge-mmio", &s->mmio,
-                          sizeof(s->mmio), &spi_bridge_ops);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
 }
 

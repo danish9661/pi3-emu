@@ -21,16 +21,22 @@ FILES = {
 def patch(path, old, new):
     with open(path, "r") as f:
         src = f.read()
-    if old in src:
+    # Already-applied check FIRST: several `new` blocks contain their own
+    # `old` anchor as a substring (insert-before anchors, the #include line,
+    # the qdev_realize line), so an anchor-present check alone re-applies on
+    # every run — duplicating functions/devices (bcm2835_gpio_in_set
+    # "redefinition", double pi3-ctl instantiation). The full `new` block can
+    # only be present if this patch already landed.
+    if new in src:
+        # Already applied (idempotent re-run on the same source tree).
+        print(f"already patched (skipped) {path}")
+    elif old in src:
         if src.count(old) != 1:
             raise SystemExit(f"ANCHOR AMBIGUOUS ({src.count(old)}) in {path}")
         src = src.replace(old, new)
         with open(path, "w") as f:
             f.write(src)
         print(f"patched {path}")
-    elif new in src:
-        # Already applied (idempotent re-run on the same source tree).
-        print(f"already patched (skipped) {path}")
     else:
         raise SystemExit(f"ANCHOR NOT FOUND in {path}:\n{old}")
 
