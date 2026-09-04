@@ -2,8 +2,8 @@ import { createRequire } from 'module';
 import { readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { createLocalInt } from '../src/localint.js';
-import { createIc } from '../src/ic.js';
+import { createLocalInt } from '../packages/pi3-emu/src/localint.js';
+import { createIc } from '../packages/pi3-emu/src/ic.js';
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));

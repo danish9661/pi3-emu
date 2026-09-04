@@ -12,7 +12,7 @@ bare-metal OS would.
 |   term / prog select <-> host loop (src/main.js)             |
 |     loads the ELF, delivers keystrokes, drains TX, draws     |
 +---------------------------+----------------------------------+
-| ELF loader (src/elf.js)   | parses PT_LOAD segments, zeros   |
+| ELF loader (packages/pi3-emu/src/elf.js)   | parses PT_LOAD segments, zeros   |
 |                           | .bss, sets PC=e_entry, SP=RAM top |
 +---------------------------+----------------------------------+
 | Board (Rust -> wasm)      |  board/src/lib.rs                |
@@ -93,6 +93,12 @@ A free-running 40-bit counter ticking in microseconds of host wall clock
 The `clock` program sleeps a real wall-clock second by spinning on CLO,
 arms C1 for +0.5 s and polls the M1 match bit, then clears it. The shell
 has a `time` command printing the live counter.
+
+Append `?vt=1` to the page URL for **virtual time**: the counter advances
+per executed instruction (~10 MIPS) instead of wall clock, so runs are
+deterministic and sleeps finish instantly (`clock` parks in ~2 s wall).
+The `pi3-emu` package exposes the same mode (`virtualTime: true`);
+`node test/virtual-time.mjs` proves identical CLO traces across runs.
 
 ## VideoCore mailbox (0x3F00B880)
 
@@ -222,7 +228,7 @@ corrupted by `mem_write`). The `mmu` program demos host-assisted
 translation instead: the guest still does the real work — it builds a
 classic 4-level page table in RAM and enables the MMU by writing
 `rootPa | 1` to the MMU_CTL window — and the host walks those tables
-(src/mmu.js):
+(packages/pi3-emu/src/mmu.js):
 
 ```
 VA 0x00000000 - 0x3FFFFFFF  1G block  -> PA 0x00000000 (identity)
@@ -266,7 +272,7 @@ control blocks, programs the channel and arms the IRQ). Channel 0 has
 the real register layout — CS at +0x00 with ACTIVE/END/INT bits,
 CONBLK_AD at +0x04 — plus the real DMA_ENABLE register at 0x3F00E050.
 The guest builds a 3-CB chain in RAM and starts it by writing
-CS.ACTIVE; the host walks the chain between slices (src/dma.js), copies
+CS.ACTIVE; the host walks the chain between slices (packages/pi3-emu/src/dma.js), copies
 or fills the buffers, latches CS.END and raises CS.INT — the INTEN bit
 (31, a documented host extension) on the final CB drives the IC's DMA0
 line (bit 16), and the M11 delivery path vectors the guest:
@@ -312,7 +318,7 @@ fixed-point phase accumulator per note, all integer math — paced by the
 FULL1/EMPT1 handshake the host refreshes in STA (the FIFO is a real
 device: it fills, the guest waits, the host drains it between slices).
 
-The controller's write-mask model (src/pwm.js): CTL level bits are
+The controller's write-mask model (packages/pi3-emu/src/pwm.js): CTL level bits are
 latched from guest writes and reflected back (write-mask semantics,
 like the other windows), STA.FULL1/EMPT1 are derived from the FIFO
 depth, and FIFO/DAT1 writes are captured with a range-limited
@@ -320,9 +326,12 @@ depth, and FIFO/DAT1 writes are captured with a range-limited
 identical samples in a row can't be missed the way a window diff would.
 Each word's low 16 bits are a signed sample (the documented convention
 for this model); the host drains 64 samples per slice into a ring (the
-depth 256 absorbs one slice's burst, since the guest can only observe
-FULL1 at slice boundaries) and the browser's ScriptProcessor pulls the
-ring to the speakers at 44.1 kHz. The guest finishes with the usual
+depth 256 absorbs one 512-insn slice's burst, since the guest can only
+observe FULL1 at slice boundaries — the browser runs the pwm guest on
+pinned 512-insn slices for exactly this reason; the 4096 default overruns
+the FIFO and drops ~86% of samples) and the browser plays them through an
+AudioWorklet (`public/audio-pwm.js`, ScriptProcessor fallback) at the
+context rate. The guest finishes with the usual
 explicit-done protocol (PWM_DONE at +0x54, like TMR_DONE/MMU_DONE).
 
 ```
@@ -350,7 +359,7 @@ pwm: parked
 ## I2C (0x3F804000, host-arbitrated sensor)
 
 The `i2c` program reads a host-played sensor: the BCM2835 BSC master at
-0x3F804000, pure window model like the DMA/IC (src/i2c.js) — when the
+0x3F804000, pure window model like the DMA/IC (packages/pi3-emu/src/i2c.js) — when the
 guest raises C.ST the host snapshots the FIFO window (DLEN bytes), runs
 the slave, and for reads loads the response back into the FIFO window.
 The slave is a classic sensor sequence: write the register address, read
@@ -373,7 +382,7 @@ i2c: parked
 
 ## SPI (0x3F204000, host-arbitrated flash slave)
 
-The `spi` program drives the BCM2835 SPI0 master (src/spi.js) with the
+The `spi` program drives the BCM2835 SPI0 master (packages/pi3-emu/src/spi.js) with the
 host playing an SPI slave: a flash chip answering the JEDEC ID command
 (0x9F) with 0xEF 0x40 0x18. The guest runs a real transaction: select
 CS0, push the command bytes into the FIFO, raise TA, poll CS.DONE, read
@@ -511,6 +520,11 @@ steps, instructions and timings.
 npm install
 npm run dev        # vite dev server -> http://localhost:5173
 ```
+
+A faulting guest no longer dies silently: `uc_emu_start` failures are
+decoded to PC/SP/faulting instruction/likely cause (`guest fault: ...` in
+the terminal and status line; `emu.lastFault` / `window.__lastFault`).
+Persistent faults halt the animation loops instead of spinning forever.
 
 ## Linux tab (real arm64 Linux in the browser)
 
@@ -706,6 +720,18 @@ node test/linux-threads-toggle.mjs # SAB toggle: lib on both pages, routing, per
 node test/linux-boot-bench.mjs     # Linux boot benchmark: phase T+ times + time-to-shell as JSON
 ```
 
+## Rebuilding the CPU core (`src/patches/`)
+
+`public/unicorn.js` is a patched + rebuilt `AlexAltea/unicorn.js @ 8028ec43`
+(single-arch aarch64): real IRQ injection (`uc_arm64_set_irq`), ARM generic
+timer (`uc_arm64_timer_tick`, CNTFRQ 19.2 MHz), host debug reads
+(`uc_arm64_debug`), and AArch64 fixes for bare-metal reset
+(`arm_el_is_aa64`, `arm_cpu_do_interrupt`). The patch files under
+`src/patches/` (with apply order + build recipe in `src/patches/README.md`)
+reconstruct that set from a fresh clone — verified by rebuilding with
+emsdk 6.0.6 and running the full probe battery green (lirq 14/14, mva
+functional; only the by-design walk-diagnostic assertions differ).
+
 ## Build
 
 ```sh
@@ -731,15 +757,15 @@ programs/             Rust workspace: runtime lib + shell/sum/fib/smp guests
   uart1/              mini UART demo: second console tagged [u1]
   sd/                 SD demo: SDHCI init + FAT12 card, prints HELLO.TXT
   uart0/              PL011 demo: baud config, FR flow control, RXINTR -> IRQ 57, RX echo
-packages/pi3-emu/src/elf.js   ELF64 loader (PT_LOAD + bss zeroing)
-packages/pi3-emu/src/mmu.js   host-assisted MMU: table walk, shadow mapping, mirror
-packages/pi3-emu/src/dma.js   host-arbitrated DMA: CB chain walk + transfer engine
-packages/pi3-emu/src/pwm.js   host-arbitrated PWM: FIFO model, drain ring, write hook
-packages/pi3-emu/src/i2c.js   host-arbitrated I2C: BSC window, sensor slave
-packages/pi3-emu/src/spi.js   host-arbitrated SPI: SPI0 window, flash slave
-packages/pi3-emu/src/uart1.js mini UART model: write hook emits chars at write time
-packages/pi3-emu/src/uart0.js PL011 model: DR/FR/RIS/MIS windows, RX FIFO, RXINTR -> IRQ 57
-packages/pi3-emu/src/sdhci.js host-arbitrated SDHCI: block buffer, FAT12 image
+packages/pi3-emu/packages/pi3-emu/src/elf.js   ELF64 loader (PT_LOAD + bss zeroing)
+packages/pi3-emu/packages/pi3-emu/src/mmu.js   host-assisted MMU: table walk, shadow mapping, mirror
+packages/pi3-emu/packages/pi3-emu/src/dma.js   host-arbitrated DMA: CB chain walk + transfer engine
+packages/pi3-emu/packages/pi3-emu/src/pwm.js   host-arbitrated PWM: FIFO model, drain ring, write hook
+packages/pi3-emu/packages/pi3-emu/src/i2c.js   host-arbitrated I2C: BSC window, sensor slave
+packages/pi3-emu/packages/pi3-emu/src/spi.js   host-arbitrated SPI: SPI0 window, flash slave
+packages/pi3-emu/packages/pi3-emu/src/uart1.js mini UART model: write hook emits chars at write time
+packages/pi3-emu/packages/pi3-emu/src/uart0.js PL011 model: DR/FR/RIS/MIS windows, RX FIFO, RXINTR -> IRQ 57
+packages/pi3-emu/packages/pi3-emu/src/sdhci.js host-arbitrated SDHCI: block buffer, FAT12 image
 src/main.js           browser host loop (device sync + scheduler + DOM);
                       engine modules live in packages/pi3-emu/src/
 packages/pi3-emu/     npm package: headless core (src/index.js facade +
@@ -929,7 +955,7 @@ dist/                 production bundle
   'number' throws), restoring `lirq` 14/14; full 19-probe regression
   green
 - M22 — real legacy-IC IRQ semantics for the Linux-boot device set. A new
-  `src/ic.js` models the BCM2835 interrupt controller (0x3F00B200) as a
+  `packages/pi3-emu/src/ic.js` models the BCM2835 interrupt controller (0x3F00B200) as a
   real 3-bank register file — IC_BASIC/IRQ1/IRQ2 pending, ENABLE_IRQS1/2
   + DISABLE_IRQS1/2, per-bank lines derived *fresh* from the device
   lines on every read (no stale windows) — with the real bank map: IRQ 1
@@ -939,7 +965,7 @@ dist/                 production bundle
   (bank-2 bit 30), IRQ 81/82 = GPIO banks 0/1 (bank-2 bits 17/18). The
   system-timer convention is fixed to real hardware: C1@0x10 → CS bit 1
   (the irq guest's timer line) and C3@0x18 → CS bit 3 (the lirq guest's
-  Phase B — Linux's bcm2835_timer uses C3/IRQ 29). `src/gpio.js` is a
+  Phase B — Linux's bcm2835_timer uses C3/IRQ 29). `packages/pi3-emu/src/gpio.js` is a
   full GPIO model — GPFSEL/GPSET/GPCLR W1S/W1C, host-driven GPLEV,
   GPEDS W1C, GPREN/GPFEN/GPHEN/GPLEN/GPAREN/GPAFEN, GPPUD — with
   host-side edge detection at slice boundaries and a bank IRQ line for

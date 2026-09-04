@@ -39,6 +39,7 @@ import { createUart25 } from './uart25.js';
 import { createUsb } from './usb.js';
 import { mmuEnable, mmuMirrorWrite } from './mmu.js';
 import { dmaRunChain } from './dma.js';
+import { decodeFault } from './fault.js';
 
 export { parseElf, loadElf, readU32, writeU32 };
 export { createUart0, createUart1, createGpio, createIc, createLocalInt };
@@ -46,6 +47,7 @@ export { createI2c, createSpi, createPwm, createSdhci };
 export { createRng, createTempSensor, createClockMgr, createI2s };
 export { createSpi1, createSpi2, createUart25, createUsb };
 export { mmuEnable, mmuMirrorWrite, dmaRunChain };
+export { decodeFault };
 
 // Load the vendored unicorn.js CPU core (node path; browsers use the
 // <script> global MUnicorn instead and pass the module in directly).
@@ -63,6 +65,10 @@ export const RAM_SIZE = 0x400000;
 export const UART_WINDOW = 0x1000;
 export const SLICE_INSNS = 4096;
 export const MAX_SLICES = 5000;
+// Default virtual-time rate: ~measured throughput of the rebuilt core, so a
+// virtual second costs about a wall second on a typical machine (but stays
+// exact regardless of host speed).
+export const VIRTUAL_IPS = 10000000;
 
 export const UART0_BASE = 0x3f201000; // PL011 console
 export const TMR_BASE = 0x3f003000; // system timer
@@ -93,8 +99,11 @@ export const SD_BASE = 0x3f300000;
 export class Pi3Emulator {
   // ucMod: unicorn module (await loadUnicorn() or window.MUnicorn()).
   // opts: { ramSize, sliceInsns, maxSlices, onConsole(text), onBridgeData(msg),
-  //         realIrq } — realIrq enables native CPU_INTERRUPT_HARD delivery
-  //         (lirq-style guests); default is host-assisted IRQ_RET delivery.
+  //         realIrq, virtualTime } — realIrq enables native CPU_INTERRUPT_HARD
+  //         delivery (lirq-style guests); default is host-assisted IRQ_RET
+  //         delivery. virtualTime (true or { ips }) decouples the system timer
+  //         from the wall clock: each slice advances the clock by
+  //         insns/ips seconds, making runs deterministic and sleeps instant.
   constructor(ucMod, opts = {}) {
     this.ucMod = ucMod;
     this.ramSize = opts.ramSize || RAM_SIZE;
@@ -103,11 +112,18 @@ export class Pi3Emulator {
     this.onConsole = opts.onConsole || null;
     this.onBridgeData = opts.onBridgeData || null;
     this.realIrq = !!opts.realIrq;
+    this.virtualIps = opts.virtualTime
+      ? (typeof opts.virtualTime === 'object' && opts.virtualTime.ips) || VIRTUAL_IPS
+      : 0;
+    this.virtualUs = 0;
     this.uc = new ucMod.Unicorn(ucMod.ARCH_ARM64, ucMod.MODE_LITTLE_ENDIAN);
     this.entry = 0;
     this.consoleText = '';
     this.stats = { steps: 0, insns: 0 };
     this.lastError = null;
+    this.lastFault = null;
+    this.lastSyncError = null;
+    this.faultStreak = 0;
     this.devices = []; // generic { syncOut?, syncIn? } synced every slice
     // Device state (timers, irq machinery).
     this.tmrWall0 = Date.now();
@@ -163,6 +179,20 @@ export class Pi3Emulator {
     );
   }
 
+  // A device mirror write must never kill the host loop (e.g. a test that
+  // unmaps a window): record the first failure and continue best-effort.
+  safeSync(fn) {
+    try {
+      fn();
+    } catch (e) {
+      if (!this.lastSyncError) this.lastSyncError = e;
+    }
+  }
+  // Emulated "now" in microseconds: wall clock, or the virtual counter.
+  emuNowUs() {
+    if (this.virtualIps) return Math.floor(this.virtualUs);
+    return (Date.now() - this.tmrWall0) * 1000;
+  }
   // ---- small helpers -------------------------------------------------
   dbg(sel) {
     try { return Number(this.uc.arm64_debug(sel)); } catch (_) { return 0; }
@@ -259,7 +289,7 @@ export class Pi3Emulator {
 
   // ---- system timer ---------------------------------------------------
   syncTimerOut() {
-    const us = ((Date.now() - this.tmrWall0) * 1000) & 0xffffffff;
+    const us = this.emuNowUs() & 0xffffffff;
     writeU32(this.uc, TMR_CLO, us);
     writeU32(this.uc, TMR_CLO + 4, 0);
     for (let i = 0; i < 4; i++) {
@@ -397,6 +427,7 @@ export class Pi3Emulator {
     const elf = parseElf(new Uint8Array(bytes));
     this.entry = loadElf(this.uc, elf);
     this.tmrWall0 = Date.now();
+    this.virtualUs = 0;
     return this.entry;
   }
   runSlice(count) {
@@ -408,33 +439,41 @@ export class Pi3Emulator {
     this.irqResume = 0;
     this.irqVector = 0;
     this.syncTimerOut();
-    this.gpio.syncOut(uc);
-    this.ic.syncOut(uc);
-    this.syncLocalOut();
+    this.safeSync(() => this.gpio.syncOut(uc));
+    this.safeSync(() => this.ic.syncOut(uc));
+    this.safeSync(() => this.syncLocalOut());
     if (this.realIrq && this.hasDebug()) {
       try {
-        const us = (Date.now() - this.tmrWall0) * 1000;
-        uc.arm64_timer_tick(BigInt(Math.floor(us * 19.2)));
+        uc.arm64_timer_tick(BigInt(Math.floor(this.emuNowUs() * 19.2)));
       } catch (_) {}
     }
-    if (this.uart0SyncOut) this.uart0SyncOut(uc);
-    for (const d of this.devices) { if (d.syncOut) d.syncOut(uc); }
+    if (this.uart0SyncOut) this.safeSync(() => this.uart0SyncOut(uc));
+    for (const d of this.devices) { if (d.syncOut) this.safeSync(() => d.syncOut(uc)); }
     try {
       uc.emu_start(pc, 0, 0, n);
+      this.faultStreak = 0;
     } catch (e) {
-      // Unmapped accesses (e.g. unmodeled windows) fault naturally; the
-      // guest resumes from the faulting PC — like the browser host loop.
+      // Unmapped accesses (e.g. unmodeled windows) fault naturally; decode
+      // for humans, then resume from the faulting PC like the browser loop.
       this.lastError = e;
+      try {
+        this.lastFault = decodeFault(uc, ucMod, e,
+          { ramBase: RAM_BASE, ramSize: this.ramSize });
+      } catch (_) {
+        this.lastFault = null;
+      }
+      this.faultStreak++;
     }
     this.stats.steps += 1;
     this.stats.insns += n;
+    if (this.virtualIps) this.virtualUs += (n / this.virtualIps) * 1e6;
     this.syncTimerIn();
-    this.gpio.syncIn(uc);
-    this.ic.syncIn(uc);
-    this.syncLocalIn();
+    this.safeSync(() => this.gpio.syncIn(uc));
+    this.safeSync(() => this.ic.syncIn(uc));
+    this.safeSync(() => this.syncLocalIn());
     this.syncIrqRet();
-    if (this.uart0SyncIn) this.uart0SyncIn(uc);
-    for (const d of this.devices) { if (d.syncIn) d.syncIn(uc); }
+    if (this.uart0SyncIn) this.safeSync(() => this.uart0SyncIn(uc));
+    for (const d of this.devices) { if (d.syncIn) this.safeSync(() => d.syncIn(uc)); }
     this.irqDeliver();
   }
   // Drain newly emitted console text since the last call.

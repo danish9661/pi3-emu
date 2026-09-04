@@ -55,6 +55,9 @@ SP), or start from `firmware/shell.elf` + `firmware/i2c.elf`.
   issuing mailbox tags spin (run loops stay bounded).
 - Interrupts: host-assisted `IRQ_RET` delivery by default; `realIrq: true`
   for local-block guests.
+- Faults: `emu.lastFault` holds a decoded crash report (`decodeFault` is
+  exported too); pass `virtualTime: true` (or `{ips}`) for deterministic,
+  instant-timer runs.
 
 ## Test
 

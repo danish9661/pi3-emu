@@ -19,6 +19,7 @@ import { createSpi1 } from '../packages/pi3-emu/src/spi1.js';
 import { createSpi2 } from '../packages/pi3-emu/src/spi2.js';
 import { createUart25 } from '../packages/pi3-emu/src/uart25.js';
 import { createUsb } from '../packages/pi3-emu/src/usb.js';
+import { decodeFault } from '../packages/pi3-emu/src/fault.js';
 
 const UART_WINDOW = 0x1000;
 const RAM_BASE = 0x0;
@@ -302,6 +303,16 @@ let cores = null; // smp: one unicorn instance per core
 let entries = null; // smp: per-core resume/entry addresses
 let smpState = null; // smp: host-arbitrated mailbox state
 let tmrWall0 = 0; // timer epoch: performance.now() at program boot
+// Virtual time (?vt=1): the system timer advances per executed instruction
+// (VIRTUAL_IPS) instead of wall clock — deterministic runs, instant sleeps.
+const VIRTUAL_TIME = (() => {
+  try { return new URLSearchParams(location.search).get('vt') === '1'; } catch (_) { return false; }
+})();
+const VIRTUAL_IPS = 10000000;
+let virtualUs = 0;
+function emuNowUs() {
+  return VIRTUAL_TIME ? Math.floor(virtualUs) : (performance.now() - tmrWall0) * 1000;
+}
 let tmrPending = 0; // CS match bits not yet cleared by the guest
 let tmrCrossed = [false, false, false, false]; // compare fired (edge-triggered)
 let tmrCompares = [0, 0, 0, 0];
@@ -405,6 +416,9 @@ function boot(ucMod, uc, board, elf, opts = {}) {
   uart0IrqActive = uart0.irqActive;
   uc.entry = elf.entry;
   tmrWall0 = performance.now();
+  virtualUs = 0;
+  lastFault = null;
+  faultStreak = 0;
   tmrPending = 0;
   tmrCrossed = [false, false, false, false];
   tmrCompares = [0, 0, 0, 0];
@@ -441,6 +455,8 @@ function boot(ucMod, uc, board, elf, opts = {}) {
   pwmAudioFed = 0;
   audioPos = 0;
   audioLen = 0;
+  audioPending = [];
+  try { window.__pwmFed = 0; } catch (_) {}
 
   const i2c = createI2c(uc, ucMod, I2C_BASE, opts.linux ? onBridgeData : null);
   i2cSyncOut = i2c.syncOut;
@@ -868,6 +884,14 @@ let irqElr = 0;
 let irqInFlight = false;
 let irqVector = 0;
 let irqResume = 0;
+// Guest fault tracking: emu_start failures are decoded for humans (see
+// fault.js) instead of killing the loop; persistent faults halt rAF loops.
+let lastFault = null;
+let faultStreak = 0;
+function faultHalted() {
+  if (faultStreak > 50 && lastFault) return 'guest fault: ' + lastFault.cause;
+  return null;
+}
 
 function daifI() {
   return ((Number(uc.arm64_debug(1)) >> 7) & 1) === 1;
@@ -942,7 +966,7 @@ function updateGpioPanel() {
 // memory can only observe byte changes, so CS here is write-mask, not the
 // real BCM2837's W1C); a monotonic counter never re-fires a cleared compare.
 function syncTimerOut(uc) {
-  const us = ((performance.now() - tmrWall0) * 1000) & 0xffffffff;
+  const us = emuNowUs() & 0xffffffff;
   writeU32(uc, TMR_CLO, us);
   writeU32(uc, TMR_CLO + 4, 0);
   for (let i = 0; i < 4; i++) {
@@ -1150,34 +1174,90 @@ function syncDmaIn(uc) {
   }
 }
 
-// PWM audio playback: the host drains the guest's FIFO into a sample ring
-// (src/pwm.js); a ScriptProcessor pulls the ring to the speakers at the
-// context's rate. Created on the Run click (a user gesture), so the
-// AudioContext is allowed to play.
+// PWM audio playback: the host drains the guest's FIFO into samples and
+// forwards them to an AudioWorklet ('pi3-pwm', public/audio-pwm.js), which
+// queues them to the speakers at the context's rate. Created on the Run
+// click (a user gesture), so the AudioContext is allowed to play. Falls
+// back to the deprecated ScriptProcessor path where AudioWorklet is
+// unavailable. window.__pwmEngine/__pwmFed expose the path + posted total
+// for tests.
+let audioWorkletNode = null;
+let audioPending = [];
+let audioUseWorklet = false;
 function initAudio() {
   if (audioCtx) return;
   const AC = window.AudioContext || window.webkitAudioContext;
   if (!AC) return;
   audioCtx = new AC();
+  // Stage into the classic ring synchronously (the guest may drain its whole
+  // FIFO before the worklet module finishes loading); upgrade below.
   audioRing = new Float32Array(1 << 18);
-  const sp = audioCtx.createScriptProcessor(4096, 0, 1);
-  sp.onaudioprocess = (e) => {
-    const out = e.outputBuffer.getChannelData(0);
-    for (let i = 0; i < out.length; i++) {
-      out[i] = audioLen > 0 ? audioRing[(audioPos++) & (audioRing.length - 1)] * 0.3 : 0;
-      if (audioLen > 0) audioLen--;
-    }
+  window.__pwmEngine = 'script';
+  const startScriptFallback = () => {
+    if (audioWorkletNode || window.__pwmEngine === 'script-live') return;
+    const sp = audioCtx.createScriptProcessor(4096, 0, 1);
+    sp.onaudioprocess = (e) => {
+      const out = e.outputBuffer.getChannelData(0);
+      for (let i = 0; i < out.length; i++) {
+        out[i] = audioLen > 0 ? audioRing[(audioPos++) & (audioRing.length - 1)] * 0.3 : 0;
+        if (audioLen > 0) audioLen--;
+      }
+    };
+    sp.connect(audioCtx.destination);
+    window.__pwmEngine = 'script-live';
   };
-  sp.connect(audioCtx.destination);
+  if (audioCtx.audioWorklet) {
+    audioCtx.audioWorklet.addModule('./audio-pwm.js').then(() => {
+      audioWorkletNode = new AudioWorkletNode(audioCtx, 'pi3-pwm');
+      audioWorkletNode.connect(audioCtx.destination);
+      // Forward anything staged while the module was loading.
+      if (audioLen > 0) {
+        const backlog = new Float32Array(audioLen);
+        for (let i = 0; i < audioLen; i++) backlog[i] = audioRing[(audioPos + i) & (audioRing.length - 1)];
+        audioPos = 0;
+        audioLen = 0;
+        const n = backlog.length; // read BEFORE post: transfer neuters the buffer (length -> 0)
+        try {
+          audioWorkletNode.port.postMessage(backlog, [backlog.buffer]);
+        } catch (_) {
+          try { audioWorkletNode.port.postMessage(new Float32Array(n)); } catch (_) {}
+        }
+        window.__pwmFed = (window.__pwmFed || 0) + n;
+      }
+      audioUseWorklet = true;
+      window.__pwmEngine = 'worklet';
+    }).catch(() => startScriptFallback());
+  } else {
+    startScriptFallback();
+  }
   if (audioCtx.state === 'suspended') audioCtx.resume();
 }
 function audioPush(sampleWord) {
-  if (!audioRing) return;
   const s16 = ((sampleWord & 0xffff) << 16) >> 16; // low 16 bits = signed sample
+  if (audioUseWorklet && audioWorkletNode) {
+    if (audioPending.length < (1 << 19)) audioPending.push(s16 / 32768);
+    return;
+  }
+  if (!audioRing) return;
   if (audioLen < audioRing.length) {
     audioRing[(audioPos + audioLen) & (audioRing.length - 1)] = s16 / 32768;
     audioLen++;
   }
+}
+// Post staged worklet samples (no-op on the ScriptProcessor path, whose
+// consumer pulls the ring itself). Called at the end of every slice.
+function audioFlush() {
+  if (!audioWorkletNode || audioPending.length === 0) return;
+  const batch = new Float32Array(audioPending);
+  audioPending = [];
+  const n = batch.length; // read BEFORE post: transfer neuters the buffer
+  try {
+    audioWorkletNode.port.postMessage(batch, [batch.buffer]);
+  } catch (_) {
+    // Fallback: post without transfer if the buffer is neutered/detached.
+    try { audioWorkletNode.port.postMessage(new Float32Array(batch)); } catch (_) {}
+  }
+  window.__pwmFed = (window.__pwmFed || 0) + n;
 }
 
 // UART1 chars reach the same terminal, tagged "[u1] " once per line (the
@@ -1212,8 +1292,7 @@ function runSlice(count) {
     // The arch timer counter runs at the real 19.2 MHz rate (CNTFRQ):
     // LIRQ_MODE ticks it so Phase A's CNTP_CTL compare can fire, and Linux
     // reads CNTPCT for timekeeping (the clockevent needs it to advance too).
-    const us = (performance.now() - tmrWall0) * 1000;
-    uc.arm64_timer_tick(BigInt(Math.floor(us * 19.2)));
+    uc.arm64_timer_tick(BigInt(Math.floor(emuNowUs() * 19.2)));
   }
   syncMmuOut(uc);
   syncDmaOut(uc);
@@ -1233,10 +1312,22 @@ function runSlice(count) {
   if (usbSyncOut) usbSyncOut(uc);
   for (const s of uart25SyncOut) s(uc);
   const t0 = performance.now();
-  uc.emu_start(pc, 0, 0, count);
+  try {
+    uc.emu_start(pc, 0, 0, count);
+    faultStreak = 0;
+  } catch (e) {
+    try {
+      lastFault = decodeFault(uc, ucMod, e, { ramBase: RAM_BASE, ramSize: RAM_SIZE });
+    } catch (_) {
+      lastFault = null;
+    }
+    faultStreak++;
+    try { window.__lastFault = lastFault; } catch (_) {}
+  }
   stats.emuMs += performance.now() - t0;
   stats.steps += 1;
   stats.insns += count;
+  if (VIRTUAL_TIME) virtualUs += (count / VIRTUAL_IPS) * 1e6;
   syncTimerIn(uc);
   syncMailboxIn(uc);
   if (gpio) {
@@ -1266,6 +1357,7 @@ function runSlice(count) {
   if (usbSyncIn) usbSyncIn(uc);
   for (const s of uart25SyncIn) s(uc);
   const out = drain(board);
+  audioFlush();
   irqDeliver(uc);
   return out;
 }
@@ -1357,10 +1449,16 @@ function runUntilDmaDone() {
 // The pwm guest generates the whole tune (paced by the FIFO handshake) in
 // one burst, so it uses the explicit-done protocol: slices until the guest
 // writes PWM_DONE; the drained samples keep playing from the audio ring.
+// Slice size is pinned to 512: the FIFO model (depth 256, 64-sample drain)
+// was designed and verified around 512-insn slices — with the default 4096
+// the guest outruns the drain inside one slice (FULL1 is only observable at
+// slice boundaries), overflows the FIFO, and ~86% of samples are silently
+// dropped (measured: drained 12160 of 84672).
+const PWM_SLICE = 512;
 function runUntilPwmDone() {
   let out = '';
   for (let i = 0; i < PWM_MAX_SLICES && !pwmState.done; i++) {
-    const o = runSlice(SLICE_INSNS);
+    const o = runSlice(PWM_SLICE);
     out += o;
     updateStats();
   }
@@ -1430,6 +1528,12 @@ function gpioRun() {
     draw(out);
     out = '';
     updateStats();
+    const halted = faultHalted();
+    if (halted) {
+      gpioLoopActive = false;
+      setStatus(halted);
+      return;
+    }
     if (clockDone) {
       gpioLoopActive = false;
       setStatus('booted — running gpio — GPIO @ 0x3F200000 — chase done — hold BTN 29 to press');
@@ -1454,6 +1558,11 @@ function fbRun() {
     draw(out);
     out = '';
     updateStats();
+    const halted = faultHalted();
+    if (halted) {
+      setStatus(halted);
+      return;
+    }
     if (fbReady) blit();
     fbFrame = requestAnimationFrame(frame);
   };
@@ -1484,6 +1593,11 @@ function irqRun() {
     draw(out);
     out = '';
     updateStats();
+    const halted = faultHalted();
+    if (halted) {
+      setStatus(halted);
+      return;
+    }
     irqFrame = requestAnimationFrame(frame);
   };
   irqFrame = requestAnimationFrame(frame);
@@ -1769,6 +1883,7 @@ async function run() {
     runBtn.disabled = false;
     term.focus();
     hint.textContent = '';
+    if (lastFault && faultStreak > 0) draw('\n[' + lastFault.message + ']\n');
   } catch (err) {
     setStatus('ERROR: ' + (err && (err.stack || err.message || err) || err));
     console.error(err);

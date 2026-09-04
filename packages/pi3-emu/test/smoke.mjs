@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Pi3Emulator, loadUnicorn, I2C_BASE, TMR_DONE } from '../src/index.js';
+import { Pi3Emulator, loadUnicorn, I2C_BASE, TMR_DONE, MMU_DONE } from '../src/index.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fail = [];
@@ -48,6 +48,29 @@ const ucMod = await loadUnicorn();
   check('stats advance', emu.stats.steps > 0 && emu.stats.insns > 0);
   check('ledLevels shape', Array.isArray(emu.ledLevels()) && emu.ledLevels().length === 8);
   check('readU32 timer ticks', emu.readU32(TMR_DONE) === 0);
+}
+
+// 4. mmu guest via attachMmu: tables, alias checks, shadow-code call.
+{
+  const emu = new Pi3Emulator(ucMod);
+  emu.attachMmu();
+  await emu.loadFirmware(readFileSync(join(__dirname, '..', '..', '..', 'public', 'programs', 'mmu.elf')));
+  emu.runUntilDone(() => emu.readU32(MMU_DONE) !== 0, 30000);
+  check('mmu guest parks DONE', emu.readU32(MMU_DONE) !== 0);
+  check('mmu all checks passed', emu.consoleText.includes('all checks passed'));
+}
+
+// 5. Fault decoder: unmap the UART window, let getc fault, expect a report.
+{
+  const emu = new Pi3Emulator(ucMod);
+  await emu.loadFirmware(readFileSync(join(__dirname, '..', 'firmware', 'shell.elf')));
+  emu.runUntilIdle();
+  emu.uc.mem_unmap(0x3f201000, 0x1000);
+  emu.sendLine('hi');
+  emu.runUntilIdle(200);
+  check('fault recorded', !!emu.lastFault, 'lastFault=' + JSON.stringify(emu.lastFault));
+  check('fault message human-readable',
+    !!emu.lastFault && /guest fault/.test(emu.lastFault.message) && emu.lastFault.pc !== null);
 }
 
 if (fail.length) { console.log('SMOKE FAIL:', fail.join(', ')); process.exit(1); }
