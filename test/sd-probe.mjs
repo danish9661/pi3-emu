@@ -6,9 +6,9 @@ import { fileURLToPath } from 'url';
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MUnicorn = require(join(__dirname, '..', 'public', 'unicorn.js'));
-const { parseElf, loadElf } = await import(join(__dirname, '..', 'src', 'elf.js'));
-const { createUart0 } = await import(join(__dirname, '..', 'src', 'uart0.js'));
-const { createSdhci } = await import(join(__dirname, '..', 'src', 'sdhci.js'));
+const { parseElf, loadElf } = await import(join(__dirname, '..', 'packages', 'pi3-emu', 'src', 'elf.js'));
+const { createUart0 } = await import(join(__dirname, '..', 'packages', 'pi3-emu', 'src', 'uart0.js'));
+const { createSdhci } = await import(join(__dirname, '..', 'packages', 'pi3-emu', 'src', 'sdhci.js'));
 
 const RAM_SIZE = 0x400000;
 const SLICE_INSNS = 512;

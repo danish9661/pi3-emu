@@ -2,6 +2,7 @@
   "name": "pi-emu-spike",
   "private": true,
   "type": "module",
+  "workspaces": ["packages/*"],
   "scripts": {
     "dev": "vite",
     "build": "bash build.sh && vite build",

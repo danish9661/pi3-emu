@@ -1,8 +1,7 @@
 /* SabToggle — reusable SharedArrayBuffer on/off switch for any project.
  *
- * NOTE: canonical source is packages/sab-toggle/sab-toggle.js (the published
- * npm package). This copy is synced for static serving; edit the package copy
- * and copy it here.
+ * Canonical source (published to npm as sab-toggle). The pi3-emu site
+ * serves a synced copy at public/sab-toggle.js.
  *
  * Drop-in: no dependencies, no build step.
  *   <script src="./sab-toggle.js"></script>

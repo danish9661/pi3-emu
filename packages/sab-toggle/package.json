@@ -1,0 +1,30 @@
+{
+  "name": "sab-toggle",
+  "version": "0.1.0",
+  "description": "Reusable SharedArrayBuffer on/off switch for any web project (detect + user preference + engine picker, zero dependencies)",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "sab-toggle.js",
+  "files": [
+    "sab-toggle.js",
+    "README.md"
+  ],
+  "keywords": [
+    "sharedarraybuffer",
+    "webassembly",
+    "pthreads",
+    "emscripten",
+    "cross-origin-isolation"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/danish9661/pi3-emu.git",
+    "directory": "packages/sab-toggle"
+  },
+  "scripts": {
+    "test": "node test/smoke.mjs"
+  }
+}

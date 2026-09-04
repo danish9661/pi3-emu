@@ -8,7 +8,7 @@ import { createIc } from '../src/ic.js';
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MUnicorn = require(join(__dirname, '..', 'public', 'unicorn.js'));
-const { parseElf, loadElf } = await import(join(__dirname, '..', 'src', 'elf.js'));
+const { parseElf, loadElf } = await import(join(__dirname, '..', 'packages', 'pi3-emu', 'src', 'elf.js'));
 
 const PROG = join(__dirname, '..', 'public', 'programs', 'lirq.elf');
 const RAM_SIZE = 0x400000;

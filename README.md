@@ -656,6 +656,31 @@ ST build when present, else a `{missing}` signal for your fallback UI) ·
 `node test/linux-threads-toggle.mjs` (17 checks: library on both pages,
 routing, persistence, fallback, zero page errors).
 
+## npm packages (`packages/`)
+
+The engine ships as installable packages (monorepo, `npm workspaces`):
+
+- **`pi3-emu`** — headless Pi 3 emulator core: AArch64 CPU (unicorn.js
+  vendored, no build step) + all device models + ELF loader + a DOM-free
+  `Pi3Emulator` scheduler (run slices, console, GPIO LEDs/button, I2C/SPI
+  browser bridges). rp2040js-style: bring your own bare-metal ELF.
+  `examples/i2c-temp-sensor/` is a reference Wokwi-style part.
+  ```sh
+  npm test --workspace pi3-emu   # headless shell + i2c smoke
+  ```
+- **`sab-toggle`** — the SharedArrayBuffer on/off switch as a dependency-free
+  single file (see above).
+  ```sh
+  npm test --workspace sab-toggle
+  ```
+
+Publish (maintainer, needs `npm login` — both names are free):
+
+```sh
+npm publish --workspace sab-toggle
+npm publish --workspace pi3-emu
+```
+
 ## Tests (no browser needed — same wasm driven from node)
 
 ```sh
@@ -706,16 +731,21 @@ programs/             Rust workspace: runtime lib + shell/sum/fib/smp guests
   uart1/              mini UART demo: second console tagged [u1]
   sd/                 SD demo: SDHCI init + FAT12 card, prints HELLO.TXT
   uart0/              PL011 demo: baud config, FR flow control, RXINTR -> IRQ 57, RX echo
-src/elf.js            ELF64 loader (PT_LOAD + bss zeroing)
-src/mmu.js            host-assisted MMU: table walk, shadow mapping, mirror
-src/dma.js            host-arbitrated DMA: CB chain walk + transfer engine
-src/pwm.js            host-arbitrated PWM: FIFO model, drain ring, write hook
-src/i2c.js            host-arbitrated I2C: BSC window, sensor slave
-src/spi.js            host-arbitrated SPI: SPI0 window, flash slave
-src/uart1.js          mini UART model: write hook emits chars at write time
-src/uart0.js          PL011 model: DR/FR/RIS/MIS windows, RX FIFO, RXINTR -> IRQ 57
-src/sdhci.js          host-arbitrated SDHCI: block buffer, FAT12 image
-src/main.js           browser host loop (run-until-idle scheduler)
+packages/pi3-emu/src/elf.js   ELF64 loader (PT_LOAD + bss zeroing)
+packages/pi3-emu/src/mmu.js   host-assisted MMU: table walk, shadow mapping, mirror
+packages/pi3-emu/src/dma.js   host-arbitrated DMA: CB chain walk + transfer engine
+packages/pi3-emu/src/pwm.js   host-arbitrated PWM: FIFO model, drain ring, write hook
+packages/pi3-emu/src/i2c.js   host-arbitrated I2C: BSC window, sensor slave
+packages/pi3-emu/src/spi.js   host-arbitrated SPI: SPI0 window, flash slave
+packages/pi3-emu/src/uart1.js mini UART model: write hook emits chars at write time
+packages/pi3-emu/src/uart0.js PL011 model: DR/FR/RIS/MIS windows, RX FIFO, RXINTR -> IRQ 57
+packages/pi3-emu/src/sdhci.js host-arbitrated SDHCI: block buffer, FAT12 image
+src/main.js           browser host loop (device sync + scheduler + DOM);
+                      engine modules live in packages/pi3-emu/src/
+packages/pi3-emu/     npm package: headless core (src/index.js facade +
+                      all device modules), vendored unicorn.js, demo
+                      firmware, i2c-temp-sensor example
+packages/sab-toggle/  npm package: sab-toggle.js + node smoke test
 board/src/lib.rs      board model (UART console FIFO only)
 test/smoke.mjs        guest-driven end-to-end test (node)
 public/programs/*.elf built guest programs (committed)

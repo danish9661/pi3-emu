@@ -6,7 +6,7 @@ const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const MUnicorn = require(join(__dirname, '..', 'public', 'unicorn.js'));
-const { parseElf, loadElf } = await import(join(__dirname, '..', 'src', 'elf.js'));
+const { parseElf, loadElf } = await import(join(__dirname, '..', 'packages', 'pi3-emu', 'src', 'elf.js'));
 
 const ucMod = await MUnicorn();
 const uc = new ucMod.Unicorn(ucMod.ARCH_ARM64, ucMod.MODE_LITTLE_ENDIAN);

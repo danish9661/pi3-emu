@@ -24,10 +24,10 @@ import { fileURLToPath } from 'url';
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MUnicorn = require(join(__dirname, '..', 'public', 'unicorn.js'));
-const { createUart0 } = await import(join(__dirname, '..', 'src', 'uart0.js'));
-const { createIc } = await import(join(__dirname, '..', 'src', 'ic.js'));
-const { createLocalInt } = await import(join(__dirname, '..', 'src', 'localint.js'));
-const { createSdhci } = await import(join(__dirname, '..', 'src', 'sdhci.js'));
+const { createUart0 } = await import(join(__dirname, '..', 'packages', 'pi3-emu', 'src', 'uart0.js'));
+const { createIc } = await import(join(__dirname, '..', 'packages', 'pi3-emu', 'src', 'ic.js'));
+const { createLocalInt } = await import(join(__dirname, '..', 'packages', 'pi3-emu', 'src', 'localint.js'));
+const { createSdhci } = await import(join(__dirname, '..', 'packages', 'pi3-emu', 'src', 'sdhci.js'));
 
 const SLICE_INSNS = 4096;
 const LINUX_RAM_SIZE = process.env.LINUX_RAM_SIZE ? Number(process.env.LINUX_RAM_SIZE) : 0x8000000;
