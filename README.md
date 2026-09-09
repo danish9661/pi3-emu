@@ -695,6 +695,23 @@ npm publish --workspace sab-toggle
 npm publish --workspace pi3-emu
 ```
 
+## MicroPython (bare metal, `ports/bcm2837/`)
+
+The MicroPython VM cross-compiled to a bare-metal AArch64 guest: boots to a
+`>>>` REPL over the PL011 in milliseconds, no OS, no Linux. Integer-only
+Python (no FPU bring-up), 256 KB GC heap, frozen `boot` demo module.
+
+```sh
+export PATH="$HOME/toolchains/arm-gnu-toolchain-13.2.Rel1-x86_64-aarch64-none-elf/bin:$PATH"
+make -C ports/bcm2837          # needs ports/micropython submodule + mpy-cross
+node test/upython-repl.mjs     # banner, arith, variables, frozen import
+```
+
+Pico compatibility note: plain `machine.*` Python (Pin/I2C/SPI/UART) will
+carry over once the `machine` module lands — same API shape as RP2040 code.
+Pico-only hardware (`rp2.PIO`, ADC) has no BCM2837 equivalent and won't
+port. See `ports/bcm2837/README.md` (build, lessons, next steps).
+
 ## Tests (no browser needed — same wasm driven from node)
 
 ```sh

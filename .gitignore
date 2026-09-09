@@ -21,3 +21,6 @@ public/pi_board.wasm
 public/linux-fromsrc/
 # qemu-wasm source clone + build scratch (ephemeral; do not commit)
 scripts/.build/
+# MicroPython port build tree (firmware.elf rebuilds from ports/bcm2837;
+# micropython source itself is a submodule, not ignored)
+ports/bcm2837/build/

@@ -915,6 +915,57 @@ Linux tab → bridge readout + send).
   contents, which would break the live emulator. Large binaries in plain
   git are the deliberate trade-off.
 
+### M33 — npm packages (pi3-emu core + sab-toggle)
+
+- Monorepo (`npm workspaces`): device/support modules moved `src/*.js` →
+  `packages/pi3-emu/src/` (single source; main.js + probes follow).
+- `pi3-emu` 0.1.0: DOM-free `Pi3Emulator` facade (ELF load, slices, PL011
+  console, timer, GPIO, IC + IRQ_RET delivery, attach helpers for
+  UART1/I2C/SPI/PWM/SDHCI/MMU/DMA), vendored unicorn.js (+ `vendor/
+  package.json` commonjs marker — without it `require()` returns an empty
+  ESM namespace), demo firmware, `examples/i2c-temp-sensor` reference part.
+- `sab-toggle` 0.1.0: the SAB switch as a dependency-free file + node smoke.
+- Unaligned `IC_BASE` rides inside the `MBOX_WINDOW` page mapping (never map
+  it directly — `UC_ERR_ARG`); sync mirror writes are `safeSync`-wrapped.
+- Both names free on npm; publish needs `npm login` (unavailable headless).
+
+### M34 — core batch (virtual time, AudioWorklet, faults, fork patches)
+
+- Virtual time (`?vt=1`, facade `virtualTime`): timer advances per insn
+  (~10 MIPS) — deterministic runs, instant sleeps (`test/virtual-time.mjs`).
+- PWM audio on AudioWorklet (`public/audio-pwm.js`, ScriptProcessor
+  fallback): transfer neuters buffers, so posted-length counters must be
+  read BEFORE `postMessage`; pwm mode pins 512-insn slices (the 4096
+  default overruns the 256-deep FIFO — FULL1 is slice-boundary-visible —
+  and drops ~86% of samples). `test/pwm-audio.mjs`: worklet + exact 84672.
+- Guest fault decoder (`packages/pi3-emu/src/fault.js`): PC/SP/insn/cause
+  to terminal/status/`lastFault`; rAF loops halt on streaks.
+- Fork patches reconstructed in `src/patches/` (AlexAltea/unicorn.js
+  @8028ec43 + engine): IRQ/timer/debug APIs, CNTFRQ 19.2 MHz, AArch64 reset
+  fixes, exports + wrapper — rebuilt with emsdk 6.0.6 and verified (lirq
+  14/14, full battery green). Build lessons baked in: no value-returning
+  `UC_INIT` in void fns, distinct `arm64_*` arch names, `BigInt()` timer
+  coercion. `public/unicorn.js` is now that single-arch rebuild.
+
+### M35 — MicroPython bare-metal port (spike green)
+
+- `ports/bcm2837/` (new, out-of-tree port) + `ports/micropython` submodule
+  (upstream master, shallow): minimal-ROM-level VM, no floats, 256 KB heap,
+  PL011 REPL, frozen `boot` module. Toolchain: ARM gcc 13.2
+  aarch64-none-elf tarball in ~/toolchains (not in repo).
+- Boots to `>>>` in the emulator; `1+1`→2, variables, heap strings/lists,
+  `import boot` + `boot.hello()` all verified (`test/upython-repl.mjs` 7/7).
+- Debug trail (all in ports/bcm2837/README.md): fake empty frozen qstr
+  pool corrupts runtime interning (proven by guest-memory forensics:
+  stored keys land under id 0) → always generate via mpy-cross/mpy-tool;
+  frozen imports need sys.path (`.frozen` entry) + plain-NO_EXIST import
+  stub; keep mpy-tool's `boot.py` entry name (`import` appends `.py`);
+  `MICROPY_ENABLE_EXTERNAL_IMPORT=1` required or `mp_find_frozen_module`
+  is gc'd; drip-feed scripted UART input (16-byte RX FIFO).
+- Pico code: plain `machine.*` Python will carry over once the `machine`
+  module lands; `rp2.PIO`/ADC have no BCM2837 equivalent. Next: `machine`
+  module on the existing device models, floats, FAT over SDHCI.
+
 ## Key risks
 
 - Core patch (Phase 1) is the big unknown: if the unicorn.js build can't
