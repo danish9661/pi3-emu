@@ -710,7 +710,9 @@ node test/upython-repl.mjs     # banner, arith, variables, frozen import
 Pico compatibility note: plain `machine.*` Python (Pin/I2C/SPI/UART) will
 carry over once the `machine` module lands — same API shape as RP2040 code.
 `machine.Pin` already works (`Pin(21, Pin.OUT)` drives the LED panel;
-`test/upython-machine.mjs` checks live registers). Pico-only hardware
+`test/upython-machine.mjs` checks live registers), as do `machine.I2C`
+(sensor reads vs the built-in slave) and `machine.SPI` (flash JEDEC ID;
+`test/upython-i2cspi.mjs`). Pico-only hardware
 (`rp2.PIO`, ADC) has no BCM2837 equivalent and won't
 port. See `ports/bcm2837/README.md` (build, lessons, next steps).
 

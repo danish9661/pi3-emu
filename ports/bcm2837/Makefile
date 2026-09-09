@@ -39,6 +39,8 @@ SRC_C = \
 	main.c \
 	uart.c \
 	machine.c \
+	machine_i2c.c \
+	machine_spi.c \
 	shared/libc/printf.c \
 	shared/readline/readline.c \
 	shared/runtime/pyexec.c \
@@ -48,7 +50,7 @@ SRC_C = \
 SRC_S = \
 	startup.s \
 
-SRC_QSTR += shared/readline/readline.c shared/runtime/pyexec.c machine.c
+SRC_QSTR += shared/readline/readline.c shared/runtime/pyexec.c machine.c machine_i2c.c machine_spi.c
 
 OBJ += $(PY_CORE_O)
 OBJ += $(addprefix $(BUILD)/, $(SRC_C:.c=.o))

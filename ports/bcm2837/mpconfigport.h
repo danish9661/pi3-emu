@@ -12,6 +12,8 @@
 #define MICROPY_ENABLE_GC                 (1)
 #define MICROPY_HELPER_REPL               (1)
 #define MICROPY_MODULE_FROZEN_MPY         (1)
+#define MICROPY_PY_MACHINE_I2C            (1)
+#define MICROPY_PY_MACHINE_SPI            (1)
 // External import ON even without a filesystem: it enables the frozen-module
 // search in __import__ (with it off, frozen .mpy modules can never load and
 // mp_find_frozen_module is gc'd as unreferenced). File imports fail cleanly
@@ -27,6 +29,10 @@
 // Python still covers REPL, GPIO/I2C/SPI drivers and control flow.
 #define MICROPY_PY_BUILTINS_FLOAT         (0)
 #define MICROPY_FLOAT_IMPL                (MICROPY_FLOAT_IMPL_NONE)
+// bytearray/memoryview: sensor code lives in buffers (write_readinto needs
+// a writable dest); cheap, no FPU involved.
+#define MICROPY_PY_BUILTINS_BYTEARRAY     (1)
+#define MICROPY_PY_BUILTINS_MEMORYVIEW    (1)
 
 // sys module ON, but only for sys.path: frozen imports resolve through the
 // ".frozen" sys.path entry (runtime.c appends it when PATH_ARGV_DEFAULTS).

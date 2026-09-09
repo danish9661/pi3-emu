@@ -58,8 +58,23 @@ Or load `build/firmware.elf` in the browser like any guest (UART0 console).
 
 ## Next (not yet)
 
-I2C/SPI/UART `machine` drivers, floating point, FAT filesystem over
-SDHCI, frozen auto-run `boot.py`.
+`machine.UART`, floating point, FAT filesystem over SDHCI, frozen
+auto-run `boot.py`.
+
+## `machine` module — I2C/SPI (done)
+
+`machine_i2c.c` / `machine_spi.c` implement `machine.I2C` and `machine.SPI`
+with Pico-compatible constructors and methods (`readfrom`/`writeto`/
+`readfrom_mem`/`scan`, `write`/`read`/`write_readinto`), driven straight
+off the BSC0/1 and SPI0 registers against the built-in slaves
+(`test/upython-i2cspi.mjs` 9/9: WHO_AM_I/TEMP/COUNTER, JEDEC
+`[0, 0xEF, 0x40, 0x18]`, scan, ACKs). Two notes for driver authors: the
+high-level API is implemented locally (extmod's shared dicts misbehave on
+this minimal config — wrong methods resolve), and every transfer needs a
+drop-sync on the DONE cell first (status bits are slice-boundary-visible,
+so a leftover DONE completes the next poll instantly — the same
+stale-window race the bare-metal guests handle). Transfers cap at 4 bytes
+(the FIFO window width); only BSC0/1 and SPI0 exist here.
 
 ## `machine` module — Pin (done)
 

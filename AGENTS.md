@@ -966,8 +966,13 @@ Linux tab → bridge readout + send).
   module lands; `rp2.PIO`/ADC have no BCM2837 equivalent. `machine.Pin`
   done (self-contained `machine.c`, Pico-compatible IN/OUT/pull/value/
   on/off/init on the real registers; `test/upython-machine.mjs` 9/9
-  incl. LED-dot GPLEV and button reads). Next: I2C/SPI/UART machine
-  drivers, floats, FAT over SDHCI.
+  incl. LED-dot GPLEV and button reads). `machine.I2C`/`SPI` done
+  (`machine_i2c/spi.c`, Pico-compatible API incl. `readfrom_mem`,
+  `write_readinto`, `scan`; 9/9 vs built-in slaves in
+  `test/upython-i2cspi.mjs`). High-level API is local, not extmod's
+  shared dicts (wrong methods resolve on this config); transfers need a
+  DONE drop-sync first (slice-boundary status staleness); 4-byte cap.
+  Next: UART machine driver, floats, FAT over SDHCI.
 
 ## Key risks
 
