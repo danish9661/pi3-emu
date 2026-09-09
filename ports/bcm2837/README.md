@@ -58,5 +58,17 @@ Or load `build/firmware.elf` in the browser like any guest (UART0 console).
 
 ## Next (not yet)
 
-`machine` module (Pin/I2C/SPI/UART on the existing device models),
-floating point, FAT filesystem over SDHCI, frozen auto-run `boot.py`.
+I2C/SPI/UART `machine` drivers, floating point, FAT filesystem over
+SDHCI, frozen auto-run `boot.py`.
+
+## `machine` module — Pin (done)
+
+`machine.c` implements `machine.Pin` with Pico-compatible semantics
+(`Pin(id, mode, pull)`, `value()/on()/off()/init()`, `IN=0/OUT=1`,
+`PULL_UP=1/PULL_DOWN=2`) on the real register file (GPFSEL/GPSET/GPCLR/
+GPLEV + the GPPUD pull sequence). Verified against live registers
+(`test/upython-machine.mjs` 9/9): FSEL latches, `on()` drives GPLEV21
+(the browser LED dot), `value()` reads back, BTN 29 reads press/release.
+`irq()` is omitted (needs guest-side vector plumbing). Note for test
+authors: GPLEV mirrors the latch at slice boundaries — settle a couple of
+slices before asserting levels.

@@ -38,6 +38,7 @@ LDFLAGS = -nostartfiles --specs=nosys.specs -T bcm2837.ld -Wl,-Map=$@.map,--cref
 SRC_C = \
 	main.c \
 	uart.c \
+	machine.c \
 	shared/libc/printf.c \
 	shared/readline/readline.c \
 	shared/runtime/pyexec.c \
@@ -47,7 +48,7 @@ SRC_C = \
 SRC_S = \
 	startup.s \
 
-SRC_QSTR += shared/readline/readline.c shared/runtime/pyexec.c
+SRC_QSTR += shared/readline/readline.c shared/runtime/pyexec.c machine.c
 
 OBJ += $(PY_CORE_O)
 OBJ += $(addprefix $(BUILD)/, $(SRC_C:.c=.o))

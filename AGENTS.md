@@ -963,8 +963,11 @@ Linux tab → bridge readout + send).
   `MICROPY_ENABLE_EXTERNAL_IMPORT=1` required or `mp_find_frozen_module`
   is gc'd; drip-feed scripted UART input (16-byte RX FIFO).
 - Pico code: plain `machine.*` Python will carry over once the `machine`
-  module lands; `rp2.PIO`/ADC have no BCM2837 equivalent. Next: `machine`
-  module on the existing device models, floats, FAT over SDHCI.
+  module lands; `rp2.PIO`/ADC have no BCM2837 equivalent. `machine.Pin`
+  done (self-contained `machine.c`, Pico-compatible IN/OUT/pull/value/
+  on/off/init on the real registers; `test/upython-machine.mjs` 9/9
+  incl. LED-dot GPLEV and button reads). Next: I2C/SPI/UART machine
+  drivers, floats, FAT over SDHCI.
 
 ## Key risks
 
