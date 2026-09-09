@@ -199,12 +199,14 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // protocol + BSC/SPI0 drivers).
 extern const mp_obj_type_t machine_i2c_type;
 extern const mp_obj_type_t machine_spi_type;
+extern const mp_obj_type_t machine_uart_type;
 
 static const mp_rom_map_elem_t machine_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_machine) },
     { MP_ROM_QSTR(MP_QSTR_Pin), MP_ROM_PTR(&machine_pin_type) },
     { MP_ROM_QSTR(MP_QSTR_I2C), MP_ROM_PTR(&machine_i2c_type) },
     { MP_ROM_QSTR(MP_QSTR_SPI), MP_ROM_PTR(&machine_spi_type) },
+    { MP_ROM_QSTR(MP_QSTR_UART), MP_ROM_PTR(&machine_uart_type) },
 };
 static MP_DEFINE_CONST_DICT(machine_module_globals, machine_module_globals_table);
 

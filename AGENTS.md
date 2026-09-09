@@ -962,6 +962,11 @@ Linux tab → bridge readout + send).
   stub; keep mpy-tool's `boot.py` entry name (`import` appends `.py`);
   `MICROPY_ENABLE_EXTERNAL_IMPORT=1` required or `mp_find_frozen_module`
   is gc'd; drip-feed scripted UART input (16-byte RX FIFO).
+- `machine.UART` done (`machine_uart.c`: Pico-compatible
+  read/readinto/write/any on PL011 id 0 + mini-UART TX on id 1, real
+  baud dividers; per-byte slice settle; 7/7 in `test/upython-uart.mjs`).
+  Floats work natively on the core (VFP executes; `BUILTINS_FLOAT`/
+  `FLOAT_IMPL_DOUBLE`/`MATH` + `-lm`, no soft-float needed).
 - Pico code: plain `machine.*` Python will carry over once the `machine`
   module lands; `rp2.PIO`/ADC have no BCM2837 equivalent. `machine.Pin`
   done (self-contained `machine.c`, Pico-compatible IN/OUT/pull/value/
@@ -972,7 +977,7 @@ Linux tab → bridge readout + send).
   `test/upython-i2cspi.mjs`). High-level API is local, not extmod's
   shared dicts (wrong methods resolve on this config); transfers need a
   DONE drop-sync first (slice-boundary status staleness); 4-byte cap.
-  Next: UART machine driver, floats, FAT over SDHCI.
+  Next: FAT over SDHCI, frozen auto-run boot.py, Pin.irq().
 
 ## Key risks
 

@@ -34,6 +34,7 @@ CFLAGS += -Os -DNDEBUG -fdata-sections -ffunction-sections
 # -nostartfiles keeps newlib's crt0 (and its _start) out: startup.s owns
 # the entry, zeroes .bss itself, and calls main.
 LDFLAGS = -nostartfiles --specs=nosys.specs -T bcm2837.ld -Wl,-Map=$@.map,--cref -Wl,--gc-sections
+LIBS = -lm
 
 SRC_C = \
 	main.c \
@@ -41,6 +42,7 @@ SRC_C = \
 	machine.c \
 	machine_i2c.c \
 	machine_spi.c \
+	machine_uart.c \
 	shared/libc/printf.c \
 	shared/readline/readline.c \
 	shared/runtime/pyexec.c \
@@ -50,7 +52,7 @@ SRC_C = \
 SRC_S = \
 	startup.s \
 
-SRC_QSTR += shared/readline/readline.c shared/runtime/pyexec.c machine.c machine_i2c.c machine_spi.c
+SRC_QSTR += shared/readline/readline.c shared/runtime/pyexec.c machine.c machine_i2c.c machine_spi.c machine_uart.c
 
 OBJ += $(PY_CORE_O)
 OBJ += $(addprefix $(BUILD)/, $(SRC_C:.c=.o))

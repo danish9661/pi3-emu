@@ -44,6 +44,9 @@ async function cmd(s, budget = 6000) {
 }
 
 check('arith', (await cmd('1+1')).includes('\r\n2\r\n'));
+check('float arith', (await cmd('1.5 + 2.25')).includes('\r\n3.75\r\n'));
+check('math module', (await cmd('import math')).includes('>>>'));
+check('math.sqrt', (await cmd('math.sqrt(2)')).includes('1.4142135623730951'));
 check('store/load', (await cmd('x = 41')).includes('>>>') && (await cmd('x + 1')).includes('\r\n42\r\n'));
 check('str/list/builtin', (await cmd('print("hi", [1,2], len("abcd"))')).includes('hi [1, 2] 4'));
 check('frozen import', /^import boot\r\n>>> $/.test(await cmd('import boot')));

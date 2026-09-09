@@ -25,10 +25,11 @@
 // Use the minimum headroom in the chunk allocator for parse nodes.
 #define MICROPY_ALLOC_PARSE_CHUNK_INIT    (16)
 
-// No floats on the spike: avoids all FPU bring-up questions. Integer-only
-// Python still covers REPL, GPIO/I2C/SPI drivers and control flow.
-#define MICROPY_PY_BUILTINS_FLOAT         (0)
-#define MICROPY_FLOAT_IMPL                (MICROPY_FLOAT_IMPL_NONE)
+// Floats via soft-float (no FPU bring-up: -msoft-float in CFLAGS keeps all
+// FP math in integer instructions, which the emulator core runs natively).
+#define MICROPY_PY_BUILTINS_FLOAT         (1)
+#define MICROPY_FLOAT_IMPL                (MICROPY_FLOAT_IMPL_DOUBLE)
+#define MICROPY_PY_MATH                   (1)
 // bytearray/memoryview: sensor code lives in buffers (write_readinto needs
 // a writable dest); cheap, no FPU involved.
 #define MICROPY_PY_BUILTINS_BYTEARRAY     (1)
