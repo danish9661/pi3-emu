@@ -39,6 +39,7 @@ LIBS = -lm
 SRC_C = \
 	main.c \
 	uart.c \
+	irq.c \
 	machine.c \
 	machine_i2c.c \
 	machine_spi.c \
@@ -49,13 +50,23 @@ SRC_C = \
 	shared/runtime/stdout_helpers.c \
 	$(BUILD)/_frozen_mpy.c \
 
+# extmod/machine_mem.c (mem8/16/32): explicit rule keeps the object in
+# $(BUILD) instead of the submodule tree.
+$(BUILD)/extmod_machine_mem.o: ../micropython/extmod/machine_mem.c
+	$(ECHO) "CC $<"
+	$(Q)mkdir -p $(dir $@)
+	$(Q)$(CC) $(CFLAGS) -c -o $@ $<
+
 SRC_S = \
 	startup.s \
+	vectors.s \
 
-SRC_QSTR += shared/readline/readline.c shared/runtime/pyexec.c machine.c machine_i2c.c machine_spi.c machine_uart.c
+SRC_QSTR += shared/readline/readline.c shared/runtime/pyexec.c machine.c machine_i2c.c machine_spi.c machine_uart.c irq.c ../micropython/extmod/machine_mem.c
 
+# extmod/machine_mem.c (mem8/16/32) is covered by the explicit rules above.
 OBJ += $(PY_CORE_O)
 OBJ += $(addprefix $(BUILD)/, $(SRC_C:.c=.o))
+OBJ += $(BUILD)/extmod_machine_mem.o
 OBJ += $(addprefix $(BUILD)/, $(SRC_S:.s=.o))
 
 all: $(BUILD)/firmware.elf
@@ -64,9 +75,13 @@ $(BUILD)/boot.mpy: boot.py
 	$(ECHO) "MPY $<"
 	$(Q)$(TOP)/mpy-cross/build/mpy-cross -o $@ $<
 
-$(BUILD)/_frozen_mpy.c: $(BUILD)/boot.mpy $(BUILD)/genhdr/qstrdefs.generated.h
+$(BUILD)/sdcard.mpy: sdcard.py
+	$(ECHO) "MPY $<"
+	$(Q)$(TOP)/mpy-cross/build/mpy-cross -o $@ $<
+
+$(BUILD)/_frozen_mpy.c: $(BUILD)/boot.mpy $(BUILD)/sdcard.mpy $(BUILD)/genhdr/qstrdefs.generated.h
 	$(ECHO) "MISC freezing bytecode"
-	$(Q)$(TOP)/tools/mpy-tool.py -f -q $(BUILD)/genhdr/qstrdefs.preprocessed.h -mlongint-impl=none $< > $@
+	$(Q)$(TOP)/tools/mpy-tool.py -f -q $(BUILD)/genhdr/qstrdefs.preprocessed.h -mlongint-impl=none $(BUILD)/boot.mpy $(BUILD)/sdcard.mpy > $@
 	# NOTE: keep mpy-tool's "boot.py" entry name as-is: the import machinery
 	# appends ".py" before the frozen search (stat_module), so `import boot`
 	# exact-matches "boot.py". Renaming the entry to "boot" BREAKS imports.

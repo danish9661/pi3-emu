@@ -163,8 +163,7 @@ static const mp_arg_t pin_init_allowed[] = {
     { MP_QSTR_pull, MP_ARG_INT, {.u_int = -1} },
 };
 
-static mp_obj_t pin_init(size_t n_args, const mp_obj_t *args, mp_map_t *kw_args) {
-    machine_pin_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+static mp_obj_t pin_init(size_t n_args, const mp_obj_t *args, mp_map_t *kw_args) {    machine_pin_obj_t *self = MP_OBJ_TO_PTR(args[0]);
     mp_arg_val_t vals[MP_ARRAY_SIZE(pin_init_allowed)];
     mp_arg_parse_all(n_args - 1, args + 1, kw_args, MP_ARRAY_SIZE(pin_init_allowed), pin_init_allowed, vals);
     pin_init_helper(self, vals[ARG_init_mode].u_int, vals[ARG_init_pull].u_int);
@@ -172,17 +171,41 @@ static mp_obj_t pin_init(size_t n_args, const mp_obj_t *args, mp_map_t *kw_args)
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(pin_init_obj, 1, pin_init);
 
+static mp_obj_t pin_irq(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_handler, ARG_trigger, ARG_hard };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_handler, MP_ARG_OBJ, {.u_rom_obj = MP_ROM_NONE} },
+        { MP_QSTR_trigger, MP_ARG_INT, {.u_int = 8} },
+        { MP_QSTR_hard,    MP_ARG_BOOL, {.u_bool = false} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
+    machine_pin_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
+    // Implemented in irq.c (GPREN/GPFEN arm + deferred dispatch).
+    extern void pin_irq_config(int pin, int trigger, mp_obj_t handler, mp_obj_t pin_obj);
+    pin_irq_config(self->id, args[ARG_trigger].u_int,
+        args[ARG_handler].u_obj == mp_const_none ? MP_OBJ_NULL : args[ARG_handler].u_obj,
+        MP_OBJ_FROM_PTR(self));
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(pin_irq_obj, 1, pin_irq);
+
 static const mp_rom_map_elem_t pin_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_value), MP_ROM_PTR(&pin_value_obj) },
     { MP_ROM_QSTR(MP_QSTR_on), MP_ROM_PTR(&pin_on_obj) },
     { MP_ROM_QSTR(MP_QSTR_off), MP_ROM_PTR(&pin_off_obj) },
     { MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&pin_init_obj) },
+    { MP_ROM_QSTR(MP_QSTR_irq), MP_ROM_PTR(&pin_irq_obj) },
     { MP_ROM_QSTR(MP_QSTR_IN), MP_ROM_INT(PIN_MODE_IN) },
     { MP_ROM_QSTR(MP_QSTR_OUT), MP_ROM_INT(PIN_MODE_OUT) },
     { MP_ROM_QSTR(MP_QSTR_OPEN_DRAIN), MP_ROM_INT(PIN_MODE_OPEN_DRAIN) },
     { MP_ROM_QSTR(MP_QSTR_ALT), MP_ROM_INT(PIN_MODE_ALT) },
     { MP_ROM_QSTR(MP_QSTR_PULL_UP), MP_ROM_INT(PIN_PULL_UP) },
     { MP_ROM_QSTR(MP_QSTR_PULL_DOWN), MP_ROM_INT(PIN_PULL_DOWN) },
+    { MP_ROM_QSTR(MP_QSTR_IRQ_RISING), MP_ROM_INT(8) },
+    { MP_ROM_QSTR(MP_QSTR_IRQ_FALLING), MP_ROM_INT(4) },
+    { MP_ROM_QSTR(MP_QSTR_IRQ_LOW_LEVEL), MP_ROM_INT(1) },
+    { MP_ROM_QSTR(MP_QSTR_IRQ_HIGH_LEVEL), MP_ROM_INT(2) },
 };
 static MP_DEFINE_CONST_DICT(pin_locals_dict, pin_locals_dict_table);
 
@@ -200,6 +223,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 extern const mp_obj_type_t machine_i2c_type;
 extern const mp_obj_type_t machine_spi_type;
 extern const mp_obj_type_t machine_uart_type;
+extern const mp_obj_t machine_mem32_obj;
 
 static const mp_rom_map_elem_t machine_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_machine) },
@@ -207,6 +231,7 @@ static const mp_rom_map_elem_t machine_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_I2C), MP_ROM_PTR(&machine_i2c_type) },
     { MP_ROM_QSTR(MP_QSTR_SPI), MP_ROM_PTR(&machine_spi_type) },
     { MP_ROM_QSTR(MP_QSTR_UART), MP_ROM_PTR(&machine_uart_type) },
+    { MP_ROM_QSTR(MP_QSTR_mem32), MP_ROM_PTR(&machine_mem32_obj) },
 };
 static MP_DEFINE_CONST_DICT(machine_module_globals, machine_module_globals_table);
 

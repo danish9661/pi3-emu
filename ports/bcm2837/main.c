@@ -21,10 +21,22 @@ int main(void) {
     stack_top = (char *)&stack_dummy;
 
     uart_init();
+    irq_init();
     #if MICROPY_ENABLE_GC
     gc_init(heap, heap + sizeof(heap));
     #endif
     mp_init();
+    // Auto-run the frozen boot.py (mounts /sd, prints banner skips). Errors
+    // must never kill startup: fall through to the REPL regardless.
+    {
+        nlr_buf_t nlr;
+        if (nlr_push(&nlr) == 0) {
+            pyexec_frozen_module("boot.py", false);
+            nlr_pop();
+        } else {
+            mp_obj_print_exception(&mp_plat_print, (mp_obj_t)nlr.ret_val);
+        }
+    }
     pyexec_friendly_repl();
     mp_deinit();
     return 0;

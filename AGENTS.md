@@ -977,7 +977,12 @@ Linux tab → bridge readout + send).
   `test/upython-i2cspi.mjs`). High-level API is local, not extmod's
   shared dicts (wrong methods resolve on this config); transfers need a
   DONE drop-sync first (slice-boundary status staleness); 4-byte cap.
-  Next: FAT over SDHCI, frozen auto-run boot.py, Pin.irq().
+  `Pin.irq()` done (vectors.s full save + GPEDS W1C ack + deferred drain
+  in stdin spin; level-qualified edges; press→1/repress→2, no keys).
+  FAT12 over SDHCI in pure Python (`sdcard.py` + frozen auto-run at
+  startup; `test/upython-sd.mjs` 4/4; upstream VFS inconsistent on master;
+  model conventions cluster@+20, size split +30/+31). Next: level-trigger
+  irq, FAT writes (needs CMD24 in model), `uos` mount.
 
 ## Key risks
 

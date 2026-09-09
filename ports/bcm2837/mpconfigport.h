@@ -14,6 +14,7 @@
 #define MICROPY_MODULE_FROZEN_MPY         (1)
 #define MICROPY_PY_MACHINE_I2C            (1)
 #define MICROPY_PY_MACHINE_SPI            (1)
+#define MICROPY_PY_MACHINE_MEMX           (1)
 // External import ON even without a filesystem: it enables the frozen-module
 // search in __import__ (with it off, frozen .mpy modules can never load and
 // mp_find_frozen_module is gc'd as unreferenced). File imports fail cleanly
@@ -34,6 +35,10 @@
 // a writable dest); cheap, no FPU involved.
 #define MICROPY_PY_BUILTINS_BYTEARRAY     (1)
 #define MICROPY_PY_BUILTINS_MEMORYVIEW    (1)
+// slice syntax (x[a:b]): off at MINIMUM ROM level, but drivers and user
+// code need it (the parser rejects slices without it).
+#define MICROPY_PY_BUILTINS_SLICE         (1)
+#define MICROPY_PY_BUILTINS_SLICE_INDICES (1)
 
 // sys module ON, but only for sys.path: frozen imports resolve through the
 // ".frozen" sys.path entry (runtime.c appends it when PATH_ARGV_DEFAULTS).

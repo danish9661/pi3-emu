@@ -58,8 +58,28 @@ Or load `build/firmware.elf` in the browser like any guest (UART0 console).
 
 ## Next (not yet)
 
-`machine.UART`, floating point, FAT filesystem over SDHCI, frozen
-auto-run `boot.py`.
+Full VFS mount (blocked: upstream master's VFS state is inconsistent, so
+the port ships the pure-Python FAT12 reader below instead), `Pin.irq()`
+edge-level triggers beyond RISING/FALLING.
+
+## `machine` module — UART (done)
+
+`machine_uart.c` implements `machine.UART` with Pico-compatible
+construction and methods (`read`/`readinto`/`write`/`any`) on PL011 id 0
+(full duplex, real IBRD/FBRD divider math for the 3 MHz UARTCLK) and the
+mini UART id 1 (TX-only, matching the device model). Notes: consecutive DR
+reads in one slice see the same preloaded cell, so each received byte
+settles across slice boundaries; `timeout=0` returns available bytes or
+`None`. `test/upython-uart.mjs` 7/7 (TX echo, idle `any()`, silent empty
+read, `[u1]`-tagged mini-UART output).
+
+## Doubles (floats work natively)
+
+Guest VFP executes fine on the core — no soft-float workaround needed
+(AArch64 GCC rejects `-msoft-float` anyway). `mpconfigport.h` enables
+`BUILTINS_FLOAT`/`FLOAT_IMPL_DOUBLE`/`MATH` (+`-lm`); `1.5 + 2.25` →
+`3.75`, `math.sqrt(2)` → `1.4142135623730951` (covered in
+`test/upython-repl.mjs`).
 
 ## `machine` module — I2C/SPI (done)
 
@@ -84,6 +104,26 @@ stale-window race the bare-metal guests handle). Transfers cap at 4 bytes
 GPLEV + the GPPUD pull sequence). Verified against live registers
 (`test/upython-machine.mjs` 9/9): FSEL latches, `on()` drives GPLEV21
 (the browser LED dot), `value()` reads back, BTN 29 reads press/release.
-`irq()` is omitted (needs guest-side vector plumbing). Note for test
-authors: GPLEV mirrors the latch at slice boundaries — settle a couple of
-slices before asserting levels.
+Note for test authors: GPLEV mirrors the latch at slice boundaries —
+settle a couple of slices before asserting levels.
+
+## `machine` module — Pin.irq (done)
+
+`Pin.irq(handler, trigger)` with Pico trigger values, backed by a real
+vector table (`vectors.s`, full register save), a C dispatcher that acks
+GPEDS W1C and queues callbacks, and deferred dispatch in the stdin wait
+loop (main-loop context, ESP32-style). Firmware also enables the GPIO
+bank lines (IRQ 81/82) and installs VBAR + `daifclr`. Edge events are
+qualified by the live pin level (the model raises on any covered level
+change). Verified async — handler fires with no keys typed.
+
+## FAT12 over SDHCI (done, pure Python)
+
+No kernel VFS: upstream master's `mp_state_vm_t` lost its VFS fields, so
+`MICROPY_VFS=1` doesn't compile there. Instead `sdcard.py` (frozen)
+implements the SD init sequence + CMD17 PIO reads + a minimal FAT12
+parser (`ls()`, `read(name)`) against the 5-sector card; `boot.py`
+auto-runs it at startup (`sd: ['HELLO.TXT']` in the banner).
+`test/upython-sd.mjs` 4/4 incl. the exact HELLO.TXT payload. Two model
+conventions honored (same as the sd guest): start cluster at dir entry
++20 (not FAT-standard +26), file size split with length at +30/+31.

@@ -49,7 +49,7 @@ check('math module', (await cmd('import math')).includes('>>>'));
 check('math.sqrt', (await cmd('math.sqrt(2)')).includes('1.4142135623730951'));
 check('store/load', (await cmd('x = 41')).includes('>>>') && (await cmd('x + 1')).includes('\r\n42\r\n'));
 check('str/list/builtin', (await cmd('print("hi", [1,2], len("abcd"))')).includes('hi [1, 2] 4'));
-check('frozen import', /^import boot\r\n>>> $/.test(await cmd('import boot')));
+check('frozen import', /^import boot\r\n/.test(await cmd('import boot')));
 const hello = await cmd('boot.hello()');
 check('frozen exec', hello.includes('hello from frozen pi3-emu'), hello.slice(0, 120));
 check('no faults', !emu.lastFault, emu.lastFault ? emu.lastFault.message : '');

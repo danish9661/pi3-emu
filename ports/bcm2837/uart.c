@@ -26,7 +26,13 @@ void uart_init(void) {
 }
 
 int mp_hal_stdin_rx_chr(void) {
-    while (UART_FR & FR_RXFE) {
+    // Deferred IRQ dispatch runs here (main-loop context, ESP32-style):
+    // vectors set pending flags async, callbacks fire while waiting.
+    for (;;) {
+        irq_drain();
+        if (!(UART_FR & FR_RXFE)) {
+            break;
+        }
     }
     return (int)(UART_DR & 0xFF);
 }
