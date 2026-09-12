@@ -45,6 +45,7 @@
           <option value="uart1">uart1 (mini UART)</option>
           <option value="sd">sd (FAT12 card)</option>
           <option value="uart0">uart0 (PL011)</option>
+          <option value="upython">upython (MicroPython)</option>
           <option value="periphs">periphs (M30 peripherals)</option>
           <option value="debug">debug (diagnostic report)</option>
           <option value="bench">bench (performance)</option>
@@ -63,6 +64,12 @@
           <option value="off">threads: off (single)</option>
         </select>
         <button id="run">Run</button>
+        <span id="cardbar" hidden>
+          <input type="file" id="cardUpload" accept=".bin" hidden />
+          <button id="saveCard" type="button" title="Download the SD card image + keep it in IndexedDB">Save Card</button>
+          <button id="loadCard" type="button" title="Load a saved .bin card image and reboot">Load Card</button>
+          <button id="resetCard" type="button" title="Forget the saved card and reboot pristine">Reset Card</button>
+        </span>
         <span id="status">loading...</span>
       </div>
       <div id="stats"></div>

@@ -980,9 +980,338 @@ Linux tab → bridge readout + send).
   `Pin.irq()` done (vectors.s full save + GPEDS W1C ack + deferred drain
   in stdin spin; level-qualified edges; press→1/repress→2, no keys).
   FAT12 over SDHCI in pure Python (`sdcard.py` + frozen auto-run at
-  startup; `test/upython-sd.mjs` 4/4; upstream VFS inconsistent on master;
-  model conventions cluster@+20, size split +30/+31). Next: level-trigger
-  irq, FAT writes (needs CMD24 in model), `uos` mount.
+  startup; `test/upython-sd.mjs` 6/6 with CMD24 overwrite + raw block
+  round-trip; card image is real FAT12 now — boot sig, `FAT12   ` type,
+  cluster@+26, size u32@+28 — after the VFS phase below).
+- `Pin.irq()` level triggers done (`lvlCache` GPHEN/GPLEN in `gpio.js`,
+  level-qualified dispatch in `irq.c`; the "silent while released" failure
+  was test button sequencing — the rising phases leave BTN held, the level
+  section never released it. Fixed in `test/upython-irq.mjs` + fixed its
+  double-escaped level regexes. `syncIn` re-mirrors GPEDS to erase the
+  guest-store-after-hook residue. 6/6).
+- FAT writes done (CMD24 in `sdhci.js`, `writeblocks` + `write(name,data)`
+  in `sdcard.py`, 6/6 in `test/upython-sd.mjs`).
+- `os` mount done (this upstream has no `uos` alias): `MICROPY_VFS/
+  VFS_FAT/READER_VFS/PY_OS/PY_IO/FATFS_RPATH=2/ENABLE_FINALISER` in
+  `mpconfigport.h`; `vfs_port.c` injects the two missing VM-state fields
+  via `MP_REGISTER_ROOT_POINTER` (submodule pristine); extmod VFS+oofatfs
+  sources compiled into `$(BUILD)` as `upy_*.o`; `fatfs_port.c`
+  `get_fattime`; `test/upython-vfs.mjs` 7/7 (mount/listdir/read/create+
+  write/import `greet.py` from `/sd`). Gotchas: `FFCONF_H` define needed,
+  `CFLAGS` changes don't trigger rebuilds (`touch ff.c`), upstream
+  inlines `mp_import_stat` under VFS (don't redefine), FatFs `check_fs`
+  needs the `FAT12   ` type string at +54. mva-probe's 1 walk-diagnostic
+  failure is pre-existing (fails on pristine tree too).
+
+### M36 — /sd as a first-class filesystem (DONE, uncommitted)
+
+- **A1 Safe auto-mount:** `SD_PRESENT` host-extension word at
+  `MBOX_WINDOW+0xFF0` (clear of mailbox regs +0x880 and IC +0x200),
+  driven every slice — always 1 in the browser host (`src/main.js`),
+  1 iff `attachSdhci()` in the facade. `boot.py` mounts `/sd` + appends
+  `sys.path` only when set (reading it can't abort); detached boots
+  unchanged. Banner keeps the `boot: pi3-emu ready` substring the repl/sd
+  tests match.
+- **C VFS depth** (`test/upython-vfs.mjs` 14/14): mkdir/chdir/getcwd,
+  stat/statvfs, seek/tell/partial, append, 3.2 KB multi-cluster,
+  package import, post-umount OSError. `os.stat` needed
+  `MICROPY_LONGINT_IMPL_MPZ` — under NONE, `mp_obj_new_int_from_ll`
+  *unconditionally* raises "small int overflow" (NOT a width problem;
+  small ints are 63-bit — proven by `1<<40`. LONGLONG is 32-bit-only
+  upstream: `objint_longlong.c:372` asserts `sizeof(mp_uint_t)==4`).
+  Image carries a valid 2026-09-10 dir stamp (FatFs date math underflows
+  on zero dates). upython-repl's `^`-anchored echo check relaxed (bigger
+  firmware shifts slice timing; prior prompt's trailing space lands late).
+- **B Allocation:** `sdcard.write` creates/extends/shrinks chains
+  (`_fat12_set` nibble mirror, free scan capped by the model's 32-sector
+  growth limit, both FAT copies, root fixed at 16). upython-sd 8/8.
+- **D Persistence:** `sdhci.js` `exportImage`/`loadImage` +
+  `Pi3Emulator.exportCard`/`importCard` + `test/upython-vfspersist.mjs`
+  7/7. ONE-WRITER RULE (load-bearing): raw writes bypass the live mount's
+  cache AND FatFs write-backs clobber raw-written sectors — umount before
+  raw writes, remount after; encoded in both suites + `sdcard.write` docs.
+  Browser Save/Load UI deferred (firmware has no program-list entry yet).
+- Regression: 19/20 probes rc=0 (mva pre-existing), all 8 upython suites
+  PASS, `npx vite build` clean.
+
+### M37 — MicroPython in the browser + card Save/Load (DONE, uncommitted)
+
+- **Program entry:** `public/programs/firmware.elf` (built artifact copy)
+  + `upython` option in `index.html` + `UPY_MODE` branch in `src/main.js`
+  (`boot()` + `irqRun()`; all windows incl. SDHCI always mapped in the
+  browser host, so `SD_PRESENT=1`). The hold button (`#gpio-btn`) is
+  shown in upython mode too — it doubles as the `Pin.irq` button
+  (`pressGpioBtn` gate extended from `GPIO_MODE`-only).
+- **Real-IRQ gating (load-bearing):** firmware enables legacy-IC GPIO
+  banks, so browser `irqDeliver` would hijack its native erets — `UPY_MODE`
+  now joins the early-return (mirrors facade `realIrq`), and `syncLocalOut`
+  / `rearmGpuLine` / `irqRun` include `UPY_MODE` for the local-block line.
+- **TWO CORES (SUPERSEDED by M38 — single stock core now; history kept):**
+  `public/unicorn.js` (single-arch rebuild) CANNOT execute
+  NEON — newlib `strlen`'s `shrn` aborts (`0x1287cc`, UC_ERR_RESOURCE;
+  kills the version banner right after `/sd mounted`). The vendored full
+  fork build (`packages/pi3-emu/vendor/unicorn.js`) does NEON fine — but
+  it HANGS browser lirq (6 min silence; node lirq-probe passes on it, so
+  it's a vendor×browser timer-path gap, unroot-caused). Resolution: the 19
+  integer guests keep stock `public/unicorn.js`; upython lazily loads the
+  vendor build via `?url` asset (`ensureUpyCore`, own `MUnicornVendor`
+  global, `STOCK_CORE` captured by value and restored). Any future core
+  rebuild must be full `--release` AND verify NEON+float IN THE BROWSER.
+- **Card UI (N3 pattern):** `#cardbar` (Save/Load/Reset, shown in upython
+  mode) + `pi3emu/disk/upycard` IndexedDB key; Load/Reset reboot (image
+  injects pre-boot via `restoreCard()`); `sdModel` handle kept in main.js
+  for `exportImage`/`loadImage`.
+- **E2E (headless Chrome, /tmp scripts):** boot banner + `/sd mounted` +
+  REPL `1+1→2` + real hold-button `Pin.irq` rising + save→reload→restore
+  round-trip, zero page errors; lirq/irq/sd re-verified on the stock core.
+- **Ride-along:** FALLING-edge coverage in `test/upython-irq.mjs` (8/8).
+
+### M38 — single core again: NEON-free firmware (DONE, uncommitted)
+
+M37's dual-core (stock for 19 guests, vendor lazily for upython) stood
+exactly one milestone: root-causing the vendor×browser lirq hang showed
+the split was backwards. Findings, all reproduced in node:
+
+- Vendor + `lirq.elf` + wall-clock slices = silent 4000 slices, no fault;
+  stock delivers at slice 3081. Guest arms `TVAL=0x1000` fine; `cntpct`
+  advances but the gt compare never fires.
+- The 14/14 "vendor" lirq-probe was never on vendor:
+  `test/lirq-probe.mjs` requires `public/unicorn.js` directly. Only the
+  upython suites use the vendor core — and upython never touches the arch
+  timer (no utime), so the dead gt path hid there. (Vendor's
+  `arm64_timer_tick` also throws on plain numbers — strict BigInt wrapper;
+  the facade passes BigInt, so compatible. A 2^40 tick lands in the debug
+  counter yet the compare still never fires: vendor gt recalc/cval latch
+  is dead, exact site unroot-caused.)
+- Decisive VFP probe (hand-assembled `fmov d0,#1.5`/`fadd`/`str`,
+  `aarch64-none-elf-as` — hand-encoding lies, and `ret` with unset LR
+  faults after the store, so stop `until` before it): stock prints 3.0.
+  Stock lacks ONLY NEON/SIMD, not scalar float.
+- Fix in firmware, not cores: `ports/bcm2837/string_port.c` overrides the
+  7 linked newlib string/mem functions with plain C (newlib `strlen` is an
+  integer SWAR fast path + a NEON slow path at +0xe4 — the `shrn` that
+  killed the version banner), `-fno-tree-vectorize/slp` globally,
+  `-fno-builtin` file-local (else GCC turns the loops back into
+  memcpy calls). Scalar VFP stays on (doubles natively, libm fine).
+- Result: the firmware boots on stock AND all 8 upython suites pass on
+  BOTH cores. Dual-core wiring removed (`ensureUpyCore`/`?url`/
+  `MUnicornVendor` gone); browser back to one stock core for all 20
+  programs (UPY_MODE gating, cardbar, gpio panel stay).
+- STANDING CONSTRAINT: the firmware must stay NEON-free or stock-core
+  browser upython dies again. Check: `nm` must show the string syms
+  resolved to `string_port.o` (small addrs, e.g. strlen at 0x11c3b4 not
+  newlib's), `objdump` the string functions for zero `v*.*` insns, and
+  the battery proves it (it runs on vendor by default — the stock proof
+  was a temporary vendor↔stock file swap, all 8 PASS).
+- E2E re-verified single-core: upython full (boot/mount/REPL/button-IRQ)
+  + save→reload→restore + lirq/irq/sd, zero page errors.
+
+### M39 — time + machine.Timer (DONE, uncommitted)
+
+- **time/utime:** extmod `modtime.c` (`MICROPY_PY_TIME=1`) on the HAL in
+  `uart.c` (`ticks_ms/us/cpu` + `delay_ms/us` off `TMR_CLO`, 1 MHz);
+  frozen `utime.py` (`from time import *`) for Pico code — this upstream
+  renamed utime to time. `test/upython-timer.mjs` 11/11.
+- **machine.Timer** (`machine_timer.c`, Pico API: id/mode/period/callback
+  + `init`/`deinit`, `PERIODIC=1`/`ONE_SHOT=0`): id 0..3 ↔ system-timer
+  C0..C3 (compare = CLO + period, CS acked, IRQ 1 via legacy IC into the
+  local block); the vector re-arms PERIODIC and queues; `irq_drain` runs
+  callbacks main-loop-style like `Pin.irq`. Gotchas, all load-bearing:
+  enable bit is per-channel (bit `ch`, NOT bit 0 — read `L_TIMER`); the
+  CS model hook is inverted vs HW W1C (keep-mask; lirq's `str wzr` works
+  around it) so the driver acks `0xF^(1<<i)` complements; a disarmed
+  channel's stale compare fires once post-deinit and MUST still be acked
+  or its level livelocks the REPL (traced via host `tmrCompares/
+  tmrCrossed` sampling); `list.__setitem__` dunder doesn't exist at this
+  ROM level (test callbacks need `def`, proven by LED side-channel).
+- **BUILD BUG (fixed):** the port's custom `upy_%.o` rules generated no
+  depfiles, so extmod objects never rebuilt on header/qstr-pool changes —
+  M39's new QSTRs renumbered the pool and stale `upy_modos.o` silently
+  lost `os.mount`/`VfsFat` (selective misses: `sep`/`remove` survived via
+  earlier first-seen IDs). Rules now emit `.P` files like upstream's
+  `compile_c`. Recovery: `rm build/upy_*.o build/extmod_machine_mem.o`
+  + rebuild. `CFLAGS` edits still don't trigger rebuilds (make can't see
+  flags — `touch` after changing them).
+- Regression: 19/20 probes rc=0 (mva pre-existing), all 9 upython suites
+  PASS, browser upython E2E green, `npx vite build` clean.
+
+### M40 — pi-cpu: own Rust AArch64 core (DONE, uncommitted)
+
+Motivation verified by measurement, not theory: our unicorn.js executes
+via TCI (`TODO tci.c` in its own logs — no JIT in wasm) at ~1.3–1.9 MIPS
+in-harness, plus ~200 wasm↔JS crossings per slice. `cpu/` (`pi-cpu`,
+zero-dep, workspace member) is a hand-written interpreter: flat RAM,
+zero-mapped MMIO + PL011-TX tap, integer subset from an objdump survey
+(mov/movk/movn, ldr/str/ldrb/strb/ldur/stur/ldp/stp, add/sub/cmp,
+and/orr/eor, lsl/lsr, cbz/cbnz/tbz/tbnz, b/bl/ret/cond, csel/cset/csinc,
+ccmp, umulh/msub, adrp/adr, nop/isb). `test/cpu-diff.mjs` runs the same
+ELF+budget on both cores and compares console + X0-X30 + SP + PC + fault:
+shell/sum/fib PASS at **~120–260 MIPS vs ~1.9 — roughly 100–150×**.
+unicorn.js stays until parity; removal is the stated end goal.
+- Masks MUST be derived from assembler output, never hand-hex (three
+  separate mask bugs caught this way: mul o0, csel op, 2-src overlap).
+  Ground-truth method: assemble variants, diff words, keep exactly the
+  fixed bits (`cpu/` notes inline).
+- CMP/CMN (S=1, Rd=31) discard — must not write SP (found via sp=0
+  with x22=sp+8 going along consistently wrong on our side).
+- Harness bugs fixed along the way: node X29/X30 IDs are FP=1/LR=2 (not
+  X0+29/30); compare regs unsigned (i64 print vs u64 print differ above
+  2^63 — the entire x28 saga was half this).
+- Build hermeticity is load-bearing: `cargo clean -p` leaves hardlinked
+  example binaries behind and fingerprints mislead after touch/RUSTFLAGS
+  churn — a full day was lost to phantom "nondeterminism" (CF90/D000
+  x28 values) that was stale artifacts + my own mutating runner (one run
+  even hardcoded sum.elf for all programs) + misread decimals. Rule: `rm
+  -rf target` before differential verdicts, never mutate the runner
+  mid-diagnosis (use separate example files), `CARGO_INCREMENTAL=0`.
+
+### M41 — pi-cpu virtual-time timer + clock (DONE, uncommitted)
+
+- `Bus` gains the BCM2837 timer window (own 4K backing; CLO/CHI derived,
+  CMP/DONE cells, CS keep-mask absorb, DONE flag) with integer-exact
+  virtual time: `vt_ips=262144` advances exactly 15625 us per 4096-slice
+  (no float anywhere near integers — the host uses float math, so partial
+  tails are banned: harness budgets stay slice-even). `Cpu::run_sliced`
+  mirrors the facade sync order (eval pre-chunk, pull+advance post).
+  `test/cpu-diff.mjs` takes `[slice] [vt_ips]`; clock passes EXACT
+  (console numbers identical!) at ~250 vs ~12 MIPS.
+- Real decoder bugs found by clock (all verified against assembler
+  truth, all fixed): 64-bit MADD/CSINV/CCMP/2-src clauses never matched
+  (masks kept bit30/sf while values dropped them — 32-bit forms passed
+  by luck); pair `is64` must be bit31 not bit26 (wrong-but-self-
+  consistent stacks hid it); pair class gate must be bits(31:25) (a loose
+  mask executed `mov` as stack-smashing STP — caught via x-reg watch
+  showing the clobber); LD/ST bit24=0 forms split on bit21 (reg-offset)
+  vs (bit11,bit10) =   unscaled/post/pre (my opc mapping was inverted —
+  proven by the NUL-bytes putu, i.e. strb landing nowhere).
+
+### M42 — pi-cpu bitfield BFM (DONE, uncommitted)
+
+- BFM semantics oracle-derived (30+ points, `test/cpu-bfm.mjs` 14/14 vs
+  unicorn + `cpu/examples/bfm.rs`): with raw fields S=imms, R=immr,
+  `S < R` inserts at position (`(dst & !wmask) | (ROR(src,R) & wmask)`,
+  the BFI shape), else extracts low (`(dst & !tmask) | (ROR(src,R) &
+  tmask)`, the BFXIL shape). Covers canonical aliases plus arbitrary
+  (R,S), 64- and 32-bit.
+- Methodology lessons (all bitten, all load-bearing): oracle scripts must
+  use a VALID dst (BFM reads Rd — a zero/invalid dst makes the ANSWER
+  look like extract-low and inverts the conclusion); always zero-pad hex
+  (a dropped leading zero misreads a match as a mismatch); hand-built
+  32-bit base is `0x33000000` (N=0) — `0x33400000` sets N=1 which is
+  illegal with sf=0 and faults (`UC_ERR_EXCEPTION`).
+- `decode_masks` now also returns `r` (5-tuple) and handles the esize=64
+  replication without `<< 64` (debug-overflow panic).
+- Battery still green: shell/sum/fib + clock EXACT.
+- gpio parity (prefix through the button-poll spin, 400k budget + vt):
+  needed LSL-reg (`lsl w9,w23,w9` at 0x100A7C, Rust's `1 << var`) — the
+  2-source arm EXISTED (UDIV/SDIV/LSLV/LSRV/ASRV/RORV) but its mask
+  `0x7FE0F800==0x1AC00800` fixed opcode bits 15:11=00001 (div-only),
+  leaving the shift arms dead. Correct mask from 8-word assembler truth:
+  bits 30:21 constant + opcode bits 15:14=00 + bit12=0, i.e.
+  `(w & 0x7FE0D000) == 0x1AC00000` (verified disjoint from CSEL's
+  `0x3FE00800` mask). `test/cpu-shift.mjs` 15/15 (both widths, div-zero,
+  INT_MIN/-1) via `cpu/examples/shift.rs`.
+- MSR/MRS/system class (`(w>>25)&0x7f==0b1101010`) records VBAR_EL1 +
+  DAIF.I (assembler truth: `msr vbar_el1,x0`=0xD518C000 {3,0,12,0,0},
+  `msr daifclr,#2`=0xD50342FF, imm in CRm; DAIF.I resets masked).
+  Everything else in the class stays a NOP.
+
+### M43 — pi-cpu GPIO IRQ phase: button + host-assisted delivery (DONE)
+
+- `Bus`: GPIO window (LEV from latch+inputs, EDS W1C, 17-cell EV-reg
+  backing incl. reserved gaps, edge eval in `sync_out` from input
+  transitions gated by the enable union + HEN/LEN level-force — mirrors
+  `gpio.js`) + legacy-IC bank 2 (ENABLE accumulate, PENDING2 bit 17 +
+  BASIC bit 9 from the gated line — mirrors `ic.js`) + IRQ_RET magic at
+  IC+0x2C (`irq_ret_pending` flag). `Cpu`: `vbar_el1`/`daif_i` fields.
+- `run` example: optional `[press1 release1 press2]` insn schedule
+  (BTN29) + post-chunk IRQ_RET-resume-then-deliver loop mirroring the
+  facade `runSlice` order (same chunk/slice size ⇒ same guest points).
+  `cpu-diff` applies the same schedule via `emu.setButton`.
+- Full gpio: `cpu-diff gpio 700000 4096 262144 350000 400000 450000`
+  PASS (console/regs/sp/pc/insns/fault) through chase, poll, release-
+  edge delivery#1, "IRQ phase done", press2-edge delivery#2.
+- REAL DECODER BUGS this flushed out (both survived self-consistently
+  until the glue needed real restores):
+  - LDP/STP load-vs-store is **bit22, not bit30** (bit30 is 0 for every
+    pair form; all LDPs executed as STPs). Assembler truth table for all
+    8 offset/pre/post × 32/64 forms. `stkcheck` one-off proved it.
+  - `movz w0,#0xfff0` scare was my own mistyped probe word (0x528FFE00
+    vs disassembly's 0x529FFE00) — model was correct.
+  - sp=0x3FFFB0 (not 0x3FFFF0) is rust_main's own 64-byte frame, not a
+    leak — verified by chunk-boundary sp trace (`spy` one-off).
+- Diagnosis discipline held: separate one-off examples (irqstep/spy/
+  stkcheck/…), all deleted after; `run.rs` tracing removed.
+- Battery still green: shell/sum/fib + clock EXACT + bfm 14/14 + shift
+  15/15 (all re-verified from `rm -rf target`).
+
+### M44 — pi-cpu UART0 + timer-IRQ + mapped-set faults (DONE, uncommitted)
+
+- **Mapped-set fault model:** data accesses outside {RAM, UART0, TMR,
+  GPIO, MBOX page, LOCAL} now fault `UnmappedData` like the unicorn
+  core (the M40 zero-map-everything was a shortcut). MBOX page
+  (0x3F00B000, IC ride-along) + LOCAL page absorb as zeros, mirroring
+  the facade's default mappings. `is_ic` capped at the MBOX page end
+  (past 0x3F00C000 the facade faults too). Passing guests are unaffected
+  (they only touch mapped windows — proven by their unicorn runs).
+  `cpu-diff` is fault-aware: fault-on-either requires fault-on-both +
+  identical console/regs/sp, allows pc-4 (pi-cpu pre-increments pc),
+  skips insns (facade overcounts to the slice end on fault).
+- **UART0 model** (mirrors `uart0.js`): IBRD/FBRD/LCRH/CR/IMSC cells the
+  guest reads back, 16-deep RX FIFO (`uart0_push`, enabled+space gated),
+  DR read = head+pop, dynamic FR (TXFE always, RXFE iff empty),
+  RIS = RXINTR-if-nonempty | TXINTR-always, MIS = RIS&IMSC, ICR absorb.
+  DR-write console tap skips zero bytes (matches the facade hook).
+  `run`/`cpu-diff` take `[keybyte] [keyat]` (single edge-triggered push).
+- **IC bank 1** (timer C0-C3): PENDING1 + BASIC bit 8 (non-shortcut),
+  UART PENDING2 bit 25 + BASIC shortcut bit 19.
+- Full parity, all PASS: `uart0 200000 ... 0 0 0 72 40000` (RXINTR MIS
+  0x10, [rx 'H'], TXINTR MIS 0x20, de-arm, no storm) and `irq 500000 ...
+  0 0 0 72 350000` (timer C1 "[irq #1 t+1s]" + UART key).
+- Sweep tally: clean PASS — shell/sum/fib/clock/gpio/bench/irqcore/irq/
+  uart0/fb; fault-both PASS — debug/periphs/uart1/i2c/spi/pwm/sd/dma/
+  smp/mmu (all unmapped-window faults at identical points).
+- BLOCKED (needs new models): mva (MMU), lirq (local block + arch
+  timer), firmware/upython (SDHCI + fuller UART/GPIO).
+
+### M45 — pi-cpu 1-source class + assembler-truth fuzzer (DONE, uncommitted)
+
+- New `test/cpu-cases.mjs`: every case word comes from
+  `aarch64-none-elf-as` (labels key words, never position, never
+  hand-hex), each runs once on the unicorn oracle + once on pi-cpu
+  `cpu/examples/one.rs` (fresh `Unicorn` per case — instance reuse hits
+  translator-buffer exhaustion), comparing fault + X0-X30 + SP + PC +
+  NZCV + 3 scratch windows. 151 snippets x 3 vectors (V0 small ints,
+  V1 scratch bases, V2 MSB-heavy) = 453/453 PASS.
+- 1-source arm (`(w & 0x7FC00000) == 0x5AC00000`, verified disjoint from
+  MADD/CSEL/CCMP/ORR/ADD/LSL-reg/UDIV/BR/RET/ADRP): op6 = bits(15:10)
+  selects the op, sf the width — 0 RBIT, 1 REV16, 2 REV32(X)/REV(W),
+  3 REV(X only; sf0 unallocated -> Illegal), 4 CLZ, 5 CLS, both widths
+  each (W results via `w()` zero-extend).
+- REV32-X reverses bytes WITHIN each 32-bit half (bswap32 per half,
+  halves stay: 0x1122334455667788 -> 0x4433221188776655, fork-probed) —
+  NOT a half-swap. CLS counts the run FOLLOWING the top bit (spec,
+  fork-probed both widths incl. negatives: no fork quirk anywhere in
+  this class — the earlier "quirk" readings were my own swapped
+  want/got columns plus three hand-transcribed words).
+- Methodology (bitten, load-bearing): transcribing objdump words by hand
+  caused this whole detour (rbitw/clzw/clsw typos — the Rn field in my
+  own table contradicted the source line and I didn't notice); always
+  machine-extract words. DIFF format is `oracle/pi` (`want/got`).
+  Assembler limits are real: LDRH unsigned max is #8190 (#32766 does not
+  assemble); `rev16 w6, w7` is legal (op6=1, sf0).
+- Also added to fuzzer: STNP/LDNP, LDPSW pre/post-index, offset
+  extremes (`ldr x20,[x21,#32760]`, `stur [...,#-256]`), all green.
+- Battery still green with the new arm: shell/sum/fib/clock/bench/
+  irqcore/fb/gpio/uart0/irq PASS; periphs/i2c/spi/pwm/dma/smp/mmu/mva/
+  debug fault-both PASS; lirq console/sp/pc/insns/fault ok, x1-only
+  residual (known chained-TB sliver, pre-existing).
+- NOTE (pre-existing, NOT M45): `cpu-diff uart1/sd` currently FAIL
+  (unicorn faults early at `adr 0x10016c`, pi-cpu runs on) — reproduces
+  with the 1-source arm gated off, so it belongs to the active
+  facade/SDHCI/sd.elf workstream, not the decoder. MMU/local-block/
+  arch-timer/SDHCI/mini-UART/firmware-REPL pi-cpu models (all working,
+  uncommitted) still need their own AGENTS.md entries.
 
 ## Key risks
 

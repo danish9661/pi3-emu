@@ -31,6 +31,8 @@ export function createGpio(uc, ucMod, base, { getBtn, onIrqChange }) {
 
   // Cached enable masks: only refreshed when guest writes to enable regs.
   let enMaskCache = [0, 0];
+  // Split high/low level masks (GPHEN/GPLEN) for level-triggered IRQs.
+  let lvlCache = { hen: [0, 0], len: [0, 0] };
   let enMaskDirty = true;
 
   function refreshEnMasks() {
@@ -40,6 +42,10 @@ export function createGpio(uc, ucMod, base, { getBtn, onIrqChange }) {
       m[1] |= readU32(uc, a1);
     }
     enMaskCache = m;
+    lvlCache = {
+      hen: [readU32(uc, base + 0x64), readU32(uc, base + 0x68)],
+      len: [readU32(uc, base + 0x70), readU32(uc, base + 0x74)],
+    };
     enMaskDirty = false;
   }
 
@@ -72,6 +78,16 @@ export function createGpio(uc, ucMod, base, { getBtn, onIrqChange }) {
       }
       state.hostPrev = host;
     }
+    // Level-triggered events: while the level is held with GPHEN/GPLEN
+    // enabled, keep the event bit set (re-fires after a W1C ack, like real
+    // hardware; nothing set when no level enable is armed).
+    getEnMasks();
+    if (lvlCache.hen[0] | lvlCache.hen[1] | lvlCache.len[0] | lvlCache.len[1]) {
+      const lev0 = (state.out & ~host) | host;
+      const lev1 = Math.floor(state.out / 4294967296);
+      state.ev[0] |= (lev0 & lvlCache.hen[0]) | (~lev0 & lvlCache.len[0]);
+      state.ev[1] |= (lev1 & lvlCache.hen[1]) | (~lev1 & lvlCache.len[1]);
+    }
     writeU32(uc, GPEDS0, state.ev[0]);
     writeU32(uc, GPEDS1, state.ev[1]);
   }
@@ -86,6 +102,12 @@ export function createGpio(uc, ucMod, base, { getBtn, onIrqChange }) {
     if (set1) writeU32(uc, GPSET1, set1);
     if (clr0) writeU32(uc, GPCLR0, clr0);
     if (clr1) writeU32(uc, GPCLR1, clr1);
+    // Re-mirror event state: the guest's own W1C store commits AFTER the
+    // write hook runs, leaving the ack value as residue in the cell. Push
+    // the cleared state back so post-slice reads see hardware truth
+    // (W1C reads back clear). Never pull cell->state here (self-clear bug).
+    writeU32(uc, GPEDS0, state.ev[0]);
+    writeU32(uc, GPEDS1, state.ev[1]);
     if (onIrqChange) onIrqChange();
   }
 

@@ -3,7 +3,9 @@
 // Supports PIO mode (block buffer at +0x100) and SDMA mode (single-block
 // and multi-block DMA to guest RAM). The guest writes the DMA target
 // address to the DONE extension register (host extension, not standard
-// SDHCI) and sets TRANSFER_MODE bit 0 to enable DMA.
+// SDHCI) and sets TRANSFER_MODE bit 0 to enable DMA. Writes: CMD24
+// (WRITE_BLOCK) stores the BLOCK_DATA-staged (PIO) or DMA-source bytes
+// into the backing disk image.
 //
 // Register map (BCM2835-style, matching the sd bare-metal guest):
 //   +0x00  ARG           command argument
@@ -35,13 +37,23 @@ function makeDisk() {
   b[11] = 0x00; b[12] = 0x02; b[13] = 1; b[14] = 1;
   b[16] = 2; b[17] = 16; b[19] = 0x28; b[21] = 0xf8;
   b[22] = 1; b[24] = 1; b[26] = 1; b[33] = 0x28;
+  for (let i = 0; i < 8; i++) b[54 + i] = "FAT12   ".charCodeAt(i); // FS type
+  b[510] = 0x55; b[511] = 0xaa; // boot signature (real FAT mounts need it)
   const f = s[1];
   f[0] = 0xf8; f[1] = 0xff; f[2] = 0xff; f[3] = 0xff;
   f[4] = 0xff; f[5] = 0x0f;
   s[2].set(f);
   const r = s[3];
   for (let i = 0; i < 11; i++) r[i] = "HELLO   TXT".charCodeAt(i);
-  r[11] = 0x20; r[20] = 2; r[30] = msg.length & 0xff; r[31] = (msg.length >> 8) & 0xff;
+  r[11] = 0x20; // archive
+  // Valid modification stamp (FatFs date math underflows on zero dates,
+  // which breaks os.stat): 2026-09-10 12:00.
+  r[22] = 0x00; r[23] = 0x60; // time: 12<<11
+  r[24] = 0x2a; r[25] = 0x5d; // date: 10 | 9<<5 | (2026-1980)<<9
+  // Real FAT12 dir entry: start cluster u16 at +26, size u32 at +28.
+  r[26] = 2; r[27] = 0;
+  r[28] = msg.length & 0xff; r[29] = (msg.length >> 8) & 0xff;
+  r[30] = 0; r[31] = 0;
   for (let i = 0; i < msg.length; i++) s[4][i] = msg.charCodeAt(i);
   return s;
 }
@@ -104,6 +116,47 @@ export function createSdhci(uc, ucMod, base, onIrqChange) {
     return disk[sec & 0xffff] || new Uint8Array(SEC);
   }
 
+  // PIO write source: the guest stages 512 bytes in BLOCK_DATA before CMD24.
+  // (The CMD hook fires mid-slice, so the staged bytes are already in RAM.)
+  function stagedBlock() {
+    const raw = uc.mem_read(BLOCK_DATA, SEC);
+    const data = new Uint8Array(SEC);
+    for (let i = 0; i < SEC; i++) data[i] = raw[i];
+    return data;
+  }
+
+  function writeSector(sec, data) {
+    const s = sec & 0xffff;
+    if (!disk[s]) {
+      if (s >= 32) return false; // cap growth: not a real allocator
+      disk[s] = new Uint8Array(SEC);
+    }
+    disk[s].set(data);
+    return true;
+  }
+
+  // Snapshot: flat sector image (sector 0 first; holes read as zeros).
+  // Pair with loadImage for save/restore across sessions.
+  function exportImage() {
+    const out = new Uint8Array(disk.length * SEC);
+    for (let i = 0; i < disk.length; i++) {
+      if (disk[i]) out.set(disk[i], i * SEC);
+    }
+    return out;
+  }
+
+  function loadImage(bytes) {
+    const u8 = bytes instanceof Uint8Array ? bytes : Uint8Array.from(bytes);
+    if (u8.length % SEC !== 0 || u8.length === 0) return false;
+    disk.length = 0;
+    for (let off = 0; off < u8.length; off += SEC) {
+      disk.push(u8.slice(off, off + SEC));
+    }
+    state.block = null;
+    state.blockDirty = false;
+    return true;
+  }
+
   function exec(index, arg) {
     state.commands.push([index, arg]);
     switch (index) {
@@ -151,6 +204,21 @@ export function createSdhci(uc, ucMod, base, onIrqChange) {
           state.block = readSector(startSector);
           state.blockDirty = true;
           state.irq |= IRPTBUF_READ_READY | IRPT_XFER_COMPLETE;
+        }
+        break;
+      }
+      case 24: {
+        setResp(0x900);
+        const sector = arg & 0xffff;
+        if (state.dmaActive && state.dmaAddr) {
+          const raw = uc.mem_read(state.dmaAddr, SEC);
+          const data = new Uint8Array(SEC);
+          for (let i = 0; i < SEC; i++) data[i] = raw[i];
+          writeSector(sector, data);
+          state.irq |= IRPT_XFER_COMPLETE | IRPT_DMA;
+        } else {
+          writeSector(sector, stagedBlock());
+          state.irq |= IRPT_BUF_WRITE_READY | IRPT_XFER_COMPLETE;
         }
         break;
       }
@@ -244,5 +312,5 @@ export function createSdhci(uc, ucMod, base, onIrqChange) {
 
   const irqActive = () => (state.irq & state.intEn & state.sigEn) !== 0;
 
-  return { state, syncOut, syncIn, irqActive, exec, w1c: (mask) => { state.irq &= ~mask; } };
+  return { state, syncOut, syncIn, irqActive, exec, exportImage, loadImage, w1c: (mask) => { state.irq &= ~mask; } };
 }

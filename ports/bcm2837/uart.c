@@ -56,8 +56,23 @@ mp_uint_t mp_hal_ticks_ms(void) {
     return TMR_CLO / 1000;
 }
 
+mp_uint_t mp_hal_ticks_us(void) {
+    return TMR_CLO;
+}
+
+// No separate CPU counter on the spike: same 1 MHz system-timer source.
+mp_uint_t mp_hal_ticks_cpu(void) {
+    return TMR_CLO;
+}
+
 void mp_hal_delay_ms(mp_uint_t ms) {
     mp_uint_t start = mp_hal_ticks_ms();
     while (mp_hal_ticks_ms() - start < ms) {
+    }
+}
+
+void mp_hal_delay_us(mp_uint_t us) {
+    unsigned start = TMR_CLO;
+    while (TMR_CLO - start < us) {
     }
 }

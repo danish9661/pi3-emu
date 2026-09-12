@@ -143,7 +143,7 @@ pub extern "C" fn rust_main() -> ! {
         let expect: &[u8] = b"HELLO   TXT";
         if name == expect {
             found = true;
-            cluster = u16_le(&dir[off + 20..off + 22]);
+            cluster = u16_le(&dir[off + 26..off + 28]);
         }
     }
 

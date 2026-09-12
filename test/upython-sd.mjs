@@ -43,6 +43,26 @@ check('auto-run banner', emu.consoleText.includes('boot: pi3-emu ready'),
 check('ls', (await cmd('import sdcard')).includes('>>>') &&
   (await cmd('sdcard.ls()')).includes("['HELLO.TXT']"));
 check('read payload', (await cmd('sdcard.read("HELLO.TXT")')).includes('hello from the SD card'));
+check('create multi-cluster',
+  (await cmd('sdcard.write("EXTRA.TXT", b"0123456789" * 100)')).includes('1000') &&
+  (await cmd('sdcard.ls()')).includes('EXTRA.TXT') &&
+  (await cmd('len(sdcard.read("EXTRA.TXT"))')).includes('1000') &&
+  (await cmd('sdcard.read("EXTRA.TXT")[:10]')).includes('0123456789'));
+check('shrink frees tail',
+  (await cmd('sdcard.write("EXTRA.TXT", b"tiny")')).includes('4') &&
+  (await cmd('sdcard.read("EXTRA.TXT")')).includes('tiny') &&
+  (await cmd('sdcard.read("HELLO.TXT")')).includes('hello from the SD card'));
+check('write round-trip',
+  (await cmd('sdcard.write("HELLO.TXT", b"pi3-emu wrote this")')).includes('>>>') &&
+  (await cmd('sdcard.read("HELLO.TXT")')).includes('pi3-emu wrote this'));
+check('raw block round-trip',
+  (await cmd('c = sdcard.SDCard()')).includes('>>>') &&
+  (await cmd('b = bytearray(512)')).includes('>>>') &&
+  (await cmd('c.readblocks(4, b)')).includes('>>>') &&
+  (await cmd('b[0]')).includes('112') && // 'p' of the payload above
+  (await cmd('b[0] = 80')).includes('>>>') && // 'P': proves the block write stuck
+  (await cmd('c.writeblocks(4, b)')).includes('>>>') &&
+  (await cmd('sdcard.read("HELLO.TXT")')).includes('Pi3-emu wrote this'));
 check('no faults', !emu.lastFault, emu.lastFault ? emu.lastFault.message : '');
 
 if (fail.length) { console.log('UPYTHON-SD FAIL:', fail.join(', ')); process.exit(1); }

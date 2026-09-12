@@ -48,6 +48,27 @@
 #define MICROPY_PY_SYS_EXIT               (0)
 #define MICROPY_PY_SYS_ARGV               (0)
 
+// Full big ints (os.stat timestamps and file sizes go through
+// mp_obj_new_int_from_ll, which unconditionally raises under the default
+// NONE impl). Small ints stay 63-bit; this only adds the slow path.
+#define MICROPY_LONGINT_IMPL            (MICROPY_LONGINT_IMPL_MPZ)
+// File I/O + VFS: the FAT12 SD card mounts via os.mount (VfsFat).
+// Upstream master's mp_state_vm_t lost its vfs_cur/vfs_mount_table
+// fields mid-refactor, so MICROPY_VFS doesn't compile out of the box —
+// vfs_port.c injects them via MP_REGISTER_ROOT_POINTER (see it).
+#define MICROPY_VFS                 (1)
+#define MICROPY_VFS_FAT             (1)
+#define MICROPY_READER_VFS          (1)
+#define MICROPY_PY_OS               (1)
+#define MICROPY_PY_IO               (1)
+// time module (sleep/ticks_*) off the system-timer HAL in uart.c; utime
+// is a frozen alias (utime.py) for Pico-compatible code.
+#define MICROPY_PY_TIME             (1)
+// VfsFat file objects need finalisers (flushed/closed on GC).
+#define MICROPY_ENABLE_FINALISER    (1)
+// Relative paths + getcwd inside the mounted FAT (f_chdir/f_getcwd).
+#define MICROPY_FATFS_RPATH         (2)
+
 // type definitions for the specific machine
 
 typedef long mp_off_t;

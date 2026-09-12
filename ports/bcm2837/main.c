@@ -26,8 +26,10 @@ int main(void) {
     gc_init(heap, heap + sizeof(heap));
     #endif
     mp_init();
-    // Auto-run the frozen boot.py (mounts /sd, prints banner skips). Errors
-    // must never kill startup: fall through to the REPL regardless.
+    // Auto-run the frozen boot.py (prints banner). Errors must never kill
+    // startup: fall through to the REPL regardless. No auto-mount here:
+    // touching SDHCI with no card attached would data-abort, which no
+    // try/except can catch — mount manually (see test/upython-vfs.mjs).
     {
         nlr_buf_t nlr;
         if (nlr_push(&nlr) == 0) {
@@ -53,18 +55,8 @@ void gc_collect(void) {
 }
 #endif
 
-mp_lexer_t *mp_lexer_new_from_file(qstr filename) {
-    mp_raise_OSError(MP_ENOENT);
-}
-
-// No filesystem: plain NO_EXIST. Frozen modules resolve through the
-// ".frozen" sys.path entry (runtime.c), which carries the prefix that
-// stat_path/do_load need to consult the frozen table. (Claiming frozen
-// matches here would return prefix-less paths that do_load can't load.)
-mp_import_stat_t mp_import_stat(const char *path) {
-    (void)path;
-    return MP_IMPORT_STAT_NO_EXIST;
-}
+// mp_lexer_new_from_file comes from the core (MICROPY_READER_VFS) and
+// mp_import_stat lives in vfs_port.c (routes to the VFS layer).
 
 void nlr_jump_fail(void *val) {
     (void)val;

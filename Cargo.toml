@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["board"]
+members = ["board", "cpu"]
 
 [profile.release]
 opt-level = "s"

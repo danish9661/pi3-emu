@@ -1,0 +1,8 @@
+[package]
+name = "pi-cpu"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "pi_cpu"
+crate-type = ["cdylib", "rlib"]

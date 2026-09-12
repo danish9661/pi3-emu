@@ -95,6 +95,12 @@ export const I2C_BASE = 0x3f804000;
 export const SPI_BASE = 0x3f204000;
 export const UART1_BASE = 0x3f215000;
 export const SD_BASE = 0x3f300000;
+// Host extension: SD-card presence flag for boot.py auto-mount. Lives in
+// the always-mapped mailbox window (mailbox regs sit at +0x880, the IC at
+// +0x200 — +0xFF0 collides with neither). Driven every slice: 1 while an
+// SDHCI card is attached, 0 otherwise. Reading it can never abort, unlike
+// touching SD_BASE with no card mapped.
+export const SD_PRESENT = MBOX_WINDOW + 0xFF0;
 
 export class Pi3Emulator {
   // ucMod: unicorn module (await loadUnicorn() or window.MUnicorn()).
@@ -364,7 +370,17 @@ export class Pi3Emulator {
     this.mapWindow(SD_BASE);
     const sd = createSdhci(this.uc, this.ucMod, SD_BASE, () => this.rearmGpuLine());
     this.sdIrqActive = sd.irqActive;
+    this.sd = sd;
     return this.attach(sd);
+  }
+  // SD card snapshot: flat sector image for save/restore across sessions
+  // (download/upload the bytes; importCard before boot, or remount after —
+  // a live VfsFat mount caches sectors, see sdcard.write docs).
+  exportCard() {
+    return this.sd ? this.sd.exportImage() : null;
+  }
+  importCard(bytes) {
+    return this.sd ? this.sd.loadImage(bytes) : false;
   }
   attachMmu() {
     this.mapWindow(MMU_CTL);
@@ -439,16 +455,20 @@ export class Pi3Emulator {
     this.irqResume = 0;
     this.irqVector = 0;
     this.syncTimerOut();
+    this.safeSync(() => writeU32(uc, SD_PRESENT, this.sdIrqActive ? 1 : 0));
     this.safeSync(() => this.gpio.syncOut(uc));
     this.safeSync(() => this.ic.syncOut(uc));
     this.safeSync(() => this.syncLocalOut());
     if (this.realIrq && this.hasDebug()) {
       try {
-        uc.arm64_timer_tick(BigInt(Math.floor(this.emuNowUs() * 19.2)));
+        const tv = BigInt(Math.floor(this.emuNowUs() * 19.2));
+        if (process.env.LIRQTRACE) console.error(`tick vus=${this.virtualUs} tv=${tv}`);
+        uc.arm64_timer_tick(tv);
       } catch (_) {}
     }
     if (this.uart0SyncOut) this.safeSync(() => this.uart0SyncOut(uc));
     for (const d of this.devices) { if (d.syncOut) this.safeSync(() => d.syncOut(uc)); }
+    if (process.env.LIRQTRACE) console.error(`start pc=0x${pc.toString(16)} n=${n} gt0pre=${this.dbg(3)}`);
     try {
       uc.emu_start(pc, 0, 0, n);
       this.faultStreak = 0;

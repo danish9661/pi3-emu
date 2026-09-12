@@ -206,10 +206,16 @@ let uart0IrqActive = null;
 // SD_DONE after printing HELLO.TXT. IRPT_EN/IRPT_MASK (0x34/0x38) gate the
 // IRQ line (bank-2 bit 30, IRQ 62).
 const SD_BASE = 0x3F300000;
+// Host extension (mirrors Pi3Emulator.SD_PRESENT): SD-card presence flag
+// for boot.py auto-mount, in the always-mapped mailbox window (+0xFF0
+// collides with neither the mailbox regs at +0x880 nor the IC at +0x200).
+// The browser host always maps the SD window, so this is always 1 here.
+const SD_PRESENT = MBOX_WINDOW + 0xFF0;
 const SD_MAX_SLICES = 30000;
 let sdSyncOut = null;
 let sdSyncIn = null;
 let sdState = null;
+let sdModel = null; // full SDHCI model handle (exportImage/loadImage for card save/load)
 let sdIrqActive = null;
 
 // New peripherals (M30): RNG + Temperature (share 0x3F104000 window),
@@ -258,6 +264,7 @@ export const PROGRAMS = {
   sd: 'sd.elf',
   uart0: 'uart0.elf',
   lirq: 'lirq.elf',
+  upython: 'firmware.elf',
   periphs: 'periphs.elf',
   debug: 'debug.elf',
   bench: 'bench.elf',
@@ -291,6 +298,62 @@ const statsEl = document.getElementById('stats');
 const hint = document.getElementById('hint');
 const gpioPanel = document.getElementById('gpiopanel');
 const fbCanvas = document.getElementById('fbscreen');
+const cardbar = document.getElementById('cardbar');
+
+// ---- MicroPython SD card persistence (Save/Load/Reset + IndexedDB) ----
+// Same pattern as the Linux harness (public/linux/index.html N3): the card
+// image is a flat sector blob (see sdhci.js exportImage/loadImage), small
+// enough (≤16 KB) to keep whole in IndexedDB. Load injects before boot
+// (the guest auto-mounts at startup); Save snapshots the live card.
+const idbCardOpen = () => new Promise((res, rej) => {
+  const r = indexedDB.open('pi3emu', 1);
+  r.onupgradeneeded = () => {
+    if (!r.result.objectStoreNames.contains('disk')) r.result.createObjectStore('disk');
+  };
+  r.onsuccess = () => res(r.result);
+  r.onerror = () => rej(r.error);
+});
+const idbCardGet = async () => {
+  const db = await idbCardOpen();
+  return await new Promise((res, rej) => {
+    const rq = db.transaction('disk', 'readonly').objectStore('disk').get('upycard');
+    rq.onsuccess = () => res(rq.result || null);
+    rq.onerror = () => rej(rq.error);
+  });
+};
+const idbCardPut = async (buf) => {
+  const db = await idbCardOpen();
+  await new Promise((res) => {
+    const tx = db.transaction('disk', 'readwrite');
+    tx.objectStore('disk').put(new Uint8Array(buf), 'upycard');
+    tx.oncomplete = res;
+  });
+};
+const idbCardDel = async () => {
+  const db = await idbCardOpen();
+  await new Promise((res) => {
+    const tx = db.transaction('disk', 'readwrite');
+    tx.objectStore('disk').delete('upycard');
+    tx.oncomplete = res;
+  });
+};
+const downloadCard = (buf, name) => {
+  const blob = new Blob([buf], { type: 'application/octet-stream' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+};
+// Called from run() after boot() created the SD model, before slices start.
+async function restoreCard() {
+  try {
+    const saved = await idbCardGet();
+    if (saved && saved.byteLength > 0 && sdModel && sdModel.loadImage(new Uint8Array(saved))) {
+      setStatus('restored saved SD card image — booting upython');
+    }
+  } catch (e) { console.log('card restore failed: ' + e); }
+}
 const fbCtx = fbCanvas.getContext('2d');
 const gpioLedsEl = document.getElementById('gpio-leds');
 const gpioBtnEl = document.getElementById('gpio-btn');
@@ -479,6 +542,7 @@ function boot(ucMod, uc, board, elf, opts = {}) {
   sdSyncOut = sd.syncOut;
   sdSyncIn = sd.syncIn;
   sdState = sd.state;
+  sdModel = sd;
   sdIrqActive = sd.irqActive;
 
   // M30: new peripherals
@@ -748,6 +812,11 @@ let fbFrame = 0;
 const IRQ_MODE = 'irq';
 let irqFrame = 0;
 const LIRQ_MODE = 'lirq';
+// MicroPython bare-metal firmware (ports/bcm2837): interactive REPL on the
+// PL011, real local-block IRQ delivery like LIRQ_MODE (its Pin.irq glue
+// erets natively — host-assisted delivery must stay off, as in the
+// facade's realIrq mode), SDHCI card always attached (SD_PRESENT=1).
+const UPY_MODE = 'upython';
 const FB_ADDR = 0x200000; // allocated framebuffer inside guest RAM
 let fbW = 0;
 let fbH = 0;
@@ -845,7 +914,7 @@ function syncLocalOut(uc) {
   // modes deliver host-assisted at slice boundaries (irqDeliver records
   // irqElr for the magic-resume glue) and a real mid-slice entry there
   // would resume at PC 0 (no irqElr).
-  if (mode === LIRQ_MODE || mode === LINUX_MODE) localInt.syncIrq(uc, (level) => uc.arm64_set_irq(level));
+  if (mode === LIRQ_MODE || mode === LINUX_MODE || mode === UPY_MODE) localInt.syncIrq(uc, (level) => uc.arm64_set_irq(level));
 }
 
 function syncLocalIn(uc) {
@@ -861,7 +930,7 @@ function syncLocalIn(uc) {
 // assisted at slice boundaries (irqDeliver records irqElr), and a real
 // mid-slice entry would leave that machinery with no resume point.
 function rearmGpuLine(uc) {
-  if (localInt && (mode === LIRQ_MODE || mode === LINUX_MODE)) localInt.syncIrq(uc, (level) => uc.arm64_set_irq(level));
+  if (localInt && (mode === LIRQ_MODE || mode === LINUX_MODE || mode === UPY_MODE)) localInt.syncIrq(uc, (level) => uc.arm64_set_irq(level));
 }
 
 // A TMR_CS ack (or any CS write) from the guest re-derives the GPU line in
@@ -898,7 +967,7 @@ function daifI() {
 }
 
 function irqDeliver(uc) {
-  if (irqInFlight || mode === SMP_MODE || mode === LINUX_MODE) return;
+  if (irqInFlight || mode === SMP_MODE || mode === LINUX_MODE || mode === UPY_MODE) return;
   if (!ic || daifI()) return;
   // ic.pending() is derived fresh from the device lines on every call (the
   // pending windows are refreshed pre-slice, so they are already gated).
@@ -1285,6 +1354,7 @@ function runSlice(count) {
   irqVector = 0;
   syncTimerOut(uc);
   syncMailboxOut(uc);
+  writeU32(uc, SD_PRESENT, 1); // SDHCI window always mapped in this host
   if (gpio) gpio.syncOut(uc);
   if (ic) ic.syncOut(uc);
   syncLocalOut(uc);
@@ -1585,7 +1655,7 @@ function blit() {
 function irqRun() {
   let out = '';
   const frame = () => {
-    if (mode !== IRQ_MODE && mode !== LIRQ_MODE) return;
+    if (mode !== IRQ_MODE && mode !== LIRQ_MODE && mode !== UPY_MODE) return;
     const t0 = performance.now();
     do {
       out += runSlice(SLICE_INSNS);
@@ -1764,6 +1834,7 @@ async function run() {
   term.textContent = '';
   gpioPanel.hidden = true;
   fbCanvas.hidden = true;
+  cardbar.hidden = true;
   stats = { steps: 0, insns: 0, emuMs: 0, chars: 0, wallStart: performance.now() };
   statsEl.textContent = '';
   try {
@@ -1822,6 +1893,16 @@ async function run() {
       irqRun(); // async: rAF-paced slices, real IRQs via the local block
       setStatus(
         `booted — running lirq — BCM2836 local interrupt block @ 0x40000000 — CNTPNS + GPU IRQ delivered to a real vector`
+      );
+    } else if (progSel.value === UPY_MODE) {
+      mode = UPY_MODE;
+      boot(ucMod, uc, board, elf);
+      await restoreCard(); // saved SD image from IndexedDB, if any
+      cardbar.hidden = false;
+      gpioPanel.hidden = false; // BTN 29 doubles as the Pin.irq button
+      irqRun(); // async: rAF-paced slices, REPL on the PL011 + real Pin.irq
+      setStatus(
+        `booted — running upython — MicroPython on BCM2837, /sd auto-mounted — type Python, card buttons below save the SD image`
       );
     } else if (progSel.value === 'mmu') {
       mode = 'mmu';
@@ -1895,7 +1976,7 @@ async function run() {
 // high in GPLEV, and slices are resumed so the guest's poll loop sees it.
 // (During the rAF-paced chase the frame loop advances the guest itself.)
 function pressGpioBtn(down) {
-  if (!uc || runBtn.disabled || mode !== GPIO_MODE) return;
+  if (!uc || runBtn.disabled || (mode !== GPIO_MODE && mode !== UPY_MODE)) return;
   gpioBtn = down ? 1 : 0;
   gpioBtnEl.classList.toggle('held', !!down);
   // The button level reaches the guest at the next slice; re-arm the local
@@ -1928,4 +2009,38 @@ window.addEventListener('message', (e) => {
 });
 
 runBtn.addEventListener('click', run);
+
+// MicroPython card buttons (visible while upython runs; see #cardbar).
+// Save snapshots the live card to IndexedDB + downloads it; Load reads a
+// .bin file into IndexedDB and reboots (injected before boot); Reset
+// clears the saved image and reboots pristine.
+try {
+  document.getElementById('saveCard').addEventListener('click', async () => {
+    try {
+      if (!sdModel) { setStatus('no SD card model (run upython first)'); return; }
+      const buf = sdModel.exportImage();
+      await idbCardPut(buf);
+      downloadCard(buf, 'pi3-card-' + Date.now() + '.bin');
+      setStatus(`saved SD card (${buf.length} bytes) — also in IndexedDB`);
+    } catch (e) { setStatus('Save Card failed: ' + (e && e.message || e)); }
+  });
+  const cardUpload = document.getElementById('cardUpload');
+  document.getElementById('loadCard').addEventListener('click', () => cardUpload.click());
+  cardUpload.addEventListener('change', () => {
+    const f = cardUpload.files[0]; if (!f) return;
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        await idbCardPut(new Uint8Array(reader.result));
+      } catch (e) { setStatus('Load Card failed: ' + (e && e.message || e)); }
+      cardUpload.value = '';
+      run();
+    };
+    reader.readAsArrayBuffer(f);
+  });
+  document.getElementById('resetCard').addEventListener('click', async () => {
+    try { await idbCardDel(); } catch (e) { console.log('card reset failed: ' + e); }
+    run();
+  });
+} catch (_) {}
 run();

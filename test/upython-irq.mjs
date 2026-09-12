@@ -50,6 +50,31 @@ for (let i = 0; i < 200; i++) emu.runSlice(4096);
 emu.setButton(true);
 for (let i = 0; i < 400; i++) emu.runSlice(4096);
 check('repress delivers again, no stuck level', (await cmd('len(hits)')).includes('\r\n2\r\n'));
+await cmd('b.irq(None)');
+await cmd('hits = []');
+// Level phases need the button released first (the rising phases leave it
+// held). Release + settle with IRQs disabled so no stale edge fires.
+emu.setButton(false);
+for (let i = 0; i < 50; i++) emu.runSlice(4096);
+await cmd('b.irq(lambda p: hits.append(1), Pin.IRQ_LOW_LEVEL)');
+for (let i = 0; i < 300; i++) emu.runSlice(4096);
+check('low level fires while released', !/\r\n0\r\n/.test(await cmd('len(hits)')));
+await cmd('b.irq(None)');
+await cmd('hits = []');
+await cmd('b.irq(lambda p: hits.append(1), Pin.IRQ_HIGH_LEVEL)');
+for (let i = 0; i < 200; i++) emu.runSlice(4096);
+check('high level silent while released', (await cmd('len(hits)')).includes('\r\n0\r\n'));
+emu.setButton(true);
+for (let i = 0; i < 300; i++) emu.runSlice(4096);
+check('high level fires while held', !/\r\n0\r\n/.test(await cmd('len(hits)')));
+await cmd('b.irq(None)');
+await cmd('hits = []');
+await cmd('b.irq(lambda p: hits.append(1), Pin.IRQ_FALLING)');
+for (let i = 0; i < 200; i++) emu.runSlice(4096);
+check('falling silent while held', (await cmd('len(hits)')).includes('\r\n0\r\n'));
+emu.setButton(false);
+for (let i = 0; i < 400; i++) emu.runSlice(4096);
+check('falling fires on release', (await cmd('len(hits)')).includes('\r\n1\r\n'));
 check('no faults', !emu.lastFault, emu.lastFault ? emu.lastFault.message : '');
 
 if (fail.length) { console.log('UPYTHON-IRQ FAIL:', fail.join(', ')); process.exit(1); }
