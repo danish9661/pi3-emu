@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Pi3Emulator, loadUnicorn } from '../packages/pi3-emu/src/index.js';
+import { PiSess } from './pi-sess.mjs';
 
 // MicroPython bare-metal port (ports/bcm2837): banner + REPL + variables +
 // frozen import, all headless. Needs ports/bcm2837/build/firmware.elf —
@@ -22,10 +22,9 @@ if (!existsSync(FW)) {
   process.exit(0);
 }
 
-const ucMod = await loadUnicorn();
-const emu = new Pi3Emulator(ucMod);
+const emu = new PiSess();
 await emu.loadFirmware(readFileSync(FW));
-for (let i = 0; i < 3000 && !emu.consoleText.includes('>>>'); i++) emu.runSlice(4096);
+for (let i = 0; i < 3000 && !emu.consoleText.includes('>>>'); i++) await emu.runSlice(4096);
 check('banner + REPL prompt', /MicroPython.*pi3-emu with bcm2837/.test(emu.consoleText));
 
 // Drip-feed: the PL011 RX FIFO holds 16 bytes; pasting long lines at once
@@ -34,11 +33,11 @@ async function cmd(s, budget = 6000) {
   const before = emu.consoleText.length;
   for (const ch of s) {
     emu.pushKey(ch.charCodeAt(0));
-    for (let k = 0; k < 8; k++) emu.runSlice(512);
+    for (let k = 0; k < 8; k++) await emu.runSlice(512);
   }
   emu.pushKey(13);
   for (let i = 0; i < budget && (emu.consoleText.slice(before).match(/>>>/g) || []).length < 1; i++) {
-    emu.runSlice(4096);
+    await emu.runSlice(4096);
   }
   return emu.consoleText.slice(before);
 }
@@ -55,4 +54,5 @@ check('frozen exec', hello.includes('hello from frozen pi3-emu'), hello.slice(0,
 check('no faults', !emu.lastFault, emu.lastFault ? emu.lastFault.message : '');
 
 if (fail.length) { console.log('UPYTHON FAIL:', fail.join(', ')); process.exit(1); }
+emu.close();
 console.log('upython-repl: PASS');

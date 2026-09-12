@@ -27,6 +27,16 @@ const keyat = Number(process.argv[10] || '0');
 // native eret); default 0 is host-assisted IRQ_RET delivery.
 const realIrq = Number(process.argv[11] || '0') !== 0;
 let keyDone = false;
+// PI3_KEYS="insn:byte,...": multi-key schedule for firmware REPL sessions
+// (mirrors run.rs; edge-triggered pushes at insn counts on BOTH sides).
+const keys = [];
+if (process.env.PI3_KEYS) {
+  for (const part of process.env.PI3_KEYS.split(',')) {
+    const [a, b] = part.split(':');
+    if (a !== undefined && b !== undefined && a !== '' && b !== '') keys.push([Number(a), Number(b)]);
+  }
+  keys.sort((x, y) => x[0] - y[0]);
+}
 
 const ucMod = await (async () => {
   // lirq needs the stock single-arch core (public/unicorn.js): the vendored
@@ -44,6 +54,25 @@ const emu = new Pi3Emulator(ucMod, {
   ...(realIrq ? { realIrq: true } : {}),
 });
 await emu.loadFirmware(readFileSync(join(__dirname, '..', 'public', 'programs', `${prog}.elf`)));
+// Firmware parity: pi-cpu's Bus always has its card attached
+// (SD_PRESENT hardwired 1), so the unicorn side must attach too —
+if (prog === 'firmware') emu.attachSdhci();
+// Same for the bare-metal sd guest (FAT12 reads need the card).
+if (prog === 'sd') emu.attachSdhci();
+// Same for the mini-UART window (uart1 guest).
+if (prog === 'uart1') emu.attachUart1();
+// Same for the I2C/SPI slave windows.
+if (prog === 'i2c') emu.attachI2c();
+if (prog === 'spi') emu.attachSpi();
+// DMA window not attached by default on the facade side.
+if (prog === 'dma') emu.attachDma();
+// PWM window neither.
+if (prog === 'pwm') emu.attachPwm();
+// NOTE (mmu): deliberately NOT attached — the facade cannot complete
+// this guest without probe-style fault-retry (same-slice enable+use
+// race; nested mem_map inside a write hook traps the fork), while
+// pi-cpu completes it natively via the MMU_CTL compat regime. Verify
+// with test/mmu-parity.mjs (compares both completions) instead.
 const t0 = Date.now();
 let steps = 0;
 while (emu.stats.insns < budget && !emu.lastError) {
@@ -54,6 +83,7 @@ while (emu.stats.insns < budget && !emu.lastError) {
     emu.pushKey(keybyte);
     keyDone = true;
   }
+  while (keys.length && emu.stats.insns >= keys[0][0]) emu.pushKey(keys.shift()[1]);
   emu.runSlice(Math.min(slice, budget - emu.stats.insns));
   steps++;
   if (steps > budget) break;

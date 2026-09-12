@@ -9,7 +9,10 @@
 // lib semantics (the lib is proven by single-step probes + watch traces
 // + full shell agreement). If x28 ever mismatches again, rebuild from
 // `rm -rf target` before theorizing.
-use pi_cpu::{load_elf, Bus, Cpu};
+//
+// The chunk loop lives in pi_cpu::runner (shared verbatim with the wasm
+// browser core) so native and browser behavior match by construction.
+use pi_cpu::{load_elf, runner::Runner, runner::SmpRunner, Bus, Cpu};
 use std::time::Instant;
 
 fn esc(s: &[u8]) -> String {
@@ -44,7 +47,6 @@ fn main() {
     // (uart0's "type a key" phase).
     let keybyte: u64 = args.get(8).and_then(|s| s.parse().ok()).unwrap_or(0);
     let keyat: u64 = args.get(9).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let mut key_done = false;
     // Optional multi-key schedule PI3_KEYS="insn:byte,insn:byte,..."
     // (firmware REPL sessions): edge-triggered pushes, like keybyte.
     let mut keys: Vec<(u64, u8)> = Vec::new();
@@ -57,127 +59,86 @@ fn main() {
                 }
             }
         }
-        keys.sort();
+        // Stable by time only: tuple sort would reorder same-count keys
+        // by byte value (briefly shipped that way: \r,+,1,1).
+        keys.sort_by_key(|k| k.0);
     }
-    const BTN: u32 = 1 << 29;
     let bytes = std::fs::read(path).expect("read elf");
+    // SMP quad mode (PI3_SMP=1): 4 partitioned cores + shared mailbox,
+    // round-robin slices (see SmpRunner). No IRQs in this guest (polling
+    // only; DAIF stays masked), so the plain chunk loop suffices.
+    if std::env::var("PI3_SMP").is_ok() {
+        let t0 = Instant::now();
+        let mut smp = SmpRunner::new(&bytes).expect("load elf");
+        smp.run(slice, 2000, budget);
+        let us = t0.elapsed().as_micros();
+        println!("console\t{}", esc(&smp.console));
+        println!(
+            "smp\t{} {} {} {} {} {} {} {}",
+            smp.shared.park,
+            smp.shared.counter,
+            smp.shared.msg[0],
+            smp.shared.msg[1],
+            smp.shared.msg[2],
+            smp.shared.msg[3],
+            smp.fault_string().unwrap_or_else(|| "null".to_string()),
+            us
+        );
+        return;
+    }
     let mut bus = Bus::new();
     bus.vt_ips = vt_ips;
     let entry = load_elf(&mut bus, &bytes).expect("load elf");
     let mut cpu = Cpu::new(entry);
+    let mut runner = Runner::new();
+    runner.budget = budget;
+    runner.slice = slice;
+    runner.press1 = press1;
+    runner.release1 = release1;
+    runner.press2 = press2;
+    runner.keybyte = keybyte;
+    runner.keyat = keyat;
+    runner.keys = keys;
     let t0 = Instant::now();
-    // Chunk loop mirroring the facade runSlice order (syncOut -> execute
-    // -> syncIn -> IRQ_RET resume -> delivery), so host-assisted VBAR+0x280
-    // entries land at the same guest points given the same chunk size.
-    let mut n = 0u64;
-    let mut fault = None;
-    let mut saved_pc: Option<u64> = None;
-    let mut saved_daif: u8 = 0;
-    // Post-chunk decision state, mirroring the facade's post-slice
-    // syncIrqRet (irqResume) + irqDeliver (irqVector), both consumed at
-    // the next chunk start (facade runSlice start: irqResume || irqVector,
-    // resume wins).
-    let mut resume_armed = false;
-    let mut vector_pending: Option<u64> = None;
-    while n < budget {
-        if press1 != 0 && n >= press1 {
-            bus.gpio_in |= BTN;
-        }
-        if release1 != 0 && n >= release1 {
-            bus.gpio_in &= !BTN;
-        }
-        if press2 != 0 && n >= press2 {
-            bus.gpio_in |= BTN;
-        }
-        if keybyte != 0 && keyat != 0 && !key_done && n >= keyat {
-            bus.uart0_push((keybyte & 0xff) as u8);
-            key_done = true;
-        }
-        while !keys.is_empty() && n >= keys[0].0 {
-            bus.uart0_push(keys.remove(0).1);
-        }
-        bus.sync_out();
-        // Actuation (facade runSlice start: irqResume || irqVector, both
-        // cleared unconditionally once consumed-or-not).
-        let do_resume = resume_armed;
-        let vec = vector_pending.take();
-        resume_armed = false;
-        if do_resume {
-            if let Some(sp) = saved_pc {
-                cpu.pc = sp;
-            }
-            // Host-assisted resume restores pre-entry DAIF (facade-
-            // equivalent: the host never masked it).
-            cpu.daif = saved_daif;
-            saved_pc = None;
-        } else if let Some(v) = vec {
-            cpu.pc = v;
-        }
-        let m = core::cmp::min(slice, budget - n);
-        let mut done = 0u64;
-        while done < m {
-            if let Err(f) = cpu.step(&mut bus) {
-                fault = Some(f);
-                break;
-            }
-            done += 1;
-        }
-        n += done;
-        bus.sync_in(done);
-        if fault.is_some() {
-            break;
-        }
-        if bus.irq_ret_pending {
-            bus.irq_ret_pending = false;
-            // Resume actuates next pre-chunk. saved_pc/saved_daif already
-            // hold the entry snapshot.
-            resume_armed = true;
-        }
-        // Fresh decision at the CURRENT (end-of-chunk) pc — the facade's
-        // irqElr. Delivery sources mirror the hardware/facade split: the
-        // legacy GPU line (host line) plus the arch-timer gt condition
-        // (owned by the core internally on the facade). cntp is disabled
-        // for the legacy-IC guests, so they only see the GPU line. No
-        // in-flight flag: entry masks DAIF, which blocks re-entry while
-        // a handler runs (completion unmasks via magic or eret).
-        if vector_pending.is_none()
-            && !cpu.irq_masked()
-            && (bus.legacy_line() || bus.cntp_line())
-        {
-            // Real exception entry snapshot at the CURRENT end-of-chunk
-            // pc/PSTATE (= facade post-slice irqElr timing, which the
-            // host-assisted resume path needs exactly). KNOWN RESIDUAL
-            // for native-entry guests: the fork enters at chained-TB
-            // granularity (a few insns into the slice), so ELR can lag
-            // the architectural entry pc by a TB sliver (8B observed on
-            // lirq phase B: x1 only; console/regs/pc/insns all match).
-            // Reproducing chained-TB entry is out of scope (depends on
-            // translator cache state, not the architecture).
-            // DAIF masked, vector at VBAR+0x280. The IRQ_RET magic path
-            // resumes host-assisted guests to saved_pc; eret resumes the
-            // rest natively at ELR.
-            cpu.elr_el1 = cpu.pc;
-            cpu.spsr_el1 = cpu.pstate();
-            saved_daif = cpu.daif;
-            cpu.daif = 0xf;
-            saved_pc = Some(cpu.pc);
-            let vbar = if cpu.vbar_el1 == 0 { 0x100000 } else { cpu.vbar_el1 };
-            vector_pending = Some(vbar + 0x280);
-        }
-    }
+    runner.run_to(&mut cpu, &mut bus, budget);
     let us = t0.elapsed().as_micros();
     println!("console\t{}", esc(&bus.console));
     let regs: Vec<String> = cpu.x.iter().map(|r| r.to_string()).collect();
     println!("regs\t{}", regs.join(" "));
+    // Framebuffer età (only when the guest allocated one via mailbox):
+    // FNV-1a over the pixels + corner/center samples, so the smoke test
+    // can pin the drawn pattern without dumping 76 KB (deterministic
+    // under virtual time + fixed budget).
+    let (fw, fh, fp, fready) = bus.fb_geometry();
+    if fready {
+        let frame = bus.mem_read_bytes(0x200000, (fw as usize) * (fh as usize) * 4);
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in &frame {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        let px = |x: usize, y: usize| -> u32 {
+            let o = (y * fp as usize + x * 4).min(frame.len().saturating_sub(4));
+            u32::from_le_bytes(frame[o..o + 4].try_into().unwrap())
+        };
+        println!(
+            "fb\t{}x{} p{} hash{:016x} c0={:08x} c1={:08x} c2={:08x} cc={:08x}",
+            fw,
+            fh,
+            fp,
+            h,
+            px(0, 0),
+            px(fw as usize - 1, fh as usize - 1),
+            px(2, 2),
+            px(fw as usize / 2, fh as usize / 2)
+        );
+    }
     println!(
         "meta\t{} {} {} {} {}",
         cpu.sp,
         cpu.pc,
-        n,
-        match fault {
-            None => "null".to_string(),
-            Some(f) => format!("{:?}", f),
-        },
+        runner.n,
+        runner.fault_string().unwrap_or_else(|| "null".to_string()),
         us
     );
 }

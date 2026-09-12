@@ -7,10 +7,9 @@
     "dev": "vite",
     "build": "bash build.sh && vite build",
     "preview": "vite preview",
-    "smoke": "node test/smoke.mjs"
+    "smoke": "node test/pi-cpu-smoke.mjs"
   },
   "dependencies": {
-    "@alexaltea/unicorn-js": "^2.1.4",
     "puppeteer-core": "^25.8.0"
   },
   "devDependencies": {

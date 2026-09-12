@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Pi3Emulator, loadUnicorn } from '../packages/pi3-emu/src/index.js';
+import { PiSess } from './pi-sess.mjs';
 
 // machine.Pin on real emulated registers: FSEL latches, GPSET/GPCLR drive
 // levels, GPLEV mirrors them, button input reads back. Needs
@@ -19,40 +19,39 @@ if (!existsSync(FW)) {
   process.exit(0);
 }
 
-const ucMod = await loadUnicorn();
-const emu = new Pi3Emulator(ucMod);
+const emu = new PiSess();
 await emu.loadFirmware(readFileSync(FW));
-for (let i = 0; i < 3000 && !emu.consoleText.includes('>>>'); i++) emu.runSlice(4096);
-const R = (a) => emu.readU32(a);
+for (let i = 0; i < 3000 && !emu.consoleText.includes('>>>'); i++) await emu.runSlice(4096);
+const R = async (a) => await emu.readU32(a);
 // Drip-feed: the PL011 RX FIFO holds 16 bytes.
 async function cmd(s, budget = 4000) {
   const before = emu.consoleText.length;
   for (const ch of s) {
     emu.pushKey(ch.charCodeAt(0));
-    for (let k = 0; k < 8; k++) emu.runSlice(512);
+    for (let k = 0; k < 8; k++) await emu.runSlice(512);
   }
   emu.pushKey(13);
   for (let i = 0; i < budget && (emu.consoleText.slice(before).match(/>>>/g) || []).length < 1; i++) {
-    emu.runSlice(4096);
+    await emu.runSlice(4096);
   }
   return emu.consoleText.slice(before);
 }
 // GPLEV mirrors the output latch at slice boundaries: settle before assert.
-function settle() {
-  emu.runSlice(512);
-  emu.runSlice(512);
+async function settle() {
+  await emu.runSlice(512);
+  await emu.runSlice(512);
 }
 
 check('import machine', (await cmd('from machine import Pin')).includes('>>>'));
 await cmd('led = Pin(21, Pin.OUT)');
-check('FSEL output latched', ((R(0x3F200008) >>> 3) & 7) === 1);
+check('FSEL output latched', ((await R(0x3F200008) >>> 3) & 7) === 1);
 await cmd('led.on()');
-settle();
-check('LED on drives GPLEV21', ((R(0x3F200034) >>> 21) & 1) === 1);
+await settle();
+check('LED on drives GPLEV21', ((await R(0x3F200034) >>> 21) & 1) === 1);
 check('value() reads back True', (await cmd('led.value()')).includes('True'));
 await cmd('led.off()');
-settle();
-check('LED off clears GPLEV21', ((R(0x3F200034) >>> 21) & 1) === 0);
+await settle();
+check('LED off clears GPLEV21', ((await R(0x3F200034) >>> 21) & 1) === 0);
 check('value() reads back False', (await cmd('led.value()')).includes('False'));
 emu.setButton(true);
 check('button press reads True', (await cmd('Pin(29, Pin.IN).value()')).includes('True'));
@@ -61,4 +60,5 @@ check('button release reads False', (await cmd('Pin(29, Pin.IN).value()')).inclu
 check('no faults', !emu.lastFault, emu.lastFault ? emu.lastFault.message : '');
 
 if (fail.length) { console.log('UPYTHON-MACHINE FAIL:', fail.join(', ')); process.exit(1); }
+emu.close();
 console.log('upython-machine: PASS');

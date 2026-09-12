@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Pi3Emulator, loadUnicorn } from '../packages/pi3-emu/src/index.js';
+import { PiSess } from './pi-sess.mjs';
 
 // time/utime (system-timer HAL) + machine.Timer PERIODIC/ONE_SHOT via the
 // C0..C3 matches. Needs ports/bcm2837/build/firmware.elf (see
@@ -21,19 +21,18 @@ if (!existsSync(FW)) {
   process.exit(0);
 }
 
-const ucMod = await loadUnicorn();
-const emu = new Pi3Emulator(ucMod, { realIrq: true });
+const emu = new PiSess();
 await emu.loadFirmware(readFileSync(FW));
-for (let i = 0; i < 9000 && !emu.consoleText.includes('>>>'); i++) emu.runSlice(4096);
+for (let i = 0; i < 9000 && !emu.consoleText.includes('>>>'); i++) await emu.runSlice(4096);
 async function cmd(s, budget = 40000, wait = '>>>') {
   const before = emu.consoleText.length;
   for (const ch of s) {
     emu.pushKey(ch.charCodeAt(0));
-    for (let k = 0; k < 8; k++) emu.runSlice(512);
+    for (let k = 0; k < 8; k++) await emu.runSlice(512);
   }
   emu.pushKey(13);
   for (let i = 0; i < budget && !emu.consoleText.slice(before).includes(wait); i++) {
-    emu.runSlice(4096);
+    await emu.runSlice(4096);
   }
   return emu.consoleText.slice(before);
 }
@@ -54,7 +53,11 @@ check('periodic timer',
   (await cmd('    n[0] += 1', 40000, '...')).includes('...') &&
   (await cmd('')).includes('>>>') &&
   (await cmd('t = Timer(1, mode=Timer.PERIODIC, period=200, callback=cb)')).includes('>>>'));
-for (let i = 0; i < 900; i++) emu.runSlice(4096);
+// Slice budgets assume sess virtual time (10M ips: 4096 insns = 0.41
+// virtual ms): 3000 slices ~= 1.2 virtual s ~= 6 fires of a 200 ms
+// period — robust against arming-phase jitter (900 slices ~= 0.37 s was
+// marginal at ~1.85 periods and flaked).
+for (let i = 0; i < 3000; i++) await emu.runSlice(4096);
 check('periodic fired repeatedly', (await cmd('n[0] >= 2')).includes('True'), await cmd('n[0]'));
 check('one-shot fires once',
   (await cmd('m = [0]')).includes('>>>') &&
@@ -62,12 +65,12 @@ check('one-shot fires once',
   (await cmd('    m[0] += 1', 40000, '...')).includes('...') &&
   (await cmd('')).includes('>>>') &&
   (await cmd('s = Timer(2, mode=Timer.ONE_SHOT, period=200, callback=cb1)')).includes('>>>'));
-for (let i = 0; i < 900; i++) emu.runSlice(4096);
+for (let i = 0; i < 3000; i++) await emu.runSlice(4096);
 check('one-shot count', (await cmd('m[0]')).includes('\r\n1\r\n'));
 check('deinit stops',
   (await cmd('t.deinit()')).includes('>>>') &&
   (await cmd('k = n[0]')).includes('>>>'));
-for (let i = 0; i < 600; i++) emu.runSlice(4096);
+for (let i = 0; i < 600; i++) await emu.runSlice(4096);
 check('stopped stays', (await cmd('n[0] == k')).includes('True'));
 check('bad args raise',
   (await cmd('Timer(9)')).includes('ValueError') &&
@@ -75,4 +78,5 @@ check('bad args raise',
 check('no faults', !emu.lastFault, emu.lastFault ? emu.lastFault.message : '');
 
 if (fail.length) { console.log('UPYTHON-TIMER FAIL:', fail.join(', ')); process.exit(1); }
+emu.close();
 console.log('upython-timer: PASS');

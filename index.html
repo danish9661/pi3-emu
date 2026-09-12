@@ -4,12 +4,12 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="icon" href="data:," />
-    <title>RPi 3 emulator spike — unicorn.js + Rust board</title>
+    <title>RPi 3 emulator — pi-cpu core + Rust board</title>
   </head>
   <body>
     <main>
       <h1>RPi 3 (BCM2837) emulator spike</h1>
-      <p class="sub">CPU: unicorn.js (QEMU TCG, AArch64 core) · Board: Rust → wasm · UART @ 0x3F201000 — type HI, RPI or HELP</p>
+      <p class="sub">CPU: pi-cpu (own AArch64 core, Rust → wasm) · Board: Rust → wasm · UART @ 0x3F201000 — type HI, RPI or HELP</p>
       <pre id="term" tabindex="0"></pre>
       <div id="gpiopanel" class="gpiopanel" hidden>
         <div class="gpio-tag">GPIO 21..28</div>
@@ -84,7 +84,8 @@
     <!-- Reusable SharedArrayBuffer on/off (any project can drop this in:
          SabToggle.detect/resolve/bindSelect — see public/sab-toggle.js) -->
     <script src="./sab-toggle.js"></script>
-    <script src="./unicorn.js"></script>
+    <!-- pi-cpu is loaded at runtime from ./pi_cpu/pi_cpu.js (built by
+         build.sh via wasm-pack); no core <script> tag needed here. -->
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>

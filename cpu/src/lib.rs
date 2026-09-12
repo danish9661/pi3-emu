@@ -8,11 +8,23 @@
 //
 // Endianness: little-endian throughout.
 
+pub mod runner;
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;
+
 pub const RAM_SIZE: u64 = 0x400000;
 pub const UART0: u64 = 0x3f201000;
 pub const TMR_BASE: u64 = 0x3f003000;
 pub const GPIO_BASE: u64 = 0x3f200000;
 pub const UART1_BASE: u64 = 0x3f215000; // mini UART (TX tap only)
+pub const I2C_BASE: u64 = 0x3f804000; // BSC master + host sensor slave
+pub const SPI_BASE: u64 = 0x3f204000; // SPI0 master + host flash slave
+pub const MBOX_BASE: u64 = 0x3f00b880; // VideoCore mailbox + framebuffer
+pub const MMU_CTL: u64 = 0x3f00d000; // host-assisted MMU window (compat)
+pub const DMA_BASE: u64 = 0x3f007000; // DMA ch0 + ENABLE extension
+pub const DMA_ENABLE_PAGE: u64 = 0x3f00e000; // ENABLE lives here (facade maps the page)
+pub const PWM_BASE: u64 = 0x3f20c000; // PWM FIFO-mode + audio samples
+pub const SMP_BASE: u64 = 0x3f202000; // SMP spin-table mailbox (host-arbitrated)
 pub const SD_BASE: u64 = 0x3f300000;
 pub const IC_BASE: u64 = 0x3f00b200;
 /// Magic cell for host-assisted IRQ resume (mirrors the facade's
@@ -72,6 +84,10 @@ pub struct Bus {
     gpio_prev_in: u32,
     gpio_out: u32,
     gpio_eds: u32,
+    /// GPFSEL0-5 backing (real BCM2837: function-select is R/W; the
+    /// old facade echoed it via window RAM, so guests/tests read back
+    /// what they wrote).
+    gpio_fsel: [u32; 6],
     // EV-reg cells indexed (off-0x4C)/4 over 0x4C..=0x8C (reserved gaps
     // included as harmless cells, like window memory); pair p bank b
     // lives at [0,3,6,9,12,15][p]+b (REN/FEN/HEN/LEN/AREN/AFEN).
@@ -97,7 +113,7 @@ pub struct Bus {
     // (translation runs inside bus.read/write/fetch, which need them
     // there). Permissions/AF/MAIR are NOT modeled — everything the
     // guests map is full-access Normal-equivalent RAM/MMIO.
-    mmu_sctlr: u64,
+    pub mmu_sctlr: u64,
     mmu_tcr: u64,
     mmu_ttbr0: u64,
     mmu_mair: u64,
@@ -120,6 +136,98 @@ pub struct Bus {
     sd_stage: [u8; 512],
     sd_irpt: u32,
     sd_disk: Vec<[u8; 512]>,
+    /// DONE host-extension latch (guest writes SD+0x54, like TMR_DONE):
+    /// the write is absorbed (no readable cell), so the flag carries it.
+    sd_done: bool,
+    // AUX mini UART (0x3F215000 — mirrors uart1.js): window backing
+    // (the facade's window IS RAM: guest writes persist, the host
+    // overwrites ENABLES/LSR/IO every slice), enable latch, TX pulse
+    // cell, and the "[u1] " line-tag state.
+    uart1_back: [u32; 64],
+    uart1_enabled: bool,
+    uart1_line_start: bool,
+    // I2C window backing (DLEN/A/FIFO/DONE cells; C/S are computed).
+    // I2C window backing (DLEN/A/FIFO/DONE cells; C/S are computed).
+    i2c_back: [u32; 32],
+    i2c_pub_c: u32,
+    i2c_pub_s: u32,
+    spi_pub_cs: u32,
+    // I2C/BSC (0x3F804000 — mirrors i2c.js): ST rising edge (detected
+    // synchronously on C writes, equivalent to the facade's slice
+    // diff), slave register + 0x68 sensor, 4-byte FIFO backing.
+    i2c_c: u32,
+    i2c_sdone: bool,
+    i2c_dlen: u32,
+    i2c_addr: u32,
+    i2c_counter: u32,
+    i2c_reg: u32,
+    i2c_resp: [u8; 4],
+    i2c_fifo: [u8; 4],
+    // SPI0 (0x3F204000 — mirrors spi.js): TX/RX queues with the JEDEC
+    // flash slave, TA edge handling on CS writes, 4-byte FIFO backing.
+    spi_tx: Vec<u8>,
+    spi_rx: Vec<u8>,
+    spi_cmd: u8,
+    spi_ta: bool,
+    spi_sdone: bool,
+    spi_fifo: [u8; 4],
+    // Last guest CS write since publish (the facade window is RAM: a
+    // same-slice write-then-read observes the written value, e.g. the
+    // TA write followed by the DONE poll; cleared on publish).
+    spi_cs_dirty: Option<u32>,
+    /// DONE host-extension latch (guest writes SPI+0x54, like TMR_DONE):
+    /// absorbed like other unlisted cells, so the flag carries it.
+    spi_done: bool,
+    // VideoCore mailbox (0x3F00B880 — mirrors main.js mboxProcess +
+    // fbTag): single-shot property requests (the fb guest sends all six
+    // tags in one buffer) with the reply published at sync_out. Frame-
+    // buffer geometry exposed for the browser canvas blit.
+    mbx_pending: bool,
+    mbx_addr: u32,
+    mbx_last_write: u32,
+    mbx_pub_read: u32,
+    mbx_pub_status: u32,
+    fb_w: u32,
+    fb_h: u32,
+    fb_depth: u32,
+    fb_pitch: u32,
+    fb_ready: bool,
+    // DMA ch0 (0x3F007000 + ENABLE page — mirrors main.js syncDmaOut/In
+    // + dma.js): full window backing (the facade windows ARE RAM:
+    // guest writes persist and read back until sync overwrites); END/INT
+    // latch on chain completion at sync_in; CS reads serve backing (the
+    // publish overwrites it every sync_out, so ACTIVE never echoes back
+    // past a boundary — same as the facade).
+    dma_back: [u32; 256],
+    dma_en_back: [u32; 256],
+    dma_end: bool,
+    dma_int: bool,
+    dma_last_cs: u32,
+    // MMU_CTL compat window (0x3F00D000 — mirrors the host-assisted
+    // model for the mmu guest): writing root|1 programs the REAL
+    // stage-1 regime (TTBR0=root, T0SZ=16 48-bit 4K, MAIR, SCTLR.M)
+    // so the guest's tables translate natively; reads echo the cell
+    // (the guest polls bit0, set by its own write).
+    mmu_ctl_cell: u32,
+    mmu_done_cell: u32,
+    /// Facade-dialect tables (MMU_CTL regime): 0b01 descends like a
+    /// table at L0/L1/L2 (the mmu guest links tables with 0b01, which
+    /// strict ARM reads as L1/L2 blocks). Native TTBR0 regimes (mva)
+    /// keep strict decoding. Set by MMU_CTL-enable.
+    mmu_loose: bool,
+    // SMP spin-table mailbox (0x3F202000 — host-arbitrated window like
+    // main.js smpState): plain backing; the SmpShared arbiter mirrors
+    // it per core per chunk (see runner.rs).
+    smp_mem: [u8; 0x1000],
+    // PWM (0x3F20C000 — mirrors pwm.js FIFO mode): CTL latch + FIFO
+    // queue drained 64/chunk into a sample ring (browser audio reads
+    // it via pwm_take). STA/FULL/EMPT published at sync_out.
+    pwm_back: [u32; 32],
+    pwm_ctl: u32,
+    pwm_last_ctl: u32,
+    pwm_fifo: Vec<u32>,
+    pwm_ring: Vec<u32>,
+    pwm_drained: u64,
 }
 
 impl Bus {
@@ -139,6 +247,7 @@ impl Bus {
             gpio_prev_in: 0,
             gpio_out: 0,
             gpio_eds: 0,
+            gpio_fsel: [0; 6],
             gpio_en: [0; 17],
             ic_en1: 0,
             ic_en2: 0,
@@ -163,10 +272,59 @@ impl Bus {
             sd_stage: [0; 512],
             sd_irpt: 0,
             sd_disk: Bus::make_disk(),
+            sd_done: false,
+            uart1_back: [0; 64],
+            uart1_enabled: false,
+            uart1_line_start: true,
+            i2c_back: [0; 32],
+            i2c_pub_c: 0,
+            i2c_pub_s: 0,
+            spi_pub_cs: 0,
+            i2c_c: 0,
+            i2c_sdone: false,
+            i2c_dlen: 0,
+            i2c_addr: 0,
+            i2c_counter: 0,
+            i2c_reg: 0,
+            i2c_resp: [0; 4],
+            i2c_fifo: [0; 4],
+            spi_tx: Vec::new(),
+            spi_rx: Vec::new(),
+            spi_cmd: 0,
+            spi_ta: false,
+            spi_sdone: false,
+            spi_fifo: [0; 4],
+            spi_cs_dirty: None,
+            spi_done: false,
+            mbx_pending: false,
+            mbx_addr: 0,
+            mbx_last_write: 0,
+            mbx_pub_read: 0,
+            mbx_pub_status: 0x80000000,
+            fb_w: 0,
+            fb_h: 0,
+            fb_depth: 0,
+            fb_pitch: 0,
+            fb_ready: false,
+            dma_back: [0; 256],
+            dma_en_back: [0; 256],
+            dma_end: false,
+            dma_int: false,
+            dma_last_cs: 0,
+            mmu_ctl_cell: 0,
+            mmu_done_cell: 0,
+            mmu_loose: false,
+            smp_mem: [0; 0x1000],
+            pwm_back: [0; 32],
+            pwm_ctl: 0,
+            pwm_last_ctl: 0,
+            pwm_fifo: Vec::new(),
+            pwm_ring: Vec::new(),
+            pwm_drained: 0,
         }
     }
 
-    fn is_ram(addr: u64, size: u64) -> bool {
+    pub fn is_ram(addr: u64, size: u64) -> bool {
         addr.checked_add(size).map_or(false, |e| e <= RAM_SIZE)
     }
 
@@ -212,6 +370,56 @@ impl Bus {
 
     fn is_miniuart(addr: u64, size: u64) -> bool {
         Self::is_page(addr, size, UART1_BASE)
+    }
+
+    fn is_i2c(addr: u64, size: u64) -> bool {
+        Self::is_page(addr, size, I2C_BASE)
+    }
+
+    fn is_spi(addr: u64, size: u64) -> bool {
+        Self::is_page(addr, size, SPI_BASE)
+    }
+
+    fn is_pwm(addr: u64, size: u64) -> bool {
+        Self::is_page(addr, size, PWM_BASE)
+    }
+
+    fn is_mmuctl(addr: u64, size: u64) -> bool {
+        Self::is_page(addr, size, MMU_CTL)
+    }
+
+    fn is_smp(addr: u64, size: u64) -> bool {
+        Self::is_page(addr, size, SMP_BASE)
+    }
+
+    /// Mapped device windows (any access size starting inside one). The
+    /// host-assisted guests (mmu) leave MMIO unmapped in their tables
+    /// and rely on the host bypass (like the facade, whose windows stay
+    /// accessible with translation on) — so translation identity-maps
+    /// these instead of walking. Unmapped NON-device VAs still fault
+    /// (the debug guest depends on it).
+    fn is_device_win(addr: u64) -> bool {
+        Self::is_uart(addr, 1)
+            || Self::is_timer(addr, 1)
+            || Self::is_gpio(addr, 1)
+            || Self::is_ic(addr, 1)
+            || Self::is_page(addr, 1, MBOX_PAGE)
+            || Self::is_page(addr, 1, LOCAL_BASE)
+            || Self::is_sd(addr, 1)
+            || Self::is_miniuart(addr, 1)
+            || Self::is_i2c(addr, 1)
+            || Self::is_spi(addr, 1)
+            || Self::is_pwm(addr, 1)
+            || Self::is_dma(addr, 1)
+            || Self::is_mmuctl(addr, 1)
+    }
+
+    /// DMA ch0 window cell: CS/CONBLK_AD in the channel window, ENABLE
+    /// page (the facade maps the whole 4K page at real layout).
+    fn is_dma(addr: u64, size: u64) -> bool {
+        (addr >= DMA_BASE && addr.checked_add(size).map_or(false, |e| e <= DMA_BASE + 0x1000))
+            || (addr >= DMA_ENABLE_PAGE
+                && addr.checked_add(size).map_or(false, |e| e <= DMA_ENABLE_PAGE + 0x1000))
     }
 
     /// Facade makeDisk() port (packages/pi3-emu/src/sdhci.js): 5-sector
@@ -312,10 +520,15 @@ impl Bus {
     }
 
     /// Stage-1 VA→PA translation (4K granule, TTBR0 only). Identity while
-    /// SCTLR.M is clear. Faults on out-of-range VA, non-4K granule, bad
-    /// descriptors, or tables outside RAM.
+    /// SCTLR.M is clear. Mapped device windows bypass the walk (host
+    /// extension for host-assisted guests — see is_device_win). Faults
+    /// on out-of-range VA, non-4K granule, bad descriptors, unmapped
+    /// non-device VAs, or tables outside RAM.
     fn translate(&self, va: u64) -> Result<u64, Fault> {
         if (self.mmu_sctlr & 1) == 0 {
+            return Ok(va);
+        }
+        if Self::is_device_win(va) {
             return Ok(va);
         }
         let t0sz = (self.mmu_tcr & 0x3f) as u32;
@@ -323,10 +536,12 @@ impl Bus {
             return Err(Fault::Translation(va)); // TG0 != 4K unsupported
         }
         let vabits = 64u32.saturating_sub(t0sz);
-        if !(12..=39).contains(&vabits) || (va >> vabits) != 0 {
+        if !(12..=48).contains(&vabits) || (va >> vabits) != 0 {
             return Err(Fault::Translation(va));
         }
-        let mut level = if vabits > 30 {
+        let mut level = if vabits > 39 {
+            0
+        } else if vabits > 30 {
             1
         } else if vabits > 21 {
             2
@@ -346,20 +561,52 @@ impl Bus {
             for i in 0..8 {
                 d |= (self.mem[a + i] as u64) << (8 * i);
             }
+            // Descriptor dialects: strict ARM (native TTBR0 regimes like
+            // mva: 0b01 = block at L1/L2, 0b11 = table at L0/L1/L2 and
+            // page at L3) vs facade-loose (MMU_CTL regime like the mmu
+            // guest: 0b01 = table-descend at L0/L1/L2, 0b10/0b11 = block
+            // or page). mmu_loose selects (set by MMU_CTL-enable only;
+            // mva never touches MMU_CTL).
             match d & 3 {
-                0b01 if level < 3 => {
-                    // Block (1G at L1, 2M at L2).
+                0b00 => return Err(Fault::Translation(va)),
+                0b01 if level == 3 => return Err(Fault::Translation(va)),
+                0b01 if level == 0 && !self.mmu_loose => {
+                    // Strict ARM: no blocks at L0.
+                    return Err(Fault::Translation(va));
+                }
+                0b01 if level == 0 || self.mmu_loose => {
+                    // Table descend (loose dialect; L0 has no blocks).
+                    base = d & 0x0000_ffff_ffff_f000;
+                    level += 1;
+                }
+                0b01 => {
+                    // Block (1G at L1, 2M at L2) — strict ARM.
+                    let block = 1u64 << shift;
+                    return Ok((d & !(block - 1)) | (va & (block - 1)));
+                }
+                0b11 if level == 3 => {
+                    // 4K page (both dialects agree).
+                    return Ok((d & !0xfff) | (va & 0xfff));
+                }
+                0b11 if self.mmu_loose => {
+                    // Block (loose dialect).
                     let block = 1u64 << shift;
                     return Ok((d & !(block - 1)) | (va & (block - 1)));
                 }
                 0b11 => {
-                    if level == 3 {
-                        return Ok((d & !0xfff) | (va & 0xfff));
-                    }
+                    // Table descend (strict ARM).
                     base = d & 0x0000_ffff_ffff_f000;
                     level += 1;
                 }
-                _ => return Err(Fault::Translation(va)),
+                // 0b10: reserved in strict ARM; block/page in loose.
+                _ if !self.mmu_loose => return Err(Fault::Translation(va)),
+                _ => {
+                    if level == 3 {
+                        return Ok((d & !0xfff) | (va & 0xfff));
+                    }
+                    let block = 1u64 << shift;
+                    return Ok((d & !(block - 1)) | (va & (block - 1)));
+                }
             }
         }
     }
@@ -384,15 +631,28 @@ impl Bus {
         (self.cntp_ctl & 1) != 0 && self.cntpct >= self.cntp_cval
     }
 
-    /// Legacy-IC gated line (bank-1 timer bits, bank-2 GPIO bit 17 +
-    /// UART bit 25; DMA/AUX/SDHCI unmodeled). Mirrors ic.js pending().
+    /// Legacy-IC gated line (bank-1 timer bits + DMA0, bank-2 GPIO
+    /// bit 17 + UART bit 25; AUX/SDHCI unmodeled). Mirrors ic.js
+    /// pending().
     pub fn legacy_line(&self) -> bool {
-        self.timer_pending1() | self.gpio_pending2() | self.uart_pending2() != 0
+        self.timer_pending1() | self.dma_pending1() | self.gpio_pending2() | self.uart_pending2() != 0
     }
 
     /// Gated bank-1 bits: timer C0-C3 matches (facade icLines timer field).
     fn timer_pending1(&self) -> u32 {
         (self.tmr_pending & 0xf) & self.ic_en1
+    }
+
+    /// Gated bank-1 DMA0 bit (facade icLines dma0: CS.INT latched while
+    /// the channel is enabled; enable read live from the window backing
+    /// — the decision runs post-chunk like the facade's line()).
+    fn dma_pending1(&self) -> u32 {
+        let enable = self.dma_en_back.get(0x50 / 4).copied().unwrap_or(0);
+        if self.dma_int && (enable & 1) != 0 {
+            (1 << 16) & self.ic_en1
+        } else {
+            0
+        }
     }
 
     /// Gated bank-2 bits (for PENDING2/BASIC reads).
@@ -424,6 +684,58 @@ impl Bus {
         }
     }
 
+    /// SPI FIFO backing as a little-endian word (staged response).
+    fn spi_fifo_le(&self) -> u64 {
+        (self.spi_fifo[0] as u64)
+            | ((self.spi_fifo[1] as u64) << 8)
+            | ((self.spi_fifo[2] as u64) << 16)
+            | ((self.spi_fifo[3] as u64) << 24)
+    }
+
+    /// Take up to `max` drained audio samples (low 16 bits, signed)
+    /// for the browser worklet. Mirrors the onBridgeData count path.
+    pub fn pwm_take(&mut self, max: usize) -> Vec<i16> {
+        let n = core::cmp::min(max, self.pwm_ring.len());
+        self.pwm_ring
+            .drain(..n)
+            .map(|w| (w & 0xffff) as u16 as i16)
+            .collect()
+    }
+
+    /// SMP window u32 access for the shared arbiter (runner.rs).
+    pub fn smp_read32(&self, off: u64) -> u32 {
+        let o = off as usize;
+        if o + 4 <= self.smp_mem.len() {
+            u32::from_le_bytes([self.smp_mem[o], self.smp_mem[o + 1], self.smp_mem[o + 2], self.smp_mem[o + 3]])
+        } else {
+            0
+        }
+    }
+
+    /// SMP window u32 access for the shared arbiter (runner.rs).
+    pub fn smp_write32(&mut self, off: u64, v: u32) {
+        let o = off as usize;
+        if o + 4 <= self.smp_mem.len() {
+            for (i, b) in v.to_le_bytes().iter().enumerate() {
+                self.smp_mem[o + i] = *b;
+            }
+        }
+    }
+
+    /// Host wall-clock advance (browser: performance.now() delta per
+    /// slice). Applies only in wall-clock mode (vt_ips == 0); virtual
+    /// mode advances per instruction instead. Drives CLO/CHI reads and
+    /// the arch-timer counter with the same float replica the facade
+    /// uses (cntpct = floor(us*19.2)).
+    pub fn wall_tick(&mut self, us: u64) {
+        if self.vt_ips != 0 {
+            return;
+        }
+        self.vt_us = self.vt_us.wrapping_add(us);
+        self.vt_us_f += us as f64;
+        self.cntpct = (self.vt_us_f * 19.2).floor() as u64;
+    }
+
     /// Host key input (mirrors uart0 push(): queued only while enabled,
     /// 16-deep FIFO).
     pub fn uart0_push(&mut self, b: u8) {
@@ -432,7 +744,409 @@ impl Bus {
         }
     }
 
+    /// Mini-UART TX tap with the facade's "[u1] " line tag (uart1Emit
+    /// rule: tag at line starts, NL bytes set line-start).
+    fn uart1_tx(&mut self, b: u8) {
+        let is_nl = b == 0x0a || b == 0x0d;
+        if self.uart1_line_start && !is_nl {
+            self.console.extend_from_slice(b"[u1] ");
+            self.uart1_line_start = false;
+        }
+        self.console.push(b);
+        if is_nl {
+            self.uart1_line_start = true;
+        }
+    }
+
+    /// Guest-RAM u32 load for the mailbox walker (out-of-range reads 0).
+    fn mem_u32(&self, addr: u64) -> u32 {
+        if Self::is_ram(addr, 4) {
+            let a = addr as usize;
+            u32::from_le_bytes([self.mem[a], self.mem[a + 1], self.mem[a + 2], self.mem[a + 3]])
+        } else {
+            0
+        }
+    }
+
+    /// Guest-RAM u32 store for the mailbox walker (out-of-range ignored).
+    fn mem_write_u32(&mut self, addr: u64, v: u32) {
+        if Self::is_ram(addr, 4) {
+            let a = addr as usize;
+            for (i, b) in v.to_le_bytes().iter().enumerate() {
+                self.mem[a + i] = *b;
+            }
+        }
+    }
+
+    /// Write a tag response (mirrors mboxProcess: status word + exactly
+    /// tsize value bytes, zero-padded past the payload).
+    fn mbox_tag_bytes(&mut self, addr: u64, off: usize, tsize: usize, out: &[u8]) {
+        self.mem_write_u32(addr + off as u64 + 8, 0x80000000);
+        for i in 0..tsize {
+            let a = addr + off as u64 + 12 + i as u64;
+            if Self::is_ram(a, 1) {
+                self.mem[a as usize] = *out.get(i).unwrap_or(&0);
+            }
+        }
+    }
+
+    /// Framebuffer tags (mirrors fbTag). Returns true when handled.
+    /// FB_ADDR carves the buffer out of guest RAM like the facade.
+    fn mbox_fb_tag(&mut self, addr: u64, off: usize, id: u32, tsize: usize) -> bool {
+        const FB_ADDR: u64 = 0x200000;
+        let v = addr + off as u64 + 12;
+        match id {
+            0x00048003 | 0x00048004 => {
+                self.fb_w = self.mem_u32(v);
+                self.fb_h = self.mem_u32(v + 4);
+                self.mem_write_u32(addr + off as u64 + 8, 0x80000000);
+                true
+            }
+            0x00048005 => {
+                self.fb_depth = self.mem_u32(v);
+                self.mem_write_u32(addr + off as u64 + 8, 0x80000000);
+                true
+            }
+            0x00048006 => {
+                self.mem_write_u32(addr + off as u64 + 8, 0x80000000);
+                true
+            }
+            0x00040001 => {
+                self.fb_pitch = self.fb_w.wrapping_mul(4);
+                self.mem_write_u32(addr + off as u64 + 8, 0x80000000);
+                self.mem_write_u32(v, FB_ADDR as u32);
+                self.mem_write_u32(v + 4, self.fb_pitch);
+                self.fb_ready = self.fb_w > 0 && self.fb_h > 0 && self.fb_depth == 32;
+                true
+            }
+            0x00040008 => {
+                self.mem_write_u32(addr + off as u64 + 8, 0x80000000);
+                self.mem_write_u32(v, self.fb_pitch);
+                let _ = tsize;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Mailbox request processing (mirrors main.js mboxProcess): walks
+    /// the tag list, writes responses into guest RAM, arms the reply.
+    /// Runs synchronously on a channel-8 MAIL1_WRITE; STATUS/READ
+    /// publish at sync_out.
+    fn mbox_process(&mut self, w: u32) {
+        if self.mbx_pending {
+            return;
+        }
+        let addr = (w & !0xf) as u64;
+        let size = core::cmp::min(self.mem_u32(addr) & 0xffff, 1024) as usize;
+        if size < 8 {
+            return;
+        }
+        let mut off = 8usize;
+        while off + 8 <= size {
+            let id = self.mem_u32(addr + off as u64);
+            if id == 0 {
+                break; // end-of-tags marker
+            }
+            let tsize = self.mem_u32(addr + off as u64 + 4) as usize;
+            if self.mbox_fb_tag(addr, off, id, tsize) {
+                // handled by the framebuffer path
+            } else {
+                match id {
+                    0x00010001 => self.mbox_tag_bytes(addr, off, tsize, &16968947u32.to_le_bytes()),
+                    0x00010002 => self.mbox_tag_bytes(addr, off, tsize, &0xa02082u32.to_le_bytes()),
+                    0x00010003 => {
+                        self.mbox_tag_bytes(addr, off, tsize, &0xdeadbeef00000000u64.to_le_bytes())
+                    }
+                    0x00010005 => {
+                        let mut out = [0u8; 8];
+                        out[4..8].copy_from_slice(&0x400000u32.to_le_bytes());
+                        self.mbox_tag_bytes(addr, off, tsize, &out);
+                    }
+                    0x00010009 => {
+                        self.mbox_tag_bytes(addr, off, tsize, &[0xb8, 0x27, 0xeb, 0xde, 0xad, 0xbe])
+                    }
+                    0x00030001 => {
+                        let mut out = [0u8; 8];
+                        out[0..4].copy_from_slice(&self.mem_u32(addr + off as u64 + 12).to_le_bytes());
+                        out[4..8].copy_from_slice(&1u32.to_le_bytes());
+                        self.mbox_tag_bytes(addr, off, tsize, &out);
+                    }
+                    0x00030002 => {
+                        self.mbox_tag_bytes(addr, off, tsize, &700000000u32.to_le_bytes())
+                    }
+                    _ => self.mem_write_u32(addr + off as u64 + 8, 0x80000001),
+                }
+            }
+            off += 12 + tsize + ((4 - (tsize % 4)) % 4);
+        }
+        self.mem_write_u32(addr + 4, 0x80000000);
+        self.mbx_pending = true;
+    }
+
+    /// Framebuffer geometry for the browser canvas blit.
+    pub fn fb_geometry(&self) -> (u32, u32, u32, bool) {
+        (self.fb_w, self.fb_h, self.fb_pitch, self.fb_ready)
+    }
+
+    /// Explicit-done park flag per guest (the browser's runUntil*Done
+    /// loops poll this instead of JS model state): 0 = clock/gpio
+    /// (TMR+0x20), 1 = mmu (MMU_CTL+0x04), 2 = dma (ENABLE+0x54),
+    /// 3 = pwm (+0x54), 4 = i2c (+0x54), 5 = spi (+0x54), 6 = sd (+0x54).
+    /// Window-backed cells read their backing; absorbed writes (spi/sd)
+    /// are carried by latches. Anything else reads 0.
+    pub fn done_flag(&self, sel: u32) -> u32 {
+        let b = match sel {
+            0 => self.tmr_done,
+            1 => self.mmu_done_cell != 0,
+            2 => self.dma_en_back.get(0x54 / 4).copied().unwrap_or(0) != 0,
+            3 => self.pwm_back.get(0x54 / 4).copied().unwrap_or(0) != 0,
+            4 => self.i2c_back.get(0x54 / 4).copied().unwrap_or(0) != 0,
+            5 => self.spi_done,
+            6 => self.sd_done,
+            _ => false,
+        };
+        b as u32
+    }
+
+    /// One DMA transfer (mirrors dma.js transfer() exactly, including
+    /// page-chunking and the IGNORE fills).
+    fn dma_transfer(&mut self, ti: u32, src: u64, dst: u64, len: u64) {
+        const PAGE: u64 = 4096;
+        let src_inc = ti & 1 != 0;
+        let dst_inc = ti & 2 != 0;
+        let src_ign = ti & (1 << 6) != 0;
+        let dst_ign = ti & (1 << 7) != 0;
+        let fill = if src_ign && Self::is_ram(src, 1) {
+            self.mem[src as usize]
+        } else {
+            0
+        };
+        let mut s = src;
+        let mut d = dst;
+        let mut rem = len;
+        while rem > 0 {
+            let mut chunk = rem;
+            let sp = PAGE - (s & (PAGE - 1));
+            if sp < chunk {
+                chunk = sp;
+            }
+            let dp = PAGE - (d & (PAGE - 1));
+            if dp < chunk {
+                chunk = dp;
+            }
+            let mut buf = vec![0u8; chunk as usize];
+            if src_ign {
+                for b in buf.iter_mut() {
+                    *b = fill;
+                }
+            } else {
+                for (i, b) in buf.iter_mut().enumerate() {
+                    let a = s + i as u64;
+                    *b = if Self::is_ram(a, 1) { self.mem[a as usize] } else { 0 };
+                }
+                if dst_ign && chunk > 0 {
+                    let last = buf[chunk as usize - 1];
+                    for b in buf.iter_mut() {
+                        *b = last;
+                    }
+                }
+            }
+            for (i, b) in buf.iter().enumerate() {
+                let a = d + i as u64;
+                if Self::is_ram(a, 1) {
+                    self.mem[a as usize] = *b;
+                }
+            }
+            if src_inc {
+                s += chunk;
+            }
+            if dst_inc {
+                d += chunk;
+            }
+            rem -= chunk;
+        }
+    }
+
+    /// DMA control-block chain (mirrors dma.js dmaRunChain): walks up
+    /// to 64 CBs in guest RAM. Returns true if the last CB had TI.INTEN.
+    fn dma_run_chain(&mut self, conblk: u64) -> bool {
+        let mut cb = conblk & !0x1f;
+        let mut inten = false;
+        for _ in 0..64 {
+            if cb == 0 || !Self::is_ram(cb, 32) {
+                break;
+            }
+            // Snapshot the CB first (the transfer below needs &mut).
+            let a = cb as usize;
+            let mut raw = [0u8; 32];
+            raw.copy_from_slice(&self.mem[a..a + 32]);
+            let rd = |o: usize| {
+                u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]])
+            };
+            let ti = rd(0);
+            let src = rd(4) as u64;
+            let dst = rd(8) as u64;
+            let len = (rd(12) & 0xfffff) as u64;
+            if len != 0 {
+                self.dma_transfer(ti, src, dst, len);
+            }
+            if ti & (1 << 31) != 0 {
+                inten = true;
+            }
+            cb = rd(20) as u64 & !0x1f;
+        }
+        inten
+    }
+
+    /// I2C sensor read (mirrors i2c.js slaveRead): WHO_AM_I 0x68,
+    /// TEMP 26/0, COUNTER++.
+    fn i2c_slave_read(&mut self, reg: u32) -> [u8; 4] {
+        let mut r = [0u8; 4];
+        match reg {
+            0x00 => r[0] = 0x68,
+            0x10 => {
+                r[0] = 26;
+            }
+            0x20 => {
+                self.i2c_counter = self.i2c_counter.wrapping_add(1);
+                r[0] = (self.i2c_counter & 0xff) as u8;
+            }
+            _ => {}
+        }
+        r
+    }
+
+    /// I2C transfer on C.ST rising edge (mirrors i2c.js syncIn).
+    fn i2c_start(&mut self) {
+        // DLEN/A latched (masked like the facade; dlen only bounds the
+        // write snapshot, the register value selects).
+        self.i2c_dlen = self.i2c_back[0x08 / 4] & 0xffff;
+        self.i2c_addr = self.i2c_back[0x0c / 4] & 0x7f;
+        if self.i2c_c & 1 != 0 {
+            // READ transfer: serve the latched register into the FIFO
+            // cell (visible once sDone publishes, like the facade's
+            // syncOut reload).
+            let resp = self.i2c_slave_read(self.i2c_reg);
+            self.i2c_back[0x10 / 4] = (resp[0] as u32)
+                | ((resp[1] as u32) << 8)
+                | ((resp[2] as u32) << 16)
+                | ((resp[3] as u32) << 24);
+            self.i2c_sdone = true;
+        } else {
+            // WRITE transfer: first FIFO byte selects the register.
+            self.i2c_reg = self.i2c_back[0x10 / 4] & 0xff;
+            self.i2c_sdone = true;
+        }
+    }
+
+    /// SPI flash response per outbound byte index (mirrors spi.js
+    /// slaveResponse): byte 0 dummy 0x00, then JEDEC 0xEF/0x40/0x18
+    /// for command 0x9F, then 0xFF.
+    fn spi_slave_response(cmd: u8, idx: usize) -> u8 {
+        if idx == 0 {
+            return 0x00;
+        }
+        if cmd == 0x9f {
+            if idx == 1 {
+                return 0xef;
+            }
+            if idx == 2 {
+                return 0x40;
+            }
+            if idx == 3 {
+                return 0x18;
+            }
+        }
+        0xff
+    }
+
+    /// SPI FIFO push (mirrors spi.js pushTx): append outbound bytes,
+    /// extending the response in lockstep.
+    fn spi_push_tx(&mut self, size: u64, v: u64) {
+        for i in 0..size {
+            let b = ((v >> (8 * i)) & 0xff) as u8;
+            if self.spi_tx.is_empty() {
+                self.spi_cmd = b;
+            }
+            let idx = self.spi_tx.len();
+            self.spi_tx.push(b);
+            self.spi_rx.push(Self::spi_slave_response(self.spi_cmd, idx));
+        }
+    }
+
+    /// GPLEV0 pin levels for the browser LED/button panel (mirrors the
+    /// +0x34 read).
+    pub fn gpio_lev0(&self) -> u32 {
+        (self.gpio_out & !self.gpio_in) | self.gpio_in
+    }
+
+    /// Flat SD-card image (sector 0 first) for browser Save/Load.
+    pub fn sd_export(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.sd_disk.len() * 512);
+        for sec in &self.sd_disk {
+            out.extend_from_slice(sec);
+        }
+        out
+    }
+
+    /// Replace the disk image (browser Load). Accepts a whole number of
+    /// sectors, capped like the write path.
+    pub fn sd_import(&mut self, bytes: &[u8]) -> bool {
+        if bytes.is_empty() || bytes.len() % 512 != 0 {
+            return false;
+        }
+        let n = bytes.len() / 512;
+        if n > 32 {
+            return false;
+        }
+        self.sd_disk.clear();
+        for chunk in bytes.chunks_exact(512) {
+            let mut sec = [0u8; 512];
+            sec.copy_from_slice(chunk);
+            self.sd_disk.push(sec);
+        }
+        true
+    }
+
+    /// UI-safe memory read (RAM only; anything else decodes as zeros,
+    /// like the fault panel expects for unmapped windows). Deliberately
+    /// avoids Bus::read so peeks never pop FIFOs or advance device state.
+    pub fn mem_read_bytes(&self, addr: u64, len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len as u64 {
+            let a = addr.wrapping_add(i);
+            if Self::is_ram(a, 1) {
+                out.push(self.mem[a as usize]);
+            } else {
+                out.push(0);
+            }
+        }
+        out
+    }
+
+    /// Side-effect-free device peek for test harnesses (sess READ):
+    /// serves the same values as read() for PURE cells (GPIO
+    /// FSEL/LEV/EDS/enables); stateful cells (UART DR pop, FIFOs) and
+    /// everything else read 0. The wasm mem_read stays RAM-only.
+    pub fn peek(&self, addr: u64) -> u32 {
+        if addr >= GPIO_BASE && addr + 4 <= GPIO_BASE + 0x1000 {
+            return match addr - GPIO_BASE {
+                0x00 | 0x04 | 0x08 | 0x0c | 0x10 | 0x14 => {
+                    self.gpio_fsel[((addr - GPIO_BASE) / 4) as usize]
+                }
+                0x34 => (self.gpio_out & !self.gpio_in) | self.gpio_in,
+                0x40 => self.gpio_eds,
+                _ => 0,
+            };
+        }
+        0
+    }
+
     pub fn read(&mut self, addr: u64, size: u64) -> Result<u64, Fault> {
+        if addr == 0x3f007054 {
+            eprintln!("RENTER {:#x} sz={}", addr, size);
+        }
         let addr = self.translate(addr)?;
         if Self::is_ram(addr, size) {
             let a = addr as usize;
@@ -504,6 +1218,9 @@ impl Bus {
         if Self::is_gpio(addr, size) {
             let off = addr - GPIO_BASE;
             let v = match off {
+                0x00 | 0x04 | 0x08 | 0x0c | 0x10 | 0x14 => {
+                    self.gpio_fsel[(off / 4) as usize] as u64
+                }
                 0x34 => ((self.gpio_out & !self.gpio_in) | self.gpio_in) as u64,
                 0x38 => 0,
                 0x40 => self.gpio_eds as u64,
@@ -516,7 +1233,7 @@ impl Bus {
                         0
                     }
                 }
-                _ => 0, // GPFSEL/GPPUD/SET/CLR absorb (write-only)
+                _ => 0, // GPPUD/SET/CLR absorb (write-only)
             };
             return Ok(v & mask(size));
         }
@@ -527,16 +1244,31 @@ impl Bus {
         if addr == SD_PRESENT && std::env::var("MBOXTRACE").is_ok() {
             eprintln!("SDPRESENT-READ");
         }
+        // VideoCore mailbox regs (+0x880 in the MBOX page). MUST precede
+        // is_ic: the IC window spans IC_BASE..MBOX_PAGE end, so it would
+        // otherwise swallow MBOX reads into its `_ => 0` arm (fb guest
+        // then spins past the polls and reports "mailbox failed"). Reads
+        // serve the sync_out snapshots.
+        if addr >= MBOX_BASE && addr + size <= MBOX_BASE + 0x20 {
+            let v: u64 = match addr - MBOX_BASE {
+                0x00 => self.mbx_pub_read as u64,
+                0x04 => self.mbx_pub_status as u64,
+                0x14 => self.mbx_last_write as u64,
+                0x18 => 0, // MAIL1_STATUS: always clear
+                _ => 0,
+            };
+            return Ok(v & mask(size));
+        }
         if Self::is_ic(addr, size) {
             let off = addr - IC_BASE;
             let v: u64 = match off {
                 // PENDING2 (GPIO bit 17 + UART bit 25) + BASIC mirrors
                 // (bit 9 for GPIO, bit 19 shortcut for UART).
                 0x08 => (self.gpio_pending2() | self.uart_pending2()) as u64,
-                0x04 => self.timer_pending1() as u64,
+                0x04 => (self.timer_pending1() | self.dma_pending1()) as u64,
                 0x00 => {
                     let mut b = 0u64;
-                    if self.timer_pending1() != 0 {
+                    if self.timer_pending1() | self.dma_pending1() != 0 {
                         b |= 1 << 8; // any non-shortcut bank-1 line
                     }
                     if self.gpio_pending2() != 0 {
@@ -580,8 +1312,104 @@ impl Bus {
             };
             return Ok(v & mask(size));
         }
+        if Self::is_i2c(addr, size) {
+            // BSC registers (mirrors i2c.js syncOut publishes): C shows
+            // latched I2CEN|READ plus ST while a transfer is done; S shows
+            // DONE; DLEN/A/FIFO/DONE read the window backing.
+            let off = addr - I2C_BASE;
+            let v: u64 = match off {
+                // Published snapshots (see sync_out): the guest only ever
+                // observes slice-boundary state, exactly like the facade.
+                0x00 => self.i2c_pub_c as u64,
+                0x04 => self.i2c_pub_s as u64,
+                _ => {
+                    let idx = (off / 4) as usize;
+                    if idx < self.i2c_back.len() {
+                        self.i2c_back[idx] as u64
+                    } else {
+                        0
+                    }
+                }
+            };
+            return Ok(v & mask(size));
+        }
+        if Self::is_spi(addr, size) {
+            // SPI0 CS (mirrors spi.js syncOut): TA latch, TXD (always
+            // drained), RXD while response bytes remain, DONE when ready.
+            // FIFO reads the staged response backing.
+            let off = addr - SPI_BASE;
+            let v: u64 = match off {
+                // Published snapshot (see sync_out), unless the guest
+                // wrote CS since (window shows the write until publish).
+                0x00 => self.spi_cs_dirty.unwrap_or(self.spi_pub_cs) as u64,
+                0x04 => self.spi_fifo_le(),
+                _ => 0,
+            };
+            return Ok(v & mask(size));
+        }
+        // PWM window backing (CTL/STA published at sync_out).
+        if Self::is_pwm(addr, size) {
+            let mut w = 0u64;
+            for i in 0..size {
+                let o = (addr - PWM_BASE) + i;
+                let cell = self.pwm_back.get((o / 4) as usize).copied().unwrap_or(0);
+                w |= (((cell >> (8 * (o % 4))) & 0xff) as u64) << (8 * i);
+            }
+            return Ok(w & mask(size));
+        }
         if Self::is_miniuart(addr, size) {
-            return Ok(0); // status/RX read as empty (RX unsupported, like uart_getc)
+            // Window backing (guest writes persist; ENABLES/LSR/IO are
+            // overwritten by sync_out, exactly like the facade window).
+            let idx = ((addr - UART1_BASE) / 4) as usize;
+            let v = if idx < self.uart1_back.len() {
+                self.uart1_back[idx] as u64
+            } else {
+                0
+            };
+            return Ok(v & mask(size));
+        }
+        // DMA ch0 + ENABLE page: full window backing (the facade
+        // windows are RAM — guest writes read back until sync_out
+        // overwrites CS; sync_in pulls CS/CONBLK/ENABLE from here).
+        // Byte-assembled so unaligned/partial accesses match RAM.
+        if Self::is_dma(addr, size) {
+            let base = if addr >= DMA_ENABLE_PAGE {
+                DMA_ENABLE_PAGE
+            } else {
+                DMA_BASE
+            };
+            let mut w = 0u64;
+            for i in 0..size {
+                let o = addr - base + i;
+                let cell = if addr >= DMA_ENABLE_PAGE {
+                    self.dma_en_back.get((o / 4) as usize).copied().unwrap_or(0)
+                } else {
+                    self.dma_back.get((o / 4) as usize).copied().unwrap_or(0)
+                };
+                w |= (((cell >> (8 * (o % 4))) & 0xff) as u64) << (8 * i);
+            }
+            return Ok(w & mask(size));
+        }
+        // MMU_CTL compat (mirrors the host-assisted model): MMU_CTL
+        // echoes (the guest polls bit0 from its own write), DONE parks.
+        if Self::is_mmuctl(addr, size) {
+            let off = addr - MMU_CTL;
+            let v: u64 = match off {
+                0x00 => self.mmu_ctl_cell as u64,
+                0x04 => self.mmu_done_cell as u64,
+                _ => 0,
+            };
+            return Ok(v & mask(size));
+        }
+        // SMP spin-table window: plain byte backing (the SmpShared
+        // arbiter in runner.rs mirrors it per core per chunk).
+        if Self::is_smp(addr, size) {
+            let mut w = 0u64;
+            for i in 0..size {
+                let o = addr - SMP_BASE + i;
+                w |= ((self.smp_mem.get(o as usize).copied().unwrap_or(0) as u64) << (8 * i));
+            }
+            return Ok(w & mask(size));
         }
         if Self::is_page(addr, size, MBOX_PAGE) || Self::is_page(addr, size, LOCAL_BASE) {
             // Local block CORE_IRQ_SRC (core 0, +0x60): bit 1 = CNTPNSIRQ,
@@ -603,6 +1431,9 @@ impl Bus {
     }
 
     pub fn write(&mut self, addr: u64, size: u64, val: u64) -> Result<(), Fault> {
+        if addr == 0x3f007054 {
+            eprintln!("WENTER {:#x} sz={} sctlr={:#x}", addr, size, self.mmu_sctlr);
+        }
         let addr = self.translate(addr)?;
         if Self::is_ram(addr, size) {
             let a = addr as usize;
@@ -652,6 +1483,9 @@ impl Bus {
             let off = addr - GPIO_BASE;
             let v = (val & mask(size)) as u32;
             match off {
+                0x00 | 0x04 | 0x08 | 0x0c | 0x10 | 0x14 => {
+                    self.gpio_fsel[(off / 4) as usize] = v;
+                }
                 0x1c => self.gpio_out |= v,
                 0x28 => self.gpio_out &= !v,
                 0x40 => self.gpio_eds &= !v, // W1C (guest-only path)
@@ -662,6 +1496,23 @@ impl Bus {
                     }
                 }
                 _ => {} // GPFSEL/GPPUD/LEV absorb
+            }
+            return Ok(());
+        }
+        // VideoCore mailbox: MAIL1_WRITE latches + processes channel-8
+        // requests (mirrors syncMailboxIn, including the changed-value
+        // gate); other cells absorb. MUST precede is_ic (same overlap
+        // as the read path — MAIL1_WRITE would be absorbed as IC enable).
+        if addr >= MBOX_BASE && addr + size <= MBOX_BASE + 0x20 {
+            if addr - MBOX_BASE == 0x14 {
+                let v = (val & mask(size)) as u32;
+                if v != self.mbx_last_write {
+                    self.mbx_last_write = v;
+                    self.mbx_addr = v;
+                    if (v & 0xf) == 8 {
+                        self.mbox_process(v);
+                    }
+                }
             }
             return Ok(());
         }
@@ -695,6 +1546,7 @@ impl Bus {
                     self.sd_exec(v & 0x3f, self.sd_arg);
                 }
                 0x30 => self.sd_irpt &= !v, // W1C
+                0x54 => self.sd_done = v != 0, // DONE host extension park flag
                 0x100..=0x2ff => {
                     // Stage PIO bytes for CMD24.
                     for i in 0..size {
@@ -706,13 +1558,185 @@ impl Bus {
             }
             return Ok(());
         }
+        if Self::is_i2c(addr, size) {
+            // C writes: CLEAR edge resets, ST rising edge runs the
+            // transfer (mirrors i2c.js syncIn; synchronous here is
+            // equivalent — the guest only observes published S/CS).
+            // Other cells merge into the window backing.
+            let off = addr - I2C_BASE;
+            if off == 0x00 {
+                let v = (val & mask(size)) as u32;
+                if v & (1 << 4) != 0 {
+                    self.i2c_sdone = false;
+                    self.i2c_resp = [0; 4];
+                }
+                let start = (v & (1 << 7)) != 0 && (self.i2c_c & (1 << 7)) == 0;
+                self.i2c_c = v & ((1 << 15) | (1 << 0) | (1 << 7));
+                if start {
+                    self.i2c_start();
+                }
+            } else {
+                let idx = (off / 4) as usize;
+                if idx < self.i2c_back.len() {
+                    let base = ((off) % 4) as u32;
+                    let mut cell = self.i2c_back[idx];
+                    for i in 0..size {
+                        let sh = 8 * (base + i as u32);
+                        if sh < 32 {
+                            cell &= !(0xff << sh);
+                            cell |= (((val >> (8 * i)) & 0xff) as u32) << sh;
+                        }
+                    }
+                    self.i2c_back[idx] = cell;
+                }
+            }
+            return Ok(());
+        }
+        if Self::is_spi(addr, size) {
+            // CS writes: CLEAR edge resets the session, TA rising edge
+            // runs the transfer (mirrors spi.js hooks, synchronous here).
+            // FIFO writes push TX bytes (response extends in lockstep).
+            let off = addr - SPI_BASE;
+            if off == 0x00 {
+                let v = (val & mask(size)) as u32;
+                self.spi_cs_dirty = Some(v);
+                if v & (0b11 << 4) != 0 {
+                    self.spi_tx.clear();
+                    self.spi_rx.clear();
+                    self.spi_cmd = 0;
+                    self.spi_sdone = false;
+                }
+                let ta = (v & (1 << 7)) != 0;
+                if ta && !self.spi_ta {
+                    self.spi_ta = true;
+                    if !self.spi_tx.is_empty() {
+                        self.spi_sdone = true;
+                        // Stage the response into the FIFO backing NOW
+                        // (synchronously with sDone — the guest observes
+                        // DONE live mid-chunk, so deferred sync_out staging
+                        // would serve a stale window; cf. the I2C model
+                        // which stages at transfer time).
+                        for i in 0..4 {
+                            self.spi_fifo[i] = *self.spi_rx.get(i).unwrap_or(&0);
+                        }
+                    }
+                }
+                if !ta {
+                    self.spi_ta = false;
+                }
+            } else if off == 0x04 {
+                self.spi_push_tx(size, val);
+            } else if off == 0x54 {
+                self.spi_done = val != 0; // DONE host extension park flag
+            }
+            return Ok(());
+        }
         if Self::is_miniuart(addr, size) {
-            // Mini-UART TX (AUX_MU_IO at +0x40) is written blindly (no
-            // status poll in machine_uart.c); tap nonzero bytes.
-            if addr - UART1_BASE == 0x40 {
-                let b = (val & 0xff) as u8;
-                if b != 0 {
-                    self.console.push(b);
+            // Window backing with RMW (the facade window is RAM). MU_IO
+            // (+0x40) TX bytes tap the console with the "[u1] " line tag
+            // (uart1Emit rule); the pulse-clear happens in sync_out.
+            let idx = ((addr - UART1_BASE) / 4) as usize;
+            if idx < self.uart1_back.len() {
+                let mut cell = self.uart1_back[idx];
+                // Merge the written bytes (little-endian partial writes).
+                let base = ((addr - UART1_BASE) % 4) as u32;
+                for i in 0..size {
+                    let sh = 8 * (base + i as u32);
+                    if sh < 32 {
+                        cell &= !(0xff << sh);
+                        cell |= (((val >> (8 * i)) & 0xff) as u32) << sh;
+                    }
+                }
+                self.uart1_back[idx] = cell;
+                if addr - UART1_BASE == 0x40 {
+                    let b = (cell & 0xff) as u8;
+                    if b != 0 {
+                        self.uart1_tx(b);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        // DMA ch0 + ENABLE page: window backing with RMW (the facade
+        // windows are RAM). No immediate action — the edge logic runs
+        // in sync_in, mirroring the facade.
+        if Self::is_dma(addr, size) {
+            let base = if addr >= DMA_ENABLE_PAGE {
+                DMA_ENABLE_PAGE
+            } else {
+                DMA_BASE
+            };
+            for i in 0..size {
+                let o = addr - base + i;
+                let idx = (o / 4) as usize;
+                let sh = 8 * (o % 4);
+                let b = ((val >> (8 * i)) & 0xff) as u32;
+                if addr >= DMA_ENABLE_PAGE {
+                    if let Some(cell) = self.dma_en_back.get_mut(idx) {
+                        *cell = (*cell & !(0xff << sh)) | (b << sh);
+                    }
+                } else if let Some(cell) = self.dma_back.get_mut(idx) {
+                    *cell = (*cell & !(0xff << sh)) | (b << sh);
+                }
+            }
+            return Ok(());
+        }
+        // PWM (mirrors pwm.js): window backing (CTL/STA published at
+        // sync_out); DAT1 pushes while USEF1 latched, FIFO pushes;
+        // depth capped at 256 like the facade.
+        if Self::is_pwm(addr, size) {
+            let off = addr - PWM_BASE;
+            let idx = (off / 4) as usize;
+            if idx < self.pwm_back.len() {
+                let base = (off % 4) as u32;
+                let mut cell = self.pwm_back[idx];
+                for i in 0..size {
+                    let sh = 8 * (base + i as u32);
+                    if sh < 32 {
+                        cell &= !(0xff << sh);
+                        cell |= (((val >> (8 * i)) & 0xff) as u32) << sh;
+                    }
+                }
+                self.pwm_back[idx] = cell;
+                if off == 0x14 {
+                    // DAT1: push while USEF1 latched.
+                    if (self.pwm_ctl & (1 << 5)) != 0 && self.pwm_fifo.len() < 256 {
+                        self.pwm_fifo.push(cell);
+                    }
+                } else if off == 0x20 && self.pwm_fifo.len() < 256 {
+                    self.pwm_fifo.push(cell);
+                }
+            }
+            return Ok(());
+        }
+        // MMU_CTL compat: writing root|1 (or root|0) programs the real
+        // regime; cells echo for the status poll + DONE park.
+        if Self::is_mmuctl(addr, size) {
+            let off = addr - MMU_CTL;
+            let v = (val & mask(size)) as u32;
+            if off == 0x00 {
+                self.mmu_ctl_cell = v;
+                if v & 1 != 0 {
+                    self.mmu_ttbr0 = (v & !0xfff) as u64;
+                    self.mmu_tcr = 16; // T0SZ=16: 48-bit VA, 4K granule
+                    self.mmu_mair = 0xff;
+                    self.mmu_sctlr |= 1;
+                    self.mmu_loose = true;
+                } else {
+                    self.mmu_sctlr &= !1;
+                    self.mmu_loose = false;
+                }
+            } else if off == 0x04 {
+                self.mmu_done_cell = v;
+            }
+            return Ok(());
+        }
+        // SMP spin-table window: plain byte backing.
+        if Self::is_smp(addr, size) {
+            for i in 0..size {
+                let o = addr - SMP_BASE + i;
+                if (o as usize) < self.smp_mem.len() {
+                    self.smp_mem[o as usize] = ((val >> (8 * i)) & 0xff) as u8;
                 }
             }
             return Ok(());
@@ -765,6 +1789,75 @@ impl Bus {
             let lev = (self.gpio_out & !host) | host;
             self.gpio_eds |= (lev & hen) | (!lev & len);
         }
+        // Mini-UART publish (mirrors uart1.js syncOut): ENABLES echo,
+        // LSR TX-empty|idle once enabled, and the IO pulse-clear (the
+        // guest's putc1 waits for the slot to clear).
+        self.uart1_back[1] = if self.uart1_enabled { 1 } else { 0 };
+        self.uart1_back[0x54 / 4] = if self.uart1_enabled {
+            (1 << 5) | (1 << 6)
+        } else {
+            0
+        };
+        self.uart1_back[0x40 / 4] = 0;
+        // I2C/SPI status publish (mirrors i2c.js/spi.js syncOut): the
+        // guest only observes slice-boundary snapshots — never live
+        // state (a mid-chunk DONE would let polls exit a chunk early
+        // and shift all downstream timing by a constant phase).
+        self.i2c_pub_c = (self.i2c_c & ((1 << 15) | 1)) | (if self.i2c_sdone { 1 << 7 } else { 0 });
+        self.i2c_pub_s = if self.i2c_sdone { 1 << 7 } else { 0 };
+        {
+            let mut cs = 0u32;
+            if self.spi_ta {
+                cs |= 1 << 7;
+            }
+            cs |= 1 << 18;
+            if !self.spi_rx.is_empty() {
+                cs |= 1 << 17;
+            }
+            if self.spi_sdone {
+                cs |= 1 << 16;
+            }
+            self.spi_pub_cs = cs;
+        }
+        self.spi_cs_dirty = None;
+        // Mailbox publish (mirrors syncMailboxOut): reply visible iff
+        // a request was processed.
+        if self.mbx_pending {
+            self.mbx_pub_status = 0;
+            self.mbx_pub_read = self.mbx_addr;
+        } else {
+            self.mbx_pub_status = 0x80000000;
+            self.mbx_pub_read = 0;
+        }
+        // PWM publish (mirrors pwm.js syncOut): STA from FIFO depth,
+        // CTL canonical latch value.
+        {
+            let mut sta = 0u32;
+            if self.pwm_fifo.len() >= 256 {
+                sta |= 1 << 0;
+            }
+            if self.pwm_fifo.is_empty() {
+                sta |= 1 << 1;
+            }
+            if self.pwm_back.len() > 1 {
+                self.pwm_back[1] = sta;
+            }
+            if !self.pwm_back.is_empty() {
+                self.pwm_back[0] = self.pwm_ctl;
+            }
+        }
+        // DMA publish (mirrors syncDmaOut): CS shows END|INT only.
+        let mut dcs = 0u32;
+        if self.dma_end {
+            dcs |= 2;
+        }
+        if self.dma_int {
+            dcs |= 4;
+        }
+        if !self.dma_back.is_empty() {
+            self.dma_back[0] = dcs;
+        }
+        self.dma_last_cs = dcs;
     }
 
     /// Post-chunk sync (mirrors syncTimerIn): pull compares (resetting a
@@ -782,6 +1875,54 @@ impl Bus {
         let cs = self.tmr_cell(0x00);
         if cs != self.tmr_last_cs {
             self.tmr_pending &= cs & 0xf;
+        }
+        // Mini-UART enable latch (mirrors uart1.js syncIn: sticky on any
+        // nonzero ENABLES write; the publish happens in sync_out).
+        if self.uart1_back[1] != 0 {
+            self.uart1_enabled = true;
+        }
+        // PWM latch + drain (mirrors pwm.js syncIn): CTL levels latch on
+        // change (CLRF1 edge clears the FIFO), then 64 samples drain.
+        {
+            let v = self.pwm_back[0];
+            if v != self.pwm_last_ctl {
+                self.pwm_last_ctl = v;
+                self.pwm_ctl = v & ((1 << 0) | (1 << 1) | (1 << 5) | (1 << 7));
+                if v & (1 << 6) != 0 {
+                    self.pwm_fifo.clear();
+                }
+            }
+            let take = core::cmp::min(self.pwm_fifo.len(), 64);
+            self.pwm_ring.extend(self.pwm_fifo.drain(..take));
+            self.pwm_drained += take as u64;
+        }
+        // DMA edge logic (mirrors main.js syncDmaIn, reading the window
+        // backing like readU32: ABORT clears; ACTIVE rising (vs last
+        // published) with a chain + enabled runs it now; a guest-cleared
+        // INT unlatches (the same-slice ACTIVE write carries no INT bit,
+        // so it can't wipe a fresh latch — only an explicit clear does).
+        // ENABLE lives at +0x50 of the ENABLE page (index 20).
+        let cs = self.dma_back[0];
+        let conblk = self.dma_back[1];
+        let enable = self.dma_en_back[(0x50 / 4) as usize];
+        if cs & (1 << 31) != 0 {
+            self.dma_end = false;
+            self.dma_int = false;
+        } else {
+            if (cs & 1) != 0
+                && (self.dma_last_cs & 1) == 0
+                && conblk != 0
+                && (enable & 1) != 0
+            {
+                let inten = self.dma_run_chain(conblk as u64);
+                self.dma_end = true;
+                if inten {
+                    self.dma_int = true;
+                }
+            }
+            if self.dma_int && (self.dma_last_cs & 4) != 0 && (cs & 4) == 0 {
+                self.dma_int = false;
+            }
         }
         if self.vt_ips != 0 {
             self.vt_us += chunk_insns * 1_000_000 / self.vt_ips;
@@ -839,11 +1980,16 @@ pub struct Cpu {
     z: bool,
     c: bool,
     v: bool,
+    /// FPSR cumulative exception flags (bits 4:0 = IXC/UFC/OFC/DZC/IOC),
+    /// set by the scalar-FP ALU below. FPCR is hardwired default (RN,
+    /// no traps — the firmware never writes it, verified by disassembly:
+    /// 12 MRS reads, 0 MSR writes). FPSR reads return these bits.
+    fpsr_cum: u32,
 }
 
 impl Cpu {
     pub fn new(entry: u64) -> Self {
-        Cpu { x: [0; 31], sp: 0, pc: entry, q: [0; 32], vbar_el1: 0, daif: 0xf, elr_el1: 0, spsr_el1: 0, n: false, z: false, c: false, v: false }
+        Cpu { x: [0; 31], sp: 0, pc: entry, q: [0; 32], vbar_el1: 0, daif: 0xf, elr_el1: 0, spsr_el1: 0, n: false, z: false, c: false, v: false, fpsr_cum: 0 }
     }
 
     #[inline]
@@ -861,6 +2007,396 @@ impl Cpu {
             return;
         }
         self.x[r as usize] = v;
+    }
+    /// Scalar-FP access through the Q file low half (d31 is a real
+    /// register — no XZR aliasing on the FP side). S writes
+    /// zero-extend into the full 128 bits (architectural; unobservable
+    /// while Q/vector forms fault).
+    #[inline]
+    fn fr(&self, r: u32) -> u64 {
+        self.q[r as usize] as u64
+    }
+    #[inline]
+    fn fw(&mut self, r: u32, v: u64, is64: bool) {
+        self.q[r as usize] = if is64 { v as u128 } else { (v & 0xffff_ffff) as u128 };
+    }
+    /// Set an FPSR cumulative flag (0 IOC, 1 DZC, 2 OFC, 3 UFC, 4 IXC).
+    #[inline]
+    fn fpsr_set(&mut self, bit: u32) {
+        self.fpsr_cum |= 1 << bit;
+    }
+
+    /// Finish a double binary op (host-computed r, RN like hardware):
+    /// NaN propagation + OF/UF/IX. `invalid` = caller-detected Invalid
+    /// Operation on non-NaN inputs (0/0, inf-inf, 0*inf); `dz` = divide-
+    /// by-zero (inf result, DZ not OF); `exact` = caller-proven exactness
+    /// (else IXC). Returns the result bits.
+    fn fp_end_bin64(&mut self, ab: u64, bb: u64, r: f64, invalid: bool, dz: bool, exact: bool) -> u64 {
+        let a = f64::from_bits(ab);
+        let b = f64::from_bits(bb);
+        // SNaN operand: IOC + quiet it preserving sign+payload
+        // (fork-verified; pure-invalid (0/0 etc.) takes DefaultNaN).
+        if fp_is_snan64(ab) {
+            self.fpsr_set(0);
+            return fp_quiet64(ab);
+        }
+        if fp_is_snan64(bb) {
+            self.fpsr_set(0);
+            return fp_quiet64(bb);
+        }
+        if invalid {
+            self.fpsr_set(0);
+            return 0x7ff8_0000_0000_0000;
+        }
+        if a.is_nan() || b.is_nan() {
+            return r.to_bits(); // quiet passthrough (payload via host op)
+        }
+        if dz {
+            self.fpsr_set(1);
+            return r.to_bits();
+        }
+        if r.is_infinite() {
+            if a.is_finite() && b.is_finite() {
+                self.fpsr_set(2);
+                self.fpsr_set(4);
+            }
+            return r.to_bits();
+        }
+        if r.abs() < f64::MIN_POSITIVE && (r != 0.0 || !exact) {
+            self.fpsr_set(3);
+            self.fpsr_set(4);
+            return r.to_bits();
+        }
+        if !exact {
+            self.fpsr_set(4);
+        }
+        r.to_bits()
+    }
+
+    /// Single-precision twin of fp_end_bin64.
+    fn fp_end_bin32(&mut self, ab: u32, bb: u32, r: f32, invalid: bool, dz: bool, exact: bool) -> u32 {
+        let a = f32::from_bits(ab);
+        let b = f32::from_bits(bb);
+        if fp_is_snan32(ab) {
+            self.fpsr_set(0);
+            return fp_quiet32(ab);
+        }
+        if fp_is_snan32(bb) {
+            self.fpsr_set(0);
+            return fp_quiet32(bb);
+        }
+        if invalid {
+            self.fpsr_set(0);
+            return 0x7fc0_0000;
+        }
+        if a.is_nan() || b.is_nan() {
+            return r.to_bits();
+        }
+        if dz {
+            self.fpsr_set(1);
+            return r.to_bits();
+        }
+        if r.is_infinite() {
+            if a.is_finite() && b.is_finite() {
+                self.fpsr_set(2);
+                self.fpsr_set(4);
+            }
+            return r.to_bits();
+        }
+        if r.abs() < f32::MIN_POSITIVE && (r != 0.0 || !exact) {
+            self.fpsr_set(3);
+            self.fpsr_set(4);
+            return r.to_bits();
+        }
+        if !exact {
+            self.fpsr_set(4);
+        }
+        r.to_bits()
+    }
+
+    /// Floating-point compare to NZCV (fcmp/fcmpe/fccmp-taken).
+    /// Unordered (any NaN) always sets V (fork-verified — even quiet
+    /// QNaN on a non-signaling compare); IOC only when signaling or
+    /// an SNaN is involved.
+    fn fp_cmp64(&mut self, ab: u64, bb: u64, signaling: bool) {
+        let a = f64::from_bits(ab);
+        let b = f64::from_bits(bb);
+        let unord = a.is_nan() || b.is_nan();
+        let snan = fp_is_snan64(ab) || fp_is_snan64(bb);
+        if unord {
+            if signaling || snan {
+                self.fpsr_set(0);
+            }
+            self.set_flags(false, false, true, true);
+        } else if a < b {
+            self.set_flags(true, false, false, false);
+        } else if a == b {
+            self.set_flags(false, true, true, false);
+        } else {
+            self.set_flags(false, false, true, false);
+        }
+    }
+
+    /// Single-precision twin of fp_cmp64 (V=1 on any unordered too).
+    fn fp_cmp32(&mut self, ab: u32, bb: u32, signaling: bool) {
+        let a = f32::from_bits(ab);
+        let b = f32::from_bits(bb);
+        let unord = a.is_nan() || b.is_nan();
+        let snan = fp_is_snan32(ab) || fp_is_snan32(bb);
+        if unord {
+            if signaling || snan {
+                self.fpsr_set(0);
+            }
+            self.set_flags(false, false, true, true);
+        } else if a < b {
+            self.set_flags(true, false, false, false);
+        } else if a == b {
+            self.set_flags(false, true, true, false);
+        } else {
+            self.set_flags(false, false, true, false);
+        }
+    }
+
+    /// Float-to-int convert (FCVTZS/ZU/AS): `ibits` = 32/64 dest width,
+    /// `mode` = fp_round_mode code. Saturates with IOC on overflow/NaN/Inf
+    /// (NaN -> 0); IXC iff a finite in-range value was rounded.
+    fn fp_to_int64(&mut self, av: u64, ibits: u32, unsigned: bool, mode: u32) -> u64 {
+        let av = if mode == 4 && fp_is_subnormal64(av) {
+            if av >> 63 == 1 {
+                0x8000_0000_0000_0000
+            } else {
+                0
+            }
+        } else {
+            av
+        };
+        let a = f64::from_bits(av);
+        if a.is_nan() {
+            self.fpsr_set(0);
+            return 0;
+        }
+        let r = fp_round_mode(a, mode);
+        // Overflow bounds (exact f64 constants).
+        let (lo, hi) = if unsigned {
+            if ibits == 64 {
+                (0.0, 18446744073709551616.0)
+            } else {
+                (0.0, 4294967296.0)
+            }
+        } else if ibits == 64 {
+            (-9223372036854775808.0, 9223372036854775808.0)
+        } else {
+            (-2147483648.0, 2147483648.0)
+        };
+        if r < lo || r >= hi || !r.is_finite() {
+            self.fpsr_set(0);
+            return if unsigned {
+                if a < 0.0 { 0 } else if ibits == 64 { u64::MAX } else { 0xffff_ffff }
+            } else if a < 0.0 {
+                if ibits == 64 { i64::MIN as u64 } else { 0xffff_ffff_8000_0000 }
+            } else if ibits == 64 {
+                i64::MAX as u64
+            } else {
+                0xffff_ffff_7fff_ffff
+            };
+        }
+        if r != a {
+            self.fpsr_set(4);
+        }
+        // In range and integral: the cast is exact.
+        if unsigned {
+            r as u64
+        } else {
+            r as i64 as u64
+        }
+    }
+
+    /// Single-precision twin of fp_to_int64.
+    fn fp_to_int32(&mut self, av: u32, ibits: u32, unsigned: bool, mode: u32) -> u64 {
+        let av = if mode == 4 && fp_is_subnormal32(av) {
+            if av >> 31 == 1 {
+                0x8000_0000
+            } else {
+                0
+            }
+        } else {
+            av
+        };
+        let a = f32::from_bits(av);
+        if a.is_nan() {
+            self.fpsr_set(0);
+            return 0;
+        }
+        let r = fp_round_mode(a as f64, mode);
+        let (lo, hi) = if unsigned {
+            if ibits == 64 {
+                (0.0, 18446744073709551616.0)
+            } else {
+                (0.0, 4294967296.0)
+            }
+        } else if ibits == 64 {
+            (-9223372036854775808.0, 9223372036854775808.0)
+        } else {
+            (-2147483648.0, 2147483648.0)
+        };
+        if r < lo || r >= hi || !r.is_finite() {
+            self.fpsr_set(0);
+            return if unsigned {
+                if a < 0.0 { 0 } else if ibits == 64 { u64::MAX } else { 0xffff_ffff }
+            } else if (a as f64) < 0.0 {
+                if ibits == 64 { i64::MIN as u64 } else { 0xffff_ffff_8000_0000 }
+            } else if ibits == 64 {
+                i64::MAX as u64
+            } else {
+                0xffff_ffff_7fff_ffff
+            };
+        }
+        if r != a as f64 {
+            self.fpsr_set(4);
+        }
+        if unsigned {
+            r as u64
+        } else {
+            r as i64 as u64
+        }
+    }
+
+    /// Int-to-float convert (SCVTF/UCVTF). IXC iff the integer is not
+    /// exactly representable (|v| > 2^53 double / 2^24 single).
+    fn fp_from_int(&mut self, v: u64, ibits: u32, unsigned: bool, is64fp: bool) -> u64 {
+        if is64fp {
+            let r: f64 = match (ibits, unsigned) {
+                (64, false) => v as i64 as f64,
+                (64, true) => v as f64,
+                (_, false) => (v as i32) as f64,
+                _ => (v as u32) as f64,
+            };
+            let mag: u128 = match (ibits, unsigned) {
+                (64, false) => (v as i64).unsigned_abs() as u128,
+                (64, true) => v as u128,
+                (_, false) => (v as i32).unsigned_abs() as u128,
+                _ => (v as u32) as u128,
+            };
+            if r.is_finite() && mag > (1u128 << 53) {
+                self.fpsr_set(4);
+            }
+            r.to_bits()
+        } else {
+            let r: f32 = match (ibits, unsigned) {
+                (64, false) => v as i64 as f32,
+                (64, true) => v as f32,
+                (_, false) => (v as i32) as f32,
+                _ => (v as u32) as f32,
+            };
+            let mag: u128 = match (ibits, unsigned) {
+                (64, false) => (v as i64).unsigned_abs() as u128,
+                (64, true) => v as u128,
+                (_, false) => (v as i32).unsigned_abs() as u128,
+                _ => (v as u32) as u128,
+            };
+            if r.is_finite() && mag > (1u128 << 24) {
+                self.fpsr_set(4);
+            }
+            r.to_bits() as u64
+        }
+    }
+
+    /// Round to integral (FRINT*): `mode` = fp_round_mode code, `set_ix`
+    /// adds IXC when the value changed (FRINTX; the others never set it).
+    fn fp_rint64(&mut self, av: u64, mode: u32, set_ix: bool) -> u64 {
+        // Fork quirk (probed): away-mode flushes subnormal inputs to
+        // signed zero (other modes coincide either way).
+        let av = if mode == 4 && fp_is_subnormal64(av) {
+            if av >> 63 == 1 {
+                0x8000_0000_0000_0000
+            } else {
+                0
+            }
+        } else {
+            av
+        };
+        let a = f64::from_bits(av);
+        if a.is_nan() {
+            if fp_is_snan64(av) {
+                self.fpsr_set(0);
+                return fp_quiet64(av);
+            }
+            return av;
+        }
+        if a.is_infinite() {
+            return av;
+        }
+        let r = fp_round_mode(a, mode);
+        if set_ix && r != a {
+            self.fpsr_set(4);
+        }
+        r.to_bits()
+    }
+
+    /// Single-precision twin of fp_rint64.
+    fn fp_rint32(&mut self, av: u32, mode: u32, set_ix: bool) -> u32 {
+        let av = if mode == 4 && fp_is_subnormal32(av) {
+            if av >> 31 == 1 {
+                0x8000_0000
+            } else {
+                0
+            }
+        } else {
+            av
+        };
+        let a = f32::from_bits(av);
+        if a.is_nan() {
+            if fp_is_snan32(av) {
+                self.fpsr_set(0);
+                return fp_quiet32(av);
+            }
+            return av;
+        }
+        if a.is_infinite() {
+            return av;
+        }
+        let r = fp_round_mode(a as f64, mode) as f32;
+        if set_ix && r != a {
+            self.fpsr_set(4);
+        }
+        r.to_bits()
+    }
+
+    /// Narrow double to single (FCVT S,D) with OF/UF/IX.
+    fn fp_narrow(&mut self, av: u64) -> u32 {
+        let a = f64::from_bits(av);
+        if a.is_nan() {
+            if fp_is_snan64(av) {
+                self.fpsr_set(0);
+                return (f64::from_bits(fp_quiet64(av)) as f32).to_bits();
+            }
+            return (a as f32).to_bits();
+        }
+        let r = a as f32;
+        if r.is_infinite() && a.is_finite() {
+            self.fpsr_set(2);
+            self.fpsr_set(4);
+        } else if r == 0.0 {
+            if a != 0.0 {
+                self.fpsr_set(3);
+                self.fpsr_set(4);
+            }
+        } else if r.abs() < f32::MIN_POSITIVE {
+            self.fpsr_set(3);
+            self.fpsr_set(4);
+        } else if (r as f64) != a {
+            self.fpsr_set(4);
+        }
+        r.to_bits()
+    }
+
+    /// Widen single to double (FCVT D,S): exact; SNaN raises IOC.
+    fn fp_widen(&mut self, av: u32) -> u64 {
+        if fp_is_snan32(av) {
+            self.fpsr_set(0);
+            return (f32::from_bits(fp_quiet32(av)) as f64).to_bits();
+        }
+        (f32::from_bits(av) as f64).to_bits()
     }
     #[inline]
     fn wsp(&mut self, r: u32, v: u64, sf: bool) {
@@ -1082,6 +2618,140 @@ fn extend_reg(v: u64, option: u32, amount: u32) -> u64 {
     masked.wrapping_shl(amount)
 }
 
+// ---- scalar-FP (VFP) helpers: bit patterns in u64/u32, host IEEE ops
+// (RN, like the hardware with default FPCR). NaN payloads propagate
+// per the host (matches the fork on the probed vectors; the fuzzer
+// carries NaN cases to catch drift). Cumulative FPSR flags are set by
+// the methods below (bit numbers in Cpu::fpsr_set).
+
+/// Expand an FMOV 8-bit float immediate (assembler+oracle ground truth:
+/// sign=a, exp=(b?base_hi:base_lo)|(cdefgh>>4), frac=(cdefgh&15)<<off).
+fn fmov_imm(imm8: u32, is64: bool) -> u64 {
+    let a = (imm8 >> 7) & 1;
+    let b = (imm8 >> 6) & 1;
+    let c = imm8 & 0x3f;
+    if is64 {
+        let exp = (if b == 1 { 0x3fcu64 } else { 0x400 }) | ((c >> 4) as u64);
+        ((a as u64) << 63) | (exp << 52) | (((c & 0xf) as u64) << 48)
+    } else {
+        let exp = (if b == 1 { 0x7cu32 } else { 0x80 }) | (c >> 4);
+        (((a << 31) | (exp << 23) | ((c & 0xf) << 19)) & 0xffff_ffff) as u64
+    }
+}
+
+#[inline]
+fn fp_is_snan64(b: u64) -> bool {
+    b & 0x7ff0_0000_0000_0000 == 0x7ff0_0000_0000_0000
+        && b & 0x0008_0000_0000_0000 == 0
+        && b & 0x0007_ffff_ffff_ffff != 0
+}
+#[inline]
+fn fp_is_snan32(b: u32) -> bool {
+    b & 0x7f80_0000 == 0x7f80_0000 && b & 0x0040_0000 == 0 && b & 0x003f_ffff != 0
+}
+
+/// Quiet a signaling NaN preserving sign+payload (fork-verified: the
+/// fork quiets SNaNs this way rather than returning DefaultNaN).
+#[inline]
+fn fp_quiet64(b: u64) -> u64 {
+    b | 0x0008_0000_0000_0000
+}
+/// Single-precision twin of fp_quiet64.
+#[inline]
+fn fp_quiet32(b: u32) -> u32 {
+    b | 0x0040_0000
+}
+
+/// Subnormal test (for the away-mode flush below).
+#[inline]
+fn fp_is_subnormal64(b: u64) -> bool {
+    b & 0x7ff0_0000_0000_0000 == 0 && b & 0x000f_ffff_ffff_ffff != 0
+}
+/// Single-precision twin of fp_is_subnormal64.
+#[inline]
+fn fp_is_subnormal32(b: u32) -> bool {
+    b & 0x7f80_0000 == 0 && b & 0x007f_ffff != 0
+}
+
+/// Exactness of r = a+b / a-b (doubles) via integer arithmetic when
+/// both operands are integral and small. Over-approximates inexact
+/// (returns false when unsure) — IX may be set spuriously in razor
+/// cases; nothing live reads IX (only newlib's dead helper).
+fn fp_exact_addsub(a: f64, b: f64, r: f64, sub: bool) -> bool {
+    if !a.is_finite() || !b.is_finite() || !r.is_finite() {
+        return true; // overflow/invalid flagged separately
+    }
+    if a.fract() != 0.0 || b.fract() != 0.0 {
+        return false;
+    }
+    const LIM: f64 = 9007199254740992.0; // 2^53
+    if a.abs() > LIM || b.abs() > LIM {
+        return false;
+    }
+    let (ai, bi) = (a as i128, b as i128);
+    if (ai as f64) != a || (bi as f64) != b {
+        return false;
+    }
+    let s = if sub { ai - bi } else { ai + bi };
+    s.abs() <= (1i128 << 53) && (s as f64) == r
+}
+
+/// Exactness of r = a*b (doubles) via i128.
+fn fp_exact_mul(a: f64, b: f64, r: f64) -> bool {
+    if !a.is_finite() || !b.is_finite() || !r.is_finite() {
+        return true;
+    }
+    if a.fract() != 0.0 || b.fract() != 0.0 {
+        return false;
+    }
+    const LIM: f64 = 9007199254740992.0;
+    if a.abs() > LIM || b.abs() > LIM {
+        return false;
+    }
+    let (ai, bi) = (a as i64, b as i64);
+    if (ai as f64) != a || (bi as f64) != b {
+        return false;
+    }
+    match (ai as i128).checked_mul(bi as i128) {
+        Some(p) => p.abs() <= (1i128 << 53) && (p as f64) == r,
+        None => false,
+    }
+}
+
+/// Round-to-integral with an explicit mode (frint*/fcvt* need several;
+/// 0=z(trunc) 1=n(ties-even) 2=p(ceil) 3=m(floor) 4=a(away) 5=i(RN)).
+fn fp_round_mode(x: f64, mode: u32) -> f64 {
+    match mode {
+        0 => x.trunc(),
+        2 => x.ceil(),
+        3 => x.floor(),
+        4 => {
+            let t = x.trunc();
+            if t == x {
+                t
+            } else {
+                t + x.signum()
+            }
+        }
+        _ => {
+            // ties-even (n and i/RN): manual, no toolchain dependency.
+            // (f == 0.5 exactly needs |x| < 2^52, so the i64 cast below
+            // is always in range on that path.)
+            let t = x.trunc();
+            let f = (x - t).abs();
+            if f < 0.5 {
+                t
+            } else if f > 0.5 {
+                t + x.signum()
+            } else if (t as i64) & 1 == 0 {
+                t
+            } else {
+                t + x.signum()
+            }
+        }
+    }
+}
+
 fn shift_reg(v: u64, kind: u32, amount: u32, sf: bool) -> u64 {
     let m = if sf { u64::MAX } else { 0xffff_ffff };
     match kind {
@@ -1212,6 +2882,7 @@ impl Cpu {
                     } else if crn == 2 && op2 == 2 {
                         bus.mmu_tcr = v;
                     } else if crn == 1 && op2 == 0 {
+                        eprintln!("SCTLR-W {:#x}", v);
                         bus.mmu_sctlr = v;
                     }
                 } else if crn == 2 && op2 == 0 {
@@ -1250,6 +2921,16 @@ impl Cpu {
                     self.z = (v >> 30) & 1 != 0;
                     self.c = (v >> 29) & 1 != 0;
                     self.v = (v >> 28) & 1 != 0;
+                }
+            } else if op0 == 3 && op1 == 3 && crn == 4 && crm == 4 && (op2 == 0 || op2 == 1) {
+                // FPCR {3,3,4,4,0} / FPSR {3,3,4,4,1}. FPCR reads 0
+                // (default RN, no traps — the firmware has 12 MRS reads
+                // and 0 MSR writes, verified by disassembly); FPSR reads
+                // the cumulative flags the FP ALU maintains. MSR to
+                // either is absorbed (nothing executes one).
+                if l != 0 {
+                    let v = if op2 == 0 { 0 } else { self.fpsr_cum as u64 };
+                    self.w(rd, v, true);
                 }
             } else if op0 == 3 && op1 == 3 && crn == 14 && crm == 0 && op2 == 1 {
                 // CNTPCT_EL0 {3,3,14,0,1}: read-only counter.
@@ -1355,14 +3036,24 @@ impl Cpu {
             }
             return Ok(());
         }
-        // SIMD Q-pair (STP/LDP Q): class bits(29:25) == 10110 (vs 10100
-        // for integer pairs). 16-byte elements, modes mirror integer
-        // pairs. Only the offset/pre/post forms the firmware's spills
-        // use; anything else in this class faults.
+        // SIMD STP/LDP S/D/Q: class bits(29:25) == 10110 (vs 10100
+        // for integer pairs). Element size from bits(31:30): 00=S(4B),
+        // 01=D(8B), 10=Q(16B). Scalar halves ride the Q file low bits
+        // (zero-extended). Modes mirror integer pairs (00/10 offset,
+        // 11 pre-index, 01 post-index) with the writeback timing the
+        // fork shows (pre applies after success, post immediately).
+        // (Was: Q-only — S/D pairs executed as 16-byte Q with x16
+        // offsets, silently corrupting FP prologues.)
         if ((w >> 25) & 0x1f) == 0x16 {
+            let esz: u64 = match bits(w, 31, 30) {
+                0b00 => 4,
+                0b01 => 8,
+                0b10 => 16,
+                _ => return Err(ill),
+            };
             let is_load = bits(w, 22, 22) == 1;
             let mode = bits(w, 24, 23);
-            let off = (sext(bits(w, 21, 15) as u64, 7) as i64).wrapping_mul(16) as u64;
+            let off = (sext(bits(w, 21, 15) as u64, 7) as i64).wrapping_mul(esz as i64) as u64;
             let rt2 = bits(w, 14, 10);
             let base = self.rsp(rn);
             let (addr, wb) = match mode {
@@ -1378,23 +3069,37 @@ impl Cpu {
                 }
             };
             if is_load {
-                let lo1 = bus.read(addr, 8).map_err(|_| Fault::UnmappedData(addr))?;
-                let hi1 = bus
-                    .read(addr.wrapping_add(8), 8)
-                    .map_err(|_| Fault::UnmappedData(addr))?;
-                let lo2 = bus.read(addr.wrapping_add(16), 8).map_err(|_| Fault::UnmappedData(addr))?;
-                let hi2 = bus
-                    .read(addr.wrapping_add(24), 8)
-                    .map_err(|_| Fault::UnmappedData(addr))?;
-                self.q[rd as usize] = ((hi1 as u128) << 64) | lo1 as u128;
-                self.q[rt2 as usize] = ((hi2 as u128) << 64) | lo2 as u128;
-            } else {
+                if esz == 16 {
+                    let lo1 = bus.read(addr, 8).map_err(|_| Fault::UnmappedData(addr))?;
+                    let hi1 = bus
+                        .read(addr.wrapping_add(8), 8)
+                        .map_err(|_| Fault::UnmappedData(addr))?;
+                    let lo2 = bus.read(addr.wrapping_add(16), 8).map_err(|_| Fault::UnmappedData(addr))?;
+                    let hi2 = bus
+                        .read(addr.wrapping_add(24), 8)
+                        .map_err(|_| Fault::UnmappedData(addr))?;
+                    self.q[rd as usize] = ((hi1 as u128) << 64) | lo1 as u128;
+                    self.q[rt2 as usize] = ((hi2 as u128) << 64) | lo2 as u128;
+                } else {
+                    let v1 = bus.read(addr, esz).map_err(|_| Fault::UnmappedData(addr))?;
+                    let v2 = bus
+                        .read(addr.wrapping_add(esz), esz)
+                        .map_err(|_| Fault::UnmappedData(addr))?;
+                    self.fw(rd, v1, esz == 8);
+                    self.fw(rt2, v2, esz == 8);
+                }
+            } else if esz == 16 {
                 let (l1, h1) = (self.q[rd as usize] as u64, (self.q[rd as usize] >> 64) as u64);
                 let (l2, h2) = (self.q[rt2 as usize] as u64, (self.q[rt2 as usize] >> 64) as u64);
                 bus.write(addr, 8, l1).map_err(|_| Fault::UnmappedData(addr))?;
                 bus.write(addr.wrapping_add(8), 8, h1).map_err(|_| Fault::UnmappedData(addr))?;
                 bus.write(addr.wrapping_add(16), 8, l2).map_err(|_| Fault::UnmappedData(addr))?;
                 bus.write(addr.wrapping_add(24), 8, h2).map_err(|_| Fault::UnmappedData(addr))?;
+            } else {
+                let m = if esz == 8 { u64::MAX } else { 0xffff_ffff };
+                bus.write(addr, esz, self.fr(rd) & m).map_err(|_| Fault::UnmappedData(addr))?;
+                let a2 = addr.wrapping_add(esz);
+                bus.write(a2, esz, self.fr(rt2) & m).map_err(|_| Fault::UnmappedData(a2))?;
             }
             if let Some(b) = wb {
                 self.wsp(rn, b, true);
@@ -1402,16 +3107,21 @@ impl Cpu {
             return Ok(());
         }
 
-        // SIMD single-Q (STR/LDR Q, unsigned-imm/pre/post/unscaled).
-        // Class bits(29:25) == 11110 (vs 11100 integer). Only the Q
-        // forms the firmware's spills use; D/S/H/B elements,
-        // multi-structure, and SIMD arithmetic fault.
+        // SIMD STR/LDR S/D/Q (unsigned-imm/pre/post/unscaled). Class
+        // bits(29:25) == 11110 (vs 11100 integer); element size from
+        // bits(31:30): 10=S(4B), 11=D(8B), 00=Q(16B, the firmware's
+        // NEON spills — kept working). Scalar halves ride the Q file
+        // low bits. opc bit22: 0 store / 1 load (bit23 must be 0 for
+        // scalars; 1x is unallocated). Register-offset mirrors the
+        // integer form (extend_reg, amount = log2(esz)).
         if ((w >> 25) & 0x1f) == 0x1e {
             let opc = bits(w, 23, 22);
-            if bits(w, 31, 30) != 0b00 || bits(w, 23, 23) != 1 {
-                return Err(ill);
-            }
-            let is_load = opc & 1 == 1;
+            match bits(w, 31, 30) {
+                0b00 => {
+                    if bits(w, 23, 23) != 1 {
+                        return Err(ill);
+                    }
+                    let is_load = opc & 1 == 1;
             let (addr, wb) = if bits(w, 24, 24) == 1 {
                 let off = (bits(w, 21, 10) as u64) * 16;
                 (self.rsp(rn).wrapping_add(off), None)
@@ -1451,6 +3161,111 @@ impl Cpu {
                 self.wsp(rn, b, true);
             }
             return Ok(());
+                }
+                0b01 => {
+                    // STR/LDR H (2B, float16 lanes — f_mkdir's dir-entry
+                    // date word uses STUR H; oracle-verified like S/D).
+                    // opc must be 00 (store) / 01 (load); 1x is
+                    // unallocated. Loads zero-extend (fw convention).
+                    if opc != 0b00 && opc != 0b01 {
+                        return Err(ill);
+                    }
+                    let is_load = opc == 0b01;
+                    let (addr, wb) = if bits(w, 24, 24) == 1 {
+                        let off = (bits(w, 21, 10) as u64) * 2;
+                        (self.rsp(rn).wrapping_add(off), None)
+                    } else if bits(w, 21, 21) == 1 {
+                        // Register offset (mirror of the integer form).
+                        let rm = bits(w, 20, 16);
+                        let option = bits(w, 15, 13);
+                        let s = bits(w, 12, 12);
+                        let amount = if s == 1 { 1 } else { 0 };
+                        let off = extend_reg(self.r(rm), option, amount);
+                        (self.rsp(rn).wrapping_add(off), None)
+                    } else {
+                        match (bits(w, 11, 11) << 1) | bits(w, 10, 10) {
+                            0b00 => {
+                                let off = sext(bits(w, 20, 12) as u64, 9);
+                                (self.rsp(rn).wrapping_add(off), None)
+                            }
+                            0b01 => {
+                                let off = sext(bits(w, 20, 12) as u64, 9);
+                                let b = self.rsp(rn);
+                                (b, Some(b.wrapping_add(off)))
+                            }
+                            0b11 => {
+                                let off = sext(bits(w, 20, 12) as u64, 9);
+                                let a = self.rsp(rn).wrapping_add(off);
+                                (a, Some(a))
+                            }
+                            _ => return Err(ill),
+                        }
+                    };
+                    if is_load {
+                        let v = bus.read(addr, 2).map_err(|_| Fault::UnmappedData(addr))?;
+                        self.fw(rd, v, false);
+                    } else {
+                        bus.write(addr, 2, self.fr(rd) & 0xffff)
+                            .map_err(|_| Fault::UnmappedData(addr))?;
+                    }
+                    if let Some(b) = wb {
+                        self.wsp(rn, b, true);
+                    }
+                    return Ok(());
+                }
+                0b10 | 0b11 => {
+                    // STR/LDR S (10, 4B) / D (11, 8B). opc must be 00
+                    // (store) / 01 (load); 1x is unallocated.
+                    let esz: u64 = if bits(w, 31, 31) == 1 { 8 } else { 4 };
+                    if opc != 0b00 && opc != 0b01 {
+                        return Err(ill);
+                    }
+                    let is_load = opc == 0b01;
+                    let (addr, wb) = if bits(w, 24, 24) == 1 {
+                        let off = (bits(w, 21, 10) as u64) * esz;
+                        (self.rsp(rn).wrapping_add(off), None)
+                    } else if bits(w, 21, 21) == 1 {
+                        // Register offset (mirror of the integer form).
+                        let rm = bits(w, 20, 16);
+                        let option = bits(w, 15, 13);
+                        let s = bits(w, 12, 12);
+                        let amount = if s == 1 { esz.trailing_zeros() } else { 0 };
+                        let off = extend_reg(self.r(rm), option, amount);
+                        (self.rsp(rn).wrapping_add(off), None)
+                    } else {
+                        match (bits(w, 11, 11) << 1) | bits(w, 10, 10) {
+                            0b00 => {
+                                let off = sext(bits(w, 20, 12) as u64, 9);
+                                (self.rsp(rn).wrapping_add(off), None)
+                            }
+                            0b01 => {
+                                let off = sext(bits(w, 20, 12) as u64, 9);
+                                let b = self.rsp(rn);
+                                (b, Some(b.wrapping_add(off)))
+                            }
+                            0b11 => {
+                                let off = sext(bits(w, 20, 12) as u64, 9);
+                                let a = self.rsp(rn).wrapping_add(off);
+                                (a, Some(a))
+                            }
+                            _ => return Err(ill),
+                        }
+                    };
+                    if is_load {
+                        let v = bus.read(addr, esz).map_err(|_| Fault::UnmappedData(addr))?;
+                        self.fw(rd, v, esz == 8);
+                    } else {
+                        let m = if esz == 8 { u64::MAX } else { 0xffff_ffff };
+                        bus.write(addr, esz, self.fr(rd) & m)
+                            .map_err(|_| Fault::UnmappedData(addr))?;
+                    }
+                    if let Some(b) = wb {
+                        self.wsp(rn, b, true);
+                    }
+                    return Ok(());
+                }
+                _ => return Err(ill),
+            }
         }
 
         // STR/LDR (unsigned imm, unscaled, pre/post-index, register offset)
@@ -1631,10 +3446,16 @@ impl Cpu {
                 let m = if sf { u64::MAX } else { 0xffff_ffff };
                 let a = self.r(rn) & m;
                 let b = self.r(rm) & m;
+                // NOTE: Rn/Rm order matters (fixed 2026-09-12): the
+                // result is (Rn << (width-lsb)) | (Rm >> lsb) — an
+                // earlier version had a/b swapped, which passed the
+                // lsb==0 and Rn==Rm (ROR-alias) cases but silently
+                // corrupted everything else (proven by multf3's
+                // mantissa alignment: 10x10 -> 64.0 instead of 100.0).
                 let r = if lsb == 0 {
                     a
                 } else {
-                    ((a >> lsb) | (b << (width - lsb))) & m
+                    ((a << (width - lsb)) | (b >> lsb)) & m
                 };
                 self.w(rd, r, sf);
                 return Ok(());
@@ -1721,6 +3542,660 @@ impl Cpu {
                     _ => return Err(ill),
                 };
                 self.w(rd, result, sf);
+                return Ok(());
+            }
+            return Err(ill);
+        }
+
+        // AdvSIMD extras (the few vector forms guests use; everything
+        // else vector faults like the stock core, so parity holds):
+        // DUP-element (.4h from W), MOVI (2d #0, 16b #0x20), EOR
+        // (.8b/.16b full-128), lane-extract to FP scalar (H/S). Rows
+        // machine-derived (mask,value); Q file holds vectors (top
+        // halves zeroed on write — unobservable while other vector
+        // ops fault).
+        {
+            let rd = bits(w, 4, 0);
+            let rn = bits(w, 9, 5);
+            let rm = bits(w, 20, 16);
+            // DUP .4h (exact row; other dup forms fault).
+            if (w & 0xffff_fc00) == 0x0e02_0c00 {
+                let v = (self.r(rn) & 0xffff) as u128;
+                let mut q: u128 = 0;
+                for i in 0..4 {
+                    q |= v << (16 * i);
+                }
+                self.q[rd as usize] = q;
+                return Ok(());
+            }
+            // MOVI 2d #0 / 16b #0x20 (exact rows; other immediates fault).
+            if (w & 0xffff_ffe0) == 0x6f00_e400 {
+                self.q[rd as usize] = 0;
+                return Ok(());
+            }
+            if (w & 0xffff_ffe0) == 0x4f01_e400 {
+                self.q[rd as usize] = 0x2020_2020_2020_2020_2020_2020_2020_2020;
+                return Ok(());
+            }
+            // EOR .8b/.16b (full-128 bitwise; arrangement bit selects the
+            // row but the operation is identical). Q=0 (64-bit) forms
+            // clear the top half (oracle-fitted: mov-8b zeroes it).
+            if (w & 0xffe0_fc00) == 0x2e20_1c00 || (w & 0xffe0_fc00) == 0x6e20_1c00 {
+                let r = self.q[rn as usize] ^ self.q[rm as usize];
+                self.q[rd as usize] = if bits(w, 30, 30) == 0 {
+                    r & 0xffff_ffff_ffff_ffff
+                } else {
+                    r
+                };
+                return Ok(());
+            }
+            // ORR .8b/.16b (full-128 bitwise; `mov v.16b` is the ORR
+            // alias with Rm == Rn). Rows machine-derived like EOR.
+            // Q=0 forms clear the top half (oracle-fitted).
+            if (w & 0xffe0_fc00) == 0x0ea0_1c00 || (w & 0xffe0_fc00) == 0x4ea0_1c00 {
+                let r = self.q[rn as usize] | self.q[rm as usize];
+                self.q[rd as usize] = if bits(w, 30, 30) == 0 {
+                    r & 0xffff_ffff_ffff_ffff
+                } else {
+                    r
+                };
+                return Ok(());
+            }
+            // BIT/BIF .8b (firmware's bit-twiddling; Q=0 rows only, as
+            // observed — no 16b forms in the image). Operand order is
+            // oracle-fitted (see test/simd-oracle.mjs): Vm is the
+            // SELECTOR for both (BIT takes Vn where set, BIF takes Vn
+            // where clear). Q=0 clears the top half.
+            if (w & 0xffe0_fc00) == 0x2ea0_1c00 {
+                let qd = self.q[rd as usize];
+                let qn = self.q[rn as usize];
+                let qm = self.q[rm as usize];
+                let r = (qm & qn) | (qd & !qm);
+                self.q[rd as usize] = r & 0xffff_ffff_ffff_ffff;
+                return Ok(());
+            }
+            if (w & 0xffe0_fc00) == 0x2ee0_1c00 {
+                let qd = self.q[rd as usize];
+                let qn = self.q[rn as usize];
+                let qm = self.q[rm as usize];
+                let r = (qm & qd) | (qn & !qm);
+                self.q[rd as usize] = r & 0xffff_ffff_ffff_ffff;
+                return Ok(());
+            }
+            // MOVI D,#0 (scalar; the assembler rejects other D
+            // immediates, so the row is exact): zeroes the lane. The
+            // top half is zeroed too (fw convention, oracle-fitted).
+            if (w & 0xffff_ffe0) == 0x2f00_e400 {
+                self.q[rd as usize] = 0;
+                return Ok(());
+            }
+            // FMOV Xd, Vn.D[1] (element extract to general; the index
+            // is always 1 — d[0] assembles to the scalar fmov form).
+            if (w & 0xffff_fc00) == 0x9eae_0000 {
+                if rd != 31 {
+                    self.x[rd as usize] = (self.q[rn as usize] >> 64) as u64;
+                }
+                return Ok(());
+            }
+            // FMOV Vd.D[1], Xn (element insert from general; index
+            // always 1; low lane preserved).
+            if (w & 0xffff_fc00) == 0x9eaf_0000 {
+                let lo = self.q[rd as usize] & 0xffff_ffff_ffff_ffff;
+                self.q[rd as usize] = lo | ((self.r(rn) as u128) << 64);
+                return Ok(());
+            }
+            // FNEG .2d (Q=1 row only, as observed): flip both lane
+            // sign bits.
+            if (w & 0xffff_fc00) == 0x6ee0_f800 {
+                let q = self.q[rn as usize];
+                let lo = ((q & 0xffff_ffff_ffff_ffff) as u64 ^ 0x8000_0000_0000_0000) as u128;
+                let hi =
+                    (((q >> 64) as u64 ^ 0x8000_0000_0000_0000) as u128) << 64;
+                self.q[rd as usize] = hi | lo;
+                return Ok(());
+            }
+            // SHL (immediate) D-lane (firmware's (x<<32) idiom):
+            // shift = imm7-64, imm7 = bits[22:16] (bit22 fixed 1 by
+            // the mask, so 32-bit-element forms fault honestly).
+            // Top half zeroed (oracle-fitted, like the Q=0 lanes).
+            if (w & 0xffc0_fc00) == 0x5f40_5400 {
+                let sh = ((w >> 16) & 0x7f) - 64;
+                self.q[rd as usize] = (self.fr(rn).wrapping_shl(sh)) as u128;
+                return Ok(());
+            }
+            // SSHR (immediate) D-lane: arithmetic shift = 128-imm7
+            // (1..=64); shift 64 sign-fills (checked_shr would drop
+            // the bit, so saturate by hand).
+            if (w & 0xffc0_fc00) == 0x5f40_0400 {
+                let sh = 128 - ((w >> 16) & 0x7f);
+                let v = self.fr(rn);
+                let r = if sh >= 64 {
+                    if (v >> 63) == 1 { u64::MAX } else { 0 }
+                } else {
+                    ((v as i64) >> sh) as u64
+                };
+                self.q[rd as usize] = r as u128;
+                return Ok(());
+            }
+            // MOV (element) D-lane (only D moves in the image): dst
+            // lane = bit20, src lane = bit14 (both machine-derived
+            // from the two observed words); the other lane is preserved.
+            if (w & 0xffef_bc00) == 0x6e08_0400 {
+                let dlane = (w >> 20) & 1;
+                let slane = (w >> 14) & 1;
+                let qd = self.q[rd as usize];
+                let qn = self.q[rn as usize];
+                let lane = if slane == 1 { (qn >> 64) as u64 } else { qn as u64 } as u128;
+                self.q[rd as usize] = if dlane == 1 {
+                    (qd & 0xffff_ffff_ffff_ffff) | (lane << 64)
+                } else {
+                    (qd & !0xffff_ffff_ffff_ffffu128) | lane
+                };
+                return Ok(());
+            }
+            // Fixed-point scalar converts with fbits=0 (mask
+            // 0xFFFFFC00): the firmware's int64<->double traffic stays
+            // entirely in the D file — oracle-proven (fcv-oracles):
+            // scvtf-fixed Dd=(double)(int64)Dn_bits,
+            // fcvtzs-fixed Dd=sat(int64)(double)Dn (toward-zero).
+            // They live here (not in the FP table below) because that
+            // gate only admits 0x1E/0x9E/0x1F tops. No collision with
+            // any general-file row (0x5E top).
+            if (w & 0xffff_fc00) == 0x5e61_d800 {
+                let v = self.fp_from_int(self.fr(rn), 64, false, true);
+                self.fw(rd, v, true);
+                return Ok(());
+            }
+            if (w & 0xffff_fc00) == 0x5ee1_b800 {
+                let v = self.fp_to_int64(self.fr(rn), 64, false, 0);
+                self.fw(rd, v, true);
+                return Ok(());
+            }
+            // Fixed-point scalar converts with fbits>=1 (the assembler
+            // rejects #0 for the scaling forms, so #0 above is a
+            // genuinely separate encoding). Masks/values machine-derived
+            // (fcv3.s); scale rules fitted from #1/#31/#63 samples and
+            // oracle-verified per row (simd-oracle.mjs fcv group):
+            // - FP-source to-FP (0x5F/0x7F): fbits = 64-scale6
+            //   (scale6 = bits[21:16]); int width is 64.
+            // - FP-source to-int (0x1E/0x9E + 0x58/0x59): fbits =
+            //   64-scale6 (scale6 = bits[15:10]); dest width from sf.
+            // Fixed-to-float DIVIDES by 2^fbits (fixed value = int /
+            // 2^fbits); float-to-fixed MULTIPLIES (fixed int = trunc(a
+            // x 2^fbits)) — oracle-proven (the -1.5 x2 = -3 case caught
+            // an inverted first version). Both scalings are
+            // single-rounding-exact, so values reuse the plain helpers;
+            // the convert then flags honestly. (The inherited IX from
+            // fp_from_int can over-fire on scaled values; nothing live
+            // reads IX.)
+            if (w & 0xffc0_fc00) == 0x5f40_e400 {
+                let fbits = 64 - bits(w, 21, 16);
+                let v = self.fp_from_int(self.fr(rn), 64, false, true);
+                let r = f64::from_bits(v) / 2f64.powi(fbits as i32);
+                self.fw(rd, r.to_bits(), true);
+                return Ok(());
+            }
+            if (w & 0xffc0_fc00) == 0x7f40_e400 {
+                let fbits = 64 - bits(w, 21, 16);
+                let v = self.fp_from_int(self.fr(rn), 64, true, true);
+                let r = f64::from_bits(v) / 2f64.powi(fbits as i32);
+                self.fw(rd, r.to_bits(), true);
+                return Ok(());
+            }
+            {
+                let fcvf = (w & 0xffff_0000) as u32;
+                if fcvf == 0x1e58_0000
+                    || fcvf == 0x9e58_0000
+                    || fcvf == 0x1e59_0000
+                    || fcvf == 0x9e59_0000
+                {
+                    let fbits = 64 - bits(w, 15, 10);
+                    let a = f64::from_bits(self.fr(rn)) * 2f64.powi(fbits as i32);
+                    let unsigned = fcvf == 0x1e59_0000 || fcvf == 0x9e59_0000;
+                    let ibits = if sf { 64 } else { 32 };
+                    let v = self.fp_to_int64(a.to_bits(), ibits, unsigned, 0);
+                    // Dest width from sf (X=64/W=32); w() zero-extends W.
+                    self.w(rd, v, sf);
+                    return Ok(());
+                }
+            }
+            // NOTE: lane-extract to FP scalar (`mov hN, vM.h[i]`, top
+            // 0x5E) deliberately faults: the stock core faults it too
+            // (verified: oracle faults, so executing it here would break
+            // fault-both parity; the guests' memset paths never take it).
+        }
+
+        // Floating-point data-processing (scalar S/D) + int<->FP moves:
+        // flat (mask,value) dispatch — every row machine-derived from
+        // aarch64-none-elf-as output (multi-sample const/vary analysis;
+        // reg/imm fields masked out, so all register numbers match).
+        // Width: ptype = bit22 (0=S,1=D) for the FP side, bit31 (0=W,
+        // 1=X) for the integer side. Q/NEON/H/single-prec-vector forms
+        // fault (the stock core faults them too, so parity holds).
+        // FPSR cumulative flags maintained (FPCR hardwired default RN).
+        if ((w >> 24) & 0xff) == 0x1e || ((w >> 24) & 0xff) == 0x9e || ((w >> 24) & 0xff) == 0x1f
+        {
+            let rd = bits(w, 4, 0);
+            let rn = bits(w, 9, 5);
+            let rm = bits(w, 20, 16);
+            let ra = bits(w, 14, 10);
+            let is64 = bits(w, 22, 22) == 1;
+            let is64i = bits(w, 31, 31) == 1;
+            // 3-reg ALU (fadd/fsub/fmul/fdiv). Ra (bits14:10) is part
+            // of the opcode and must be 0 as assembled (kept by the
+            // masked values). The ROW selects the op (bit19:18 is 0 for
+            // all four — verified, not hand-derived).
+            let alu = (w & 0xffe0_fc00) as u32;
+            let op = match alu {
+                0x1e60_2800 | 0x1e20_2800 => 0, // fadd
+                0x1e60_3800 | 0x1e20_3800 => 1, // fsub
+                0x1e60_0800 | 0x1e20_0800 => 2, // fmul
+                0x1e60_1800 | 0x1e20_1800 => 3, // fdiv
+                _ => 99,
+            };
+            if op != 99 {
+                if is64 {
+                    let a = f64::from_bits(self.fr(rn));
+                    let b = f64::from_bits(self.fr(rm));
+                    let (r, invalid, dz, exact) = match op {
+                        0b00 => {
+                            let r = a + b;
+                            let inv = a.is_infinite() && b.is_infinite() && a != b;
+                            (r, inv, false, fp_exact_addsub(a, b, r, false))
+                        }
+                        0b01 => {
+                            let r = a - b;
+                            let inv = a.is_infinite() && b.is_infinite() && a == b;
+                            (r, inv, false, fp_exact_addsub(a, b, r, true))
+                        }
+                        0b10 => {
+                            let r = a * b;
+                            let inv = (a == 0.0 && b.is_infinite())
+                                || (a.is_infinite() && b == 0.0);
+                            (r, inv, false, fp_exact_mul(a, b, r))
+                        }
+                        _ => {
+                            let r = a / b;
+                            let inv = (a == 0.0 && b == 0.0)
+                                || (a.is_infinite() && b.is_infinite());
+                            let dz = b == 0.0 && a.is_finite() && a != 0.0;
+                            let ex = r.is_finite() && b != 0.0 && r * b == a;
+                            (r, inv, dz, ex)
+                        }
+                    };
+                    let ab = self.fr(rn);
+                    let bb = self.fr(rm);
+                    let v = self.fp_end_bin64(ab, bb, r, invalid, dz, exact);
+                    self.fw(rd, v, true);
+                } else {
+                    let a = f32::from_bits(self.fr(rn) as u32);
+                    let b = f32::from_bits(self.fr(rm) as u32);
+                    let (r, invalid, dz, exact) = match op {
+                        0b00 => {
+                            let r = a + b;
+                            let inv = a.is_infinite() && b.is_infinite() && a != b;
+                            let ex = fp_exact_addsub(a as f64, b as f64, r as f64, false)
+                                && (r as f64) == (a as f64) + (b as f64);
+                            (r, inv, false, ex)
+                        }
+                        0b01 => {
+                            let r = a - b;
+                            let inv = a.is_infinite() && b.is_infinite() && a == b;
+                            let ex = fp_exact_addsub(a as f64, b as f64, r as f64, true)
+                                && (r as f64) == (a as f64) - (b as f64);
+                            (r, inv, false, ex)
+                        }
+                        0b10 => {
+                            let r = a * b;
+                            let inv = (a == 0.0 && b.is_infinite())
+                                || (a.is_infinite() && b == 0.0);
+                            let ex = fp_exact_mul(a as f64, b as f64, r as f64)
+                                && (r as f64) == (a as f64) * (b as f64);
+                            (r, inv, false, ex)
+                        }
+                        _ => {
+                            let r = a / b;
+                            let inv = (a == 0.0 && b == 0.0)
+                                || (a.is_infinite() && b.is_infinite());
+                            let dz = b == 0.0 && a.is_finite() && a != 0.0;
+                            let ex = r.is_finite() && b != 0.0 && r * b == a;
+                            (r, inv, dz, ex)
+                        }
+                    };
+                    let ab = self.fr(rn) as u32;
+                    let bb = self.fr(rm) as u32;
+                    let v = self.fp_end_bin32(ab, bb, r, invalid, dz, exact);
+                    self.fw(rd, v as u64, false);
+                }
+                return Ok(());
+            }
+            // 1-source FP (fmov-reg/fneg/fabs/fsqrt/frint*/fcvt): rows
+            // keyed by the full (mask 0xFFFFFC00) value.
+            let u1 = (w & 0xffff_fc00) as u32;
+            // (kind, mode): kind 0=mov 1=neg 2=abs 3=sqrt 4=rint 5=cvt.
+            let one: Option<(u32, u32)> = match u1 {
+                0x1e60_4000 | 0x1e20_4000 => Some((0, 0)), // fmov-reg
+                0x1e61_4000 | 0x1e21_4000 => Some((1, 0)), // fneg
+                0x1e20_c000 | 0x1e60_c000 => Some((2, 0)), // fabs
+                0x1e61_c000 | 0x1e21_c000 => Some((3, 0)), // fsqrt
+                0x1e65_4000 | 0x1e25_4000 => Some((4, 3)), // frintm
+                0x1e66_4000 | 0x1e26_4000 => Some((4, 4)), // frinta
+                0x1e64_4000 | 0x1e24_4000 => Some((4, 1)), // frintn
+                0x1e64_c000 | 0x1e24_c000 => Some((4, 2)), // frintp
+                0x1e67_c000 | 0x1e27_c000 => Some((4, 5)), // frinti
+                0x1e65_c000 | 0x1e25_c000 => Some((4, 0)), // frintz
+                0x1e67_4000 | 0x1e27_4000 => Some((4, 6)), // frintx (mode 6: like i + IXC)
+                0x1e62_4000 => Some((5, 1)),               // fcvt S,D (s<-d)
+                0x1e22_c000 => Some((5, 0)),               // fcvt D,S (d<-s)
+                _ => None,
+            };
+            if let Some((kind, mode)) = one {
+                if is64 {
+                    let a = self.fr(rn);
+                    match kind {
+                        0 => self.fw(rd, a, true),
+                        1 => self.fw(rd, (-f64::from_bits(a)).to_bits(), true),
+                        2 => self.fw(rd, f64::from_bits(a).abs().to_bits(), true),
+                        3 => {
+                            let x = f64::from_bits(a);
+                            if x.is_nan() {
+                                if fp_is_snan64(a) {
+                                    self.fpsr_set(0);
+                                    self.fw(rd, fp_quiet64(a), true);
+                                } else {
+                                    self.fw(rd, a, true);
+                                }
+                            } else if x < 0.0 {
+                                self.fpsr_set(0);
+                                self.fw(rd, 0x7ff8_0000_0000_0000, true);
+                            } else {
+                                let r = x.sqrt();
+                                if r != 0.0 && r.abs() < f64::MIN_POSITIVE {
+                                    self.fpsr_set(3);
+                                    self.fpsr_set(4);
+                                } else if r * r != x {
+                                    self.fpsr_set(4);
+                                }
+                                self.fw(rd, r.to_bits(), true);
+                            }
+                        }
+                        4 => {
+                            let v = self.fp_rint64(a, mode, mode == 6);
+                            self.fw(rd, v, true);
+                        }
+                        _ => {
+                            // fcvt S,D only valid with ptype=1 (D source).
+                            if !is64 {
+                                return Err(ill);
+                            }
+                            let v = self.fp_narrow(a);
+                            self.fw(rd, v as u64, false);
+                        }
+                    }
+                } else {
+                    let a = self.fr(rn) as u32;
+                    match kind {
+                        0 => self.fw(rd, a as u64, false),
+                        1 => self.fw(rd, (-f32::from_bits(a)).to_bits() as u64, false),
+                        2 => self.fw(rd, f32::from_bits(a).abs().to_bits() as u64, false),
+                        3 => {
+                            let x = f32::from_bits(a);
+                            if x.is_nan() {
+                                if fp_is_snan32(a) {
+                                    self.fpsr_set(0);
+                                    self.fw(rd, fp_quiet32(a) as u64, false);
+                                } else {
+                                    self.fw(rd, a as u64, false);
+                                }
+                            } else if x < 0.0 {
+                                self.fpsr_set(0);
+                                self.fw(rd, 0x7fc0_0000, false);
+                            } else {
+                                let r = x.sqrt();
+                                if r != 0.0 && r.abs() < f32::MIN_POSITIVE {
+                                    self.fpsr_set(3);
+                                    self.fpsr_set(4);
+                                } else if r * r != x {
+                                    self.fpsr_set(4);
+                                }
+                                self.fw(rd, r.to_bits() as u64, false);
+                            }
+                        }
+                        4 => {
+                            let v = self.fp_rint32(a, mode, mode == 6);
+                            self.fw(rd, v as u64, false);
+                        }
+                        _ => {
+                            // fcvt D,S only valid with ptype=0 (S source).
+                            if is64 {
+                                return Err(ill);
+                            }
+                            let v = self.fp_widen(a);
+                            self.fw(rd, v, true);
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            // FMOV immediate (mask keeps imm8 out — data, not opcode).
+            let mi = (w & 0xffe0_1fe0) as u32;
+            if mi == 0x1e60_1000 || mi == 0x1e20_1000 {
+                let v = fmov_imm(bits(w, 20, 13), is64);
+                self.fw(rd, v, is64);
+                return Ok(());
+            }
+            // Compares: fcmp/fcmpe (reg + #0), fccmp, fcsel.
+            let c = (w & 0xffe0_fc1f) as u32;
+            // (which, signaling, zero): which 0=cmp 1=cmpe.
+            let cmp: Option<(u32, bool, bool)> = match c {
+                0x1e60_2000 | 0x1e20_2000 => Some((0, false, false)),
+                0x1e60_2008 | 0x1e20_2008 => Some((0, false, true)),
+                0x1e60_2010 | 0x1e20_2010 => Some((0, true, false)),
+                0x1e60_2018 | 0x1e20_2018 => Some((0, true, true)),
+                _ => None,
+            };
+            if let Some((_, signaling, zero)) = cmp {
+                if is64 {
+                    if zero {
+                        self.fp_cmp64(self.fr(rn), 0, signaling);
+                    } else {
+                        self.fp_cmp64(self.fr(rn), self.fr(rm), signaling);
+                    }
+                } else if zero {
+                    self.fp_cmp32(self.fr(rn) as u32, 0, signaling);
+                } else {
+                    self.fp_cmp32(self.fr(rn) as u32, self.fr(rm) as u32, signaling);
+                }
+                return Ok(());
+            }
+            let cc = (w & 0xffe0_0c10) as u32;
+            if cc == 0x1e20_0400 || cc == 0x1e60_0400 {
+                // FCCMP quiet (E=0 kept by the mask; signaling faults).
+                // Width = ptype bit22 baked into the row.
+                let cond = bits(w, 15, 12);
+                let nzcv = bits(w, 3, 0);
+                if self.cond_holds(cond) {
+                    if cc == 0x1e60_0400 {
+                        self.fp_cmp64(self.fr(rn), self.fr(rm), false);
+                    } else {
+                        self.fp_cmp32(self.fr(rn) as u32, self.fr(rm) as u32, false);
+                    }
+                } else {
+                    self.set_flags(
+                        nzcv & 8 != 0,
+                        nzcv & 4 != 0,
+                        nzcv & 2 != 0,
+                        nzcv & 1 != 0,
+                    );
+                }
+                return Ok(());
+            }
+            let cs = (w & 0xffe0_0c00) as u32;
+            if cs == 0x1e60_0c00 || cs == 0x1e20_0c00 {
+                let cond = bits(w, 15, 12);
+                let take_n = self.cond_holds(cond);
+                let v = if take_n { self.fr(rn) } else { self.fr(rm) };
+                self.fw(rd, v, cs == 0x1e60_0c00);
+                return Ok(());
+            }
+            // int<->FP moves and converts (mask 0xFFFFFC00).
+            let cv = (w & 0xffff_fc00) as u32;
+            // (dir, signed, fpmode): dir 0=int->fp 1=fp->int 2=both-bits.
+            // fpmode for fp->int: 0=zs 1=zu 2=as.
+            let cvop: Option<(u32, bool, u32)> = match cv {
+                0x9e67_0000 | 0x1e27_0000 => Some((2, true, 0)), // fmov fp<-int
+                0x9e66_0000 | 0x1e26_0000 => Some((2, true, 1)), // fmov int<-fp
+                0x9e62_0000 | 0x1e62_0000 | 0x1e22_0000 | 0x9e22_0000 => {
+                    Some((0, true, 0)) // scvtf
+                }
+                0x9e63_0000 | 0x1e63_0000 | 0x1e23_0000 | 0x9e23_0000 => {
+                    Some((0, false, 0)) // ucvtf
+                }
+                0x1e78_0000 | 0x9e78_0000 | 0x1e38_0000 | 0x9e38_0000 => {
+                    Some((1, true, 0)) // fcvtzs
+                }
+                0x1e79_0000 | 0x9e79_0000 | 0x1e39_0000 | 0x9e39_0000 => {
+                    Some((1, false, 0)) // fcvtzu
+                }
+                0x1e64_0000 | 0x9e64_0000 | 0x1e24_0000 | 0x9e24_0000 => {
+                    Some((1, true, 4)) // fcvtas
+                }
+                _ => None,
+            };
+            if let Some((dir, signed, fpmode)) = cvop {
+                // Int-side width from bit31 (X=64/W=32), FP-side from ptype.
+                let ibits = if is64i { 64 } else { 32 };
+                match dir {
+                    0 => {
+                        let v = self.fp_from_int(self.r(rn), ibits, !signed, is64);
+                        self.fw(rd, v, is64);
+                    }
+                    1 => {
+                        let v = if is64 {
+                            self.fp_to_int64(self.fr(rn), ibits, !signed, fpmode)
+                        } else {
+                            self.fp_to_int32(self.fr(rn) as u32, ibits, !signed, fpmode)
+                        };
+                        self.w(rd, v, ibits == 64);
+                    }
+                    _ => {
+                        if fpmode == 0 {
+                            // int -> fp bits.
+                            if is64 {
+                                self.fw(rd, self.r(rn), true);
+                            } else {
+                                self.fw(rd, self.r(rn), false);
+                            }
+                        } else if is64 {
+                            self.w(rd, self.fr(rn), true);
+                        } else {
+                            self.w(rd, self.fr(rn), false);
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            // Fused multiply-add family (mask keeps o1/o0 + ptype).
+            let ma = (w & 0xffe0_8000) as u32;
+            // Row: 0=fmadd 1=fmsub 2=fnmadd 3=fnmsub.
+            // FORK QUIRK (probed with a=2,b=3,c=4: fork gives
+            // 10,-2,-10,+2): the fork swaps FMSUB<->FNMSUB negation —
+            // its FMSUB computes -(a*b)+c and its FNMSUB computes
+            // (a*b)-c. Mirrored here for parity (FMADD/FNMADD match
+            // spec and are kept).
+            let fma: Option<u32> = match ma {
+                0x1f40_0000 | 0x1f00_0000 => Some(0), // fmadd: ab+c
+                0x1f40_8000 | 0x1f00_8000 => Some(1), // fmsub-row: -(ab)+c (fork)
+                0x1f60_0000 | 0x1f20_0000 => Some(2), // fnmadd: -(ab+c)
+                0x1f60_8000 | 0x1f20_8000 => Some(3), // fnmsub-row: (ab)-c (fork)
+                _ => None,
+            };
+            if let Some(which) = fma {
+                if is64 {
+                    let a = f64::from_bits(self.fr(rn));
+                    let b = f64::from_bits(self.fr(rm));
+                    let cc = f64::from_bits(self.fr(ra));
+                    let ab = self.fr(rn);
+                    let bb = self.fr(rm);
+                    let cb = self.fr(ra);
+                    let minv = (a == 0.0 && b.is_infinite())
+                        || (a.is_infinite() && b == 0.0);
+                    // First SNaN in (a,b,c) order, quieted preserving
+                    // sign+payload (fork-verified).
+                    let sn = if fp_is_snan64(ab) {
+                        Some(ab)
+                    } else if fp_is_snan64(bb) {
+                        Some(bb)
+                    } else if fp_is_snan64(cb) {
+                        Some(cb)
+                    } else {
+                        None
+                    };
+                    if minv || sn.is_some() {
+                        self.fpsr_set(0);
+                        self.fw(
+                            rd,
+                            sn.map(fp_quiet64).unwrap_or(0x7ff8_0000_0000_0000),
+                            true,
+                        );
+                        return Ok(());
+                    }
+                    // Per-row fused form (negation is exact, so these
+                    // round identically to the parenthesized spec forms).
+                    let r = match which {
+                        0 => a.mul_add(b, cc),        // ab+c
+                        1 => (-a).mul_add(b, cc),     // -(ab)+c (fork)
+                        2 => -(a.mul_add(b, cc)),     // -(ab+c)
+                        _ => a.mul_add(b, -cc),       // (ab)-c (fork)
+                    };
+                    if a.is_nan() || b.is_nan() || cc.is_nan() {
+                        self.fw(rd, r.to_bits(), true);
+                        return Ok(());
+                    }
+                    let exact = a == 0.0 || b == 0.0;
+                    let v = self.fp_end_bin64(ab, bb, r, false, false, exact);
+                    self.fw(rd, v, true);
+                } else {
+                    let a = f32::from_bits(self.fr(rn) as u32);
+                    let b = f32::from_bits(self.fr(rm) as u32);
+                    let cc = f32::from_bits(self.fr(ra) as u32);
+                    let ab = self.fr(rn) as u32;
+                    let bb = self.fr(rm) as u32;
+                    let cb = self.fr(ra) as u32;
+                    let minv = (a == 0.0 && b.is_infinite())
+                        || (a.is_infinite() && b == 0.0);
+                    let sn = if fp_is_snan32(ab) {
+                        Some(ab)
+                    } else if fp_is_snan32(bb) {
+                        Some(bb)
+                    } else if fp_is_snan32(cb) {
+                        Some(cb)
+                    } else {
+                        None
+                    };
+                    if minv || sn.is_some() {
+                        self.fpsr_set(0);
+                        self.fw(
+                            rd,
+                            sn.map(fp_quiet32).unwrap_or(0x7fc0_0000) as u64,
+                            false,
+                        );
+                        return Ok(());
+                    }
+                    let r = match which {
+                        0 => a.mul_add(b, cc),
+                        1 => (-a).mul_add(b, cc),
+                        2 => -(a.mul_add(b, cc)),
+                        _ => a.mul_add(b, -cc),
+                    };
+                    if a.is_nan() || b.is_nan() || cc.is_nan() {
+                        self.fw(rd, r.to_bits() as u64, false);
+                        return Ok(());
+                    }
+                    let exact = a == 0.0 || b == 0.0;
+                    let v = self.fp_end_bin32(ab, bb, r, false, false, exact);
+                    self.fw(rd, v as u64, false);
+                }
                 return Ok(());
             }
             return Err(ill);
@@ -1829,7 +4304,8 @@ impl Cpu {
             // ADD/SUB (shifted or extended register)
             let op = bits(w, 30, 30);
             let s = bits(w, 29, 29) == 1;
-            let b = if bits(w, 21, 21) == 0 {
+            let extended = bits(w, 21, 21) == 1;
+            let b = if !extended {
                 shift_reg(self.r(rm), bits(w, 23, 22), bits(w, 15, 10), sf)
             } else {
                 extend_reg(
@@ -1838,9 +4314,18 @@ impl Cpu {
                     bits(w, 12, 10) as u32,
                 )
             };
-            // Rn==31 is SP except with S set (SUBS aliases incl. NEGS
-            // read XZR — verified: `subs`-with-Rn=31 negates).
-            let a = if s && rn == 31 { self.r(rn) } else { self.rsp(rn) };
+            // Rn==31: SP everywhere EXCEPT shifted-form SUB (S=0 or S=1),
+            // where it reads XZR. Proven by `neg x1, x1` (SUB-shifted,
+            // must compute 0-x1; reading SP gave SP-x1 = 0x3FFAAF and a
+            // wild store fault in firmware): GNU encodes NEG with Rn=31
+            // intending XZR. (The old rule keyed on S and got it
+            // backwards.) Extended forms keep SP (fuzz-pinned by
+            // `add x6, sp, w7, uxtx` etc.), as does shifted ADD.
+            let a = if rn == 31 && !extended && op == 1 {
+                self.r(rn)
+            } else {
+                self.rsp(rn)
+            };
             let (r, n, z, c, v) = if op == 0 {
                 Cpu::add_with_carry(sf, a, b, 0)
             } else {
@@ -1992,9 +4477,17 @@ impl Cpu {
             let rm = bits(w, 20, 16);
             if self.cond_holds(cond) {
                 // CCMN/CCMP never take SP (assembler rejects it): Rn==31
-                // reads XZR.
+                // reads XZR. Second operand is imm5 (bits20:16) when
+                // bit11 is set, else register Rm (assembler ground truth:
+                // ccmp-imm sets bit11, ccmp-reg clears it — the old code
+                // always read X[imm], so `ccmp w0, #5` compared against
+                // X5 and broke `<` (fell into the == handler) and `!=`.
                 let a = self.r(rn);
-                let b = self.r(rm);
+                let b = if bits(w, 11, 11) == 1 {
+                    rm as u64
+                } else {
+                    self.r(rm)
+                };
                 let (_, n, z, c, v) = if op == 0 {
                     Cpu::add_with_carry(sf, a, b, 0)
                 } else {

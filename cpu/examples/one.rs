@@ -30,6 +30,16 @@ fn main() {
     for i in 0..31 {
         cpu.x[i] = hex(&args[2 + i]);
     }
+    // FP seeds (args 35..66): D-reg bit patterns (fuzzer compares D0-D31).
+    // Full 128-bit Q patterns also accepted (hex up to 32 digits) for
+    // vector-row verification (test/simd-oracle.mjs); shorter values
+    // seed the low half exactly like before.
+    for i in 0..32 {
+        if let Some(s) = args.get(35 + i) {
+            let t = s.trim_start_matches("0x");
+            cpu.q[i] = u128::from_str_radix(t, 16).unwrap();
+        }
+    }
     cpu.sp = hex(&args[33]);
     let f = &args[34];
     let fb: Vec<bool> = f.chars().map(|c| c == '1').collect();
@@ -40,6 +50,10 @@ fn main() {
     }
     let regs: Vec<String> = cpu.x.iter().map(|r| format!("{:016x}", r)).collect();
     println!("regs {}", regs.join(" "));
+    let fpregs: Vec<String> = cpu.q.iter().map(|r| format!("{:016x}", (*r as u64))).collect();
+    println!("fpregs {}", fpregs.join(" "));
+    let qregs: Vec<String> = cpu.q.iter().map(|r| format!("{:032x}", r)).collect();
+    println!("qregs {}", qregs.join(" "));
     println!("sp {:016x} pc {:x}", cpu.sp, cpu.pc);
     let fl = cpu.flags();
     println!(

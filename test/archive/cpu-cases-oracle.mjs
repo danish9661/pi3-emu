@@ -1,19 +1,15 @@
-// Decoder golden test: every word comes from aarch64-none-elf-as
-// (ground-truth encodings — never hand-hex). Each word runs on pi-cpu
-// `one` with identical regs/flags/mem, comparing fault + all regs +
-// full Q regs + NZCV + scratch windows against checked-in goldens
-// (test/goldens/cpu-cases.json). The oracle differential this descends
-// from (vs unicorn.js) is archived at test/archive/cpu-cases-oracle.mjs;
-// correctness was proven there (756/756 + 35/35 SIMD rows) before the
-// unicorn removal. Goldens pin the proven behavior against regressions.
-// Usage: node test/cpu-cases.mjs [filter] [snipfilter] [--regen]
+// Decoder differential: every word comes from aarch64-none-elf-as
+// (ground-truth encodings — never hand-hex). Each word runs once on the
+// unicorn oracle and once on pi-cpu `one`, with identical regs/flags/mem,
+// comparing fault + all regs + NZCV + scratch windows.
+// Usage: node test/cpu-cases.mjs [filter]
 import { execFileSync, execSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const ROOT = join(__dirname, '..');
-const GOLD = join(__dirname, 'goldens', 'cpu-cases.json');
+import { writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+const require = createRequire('/home/danish1075/Documents/ri pi emu/packages/pi3-emu/src/index.js');
+const MUnicorn = require('/home/danish1075/Documents/ri pi emu/public/unicorn.js');
+const ucMod = await MUnicorn();
+const ROOT = '/home/danish1075/Documents/ri pi emu';
 const TC = process.env.TOOLCHAIN || (process.env.HOME + '/toolchains/arm-gnu-toolchain-13.2.Rel1-x86_64-aarch64-none-elf/bin');
 
 // ---- case list: groups of assembly snippets (one insn each) ----
@@ -123,19 +119,6 @@ const GROUPS = {
     // these here would break parity; guests never take them).
     'mov h10, v11.h[0]', 'mov h12, v13.h[3]',
   ],
-  // M49 firmware-float gap rows (all oracle-verified one by one in the
-  // simd-oracle rig before the unicorn removal; goldens pin them now).
-  simdguest: [
-    'extr x7, x7, x0, #61', 'extr x0, x1, x2, #0',
-    'movi d8, #0', 'fmov x1, v0.d[1]', 'fmov v0.d[1], x3',
-    'mov v0.16b, v1.16b', 'mov v2.8b, v0.8b',
-    'bit v0.8b, v1.8b, v2.8b', 'bif v0.8b, v1.8b, v2.8b',
-    'fneg v0.2d, v0.2d', 'mov v2.d[1], v0.d[0]',
-    'scvtf d0, d0', 'fcvtzs d1, d1',
-    'scvtf d0, d0, #1', 'scvtf d0, d0, #31', 'ucvtf d0, d0, #1',
-    'fcvtzs w1, d1, #1', 'fcvtzs x2, d2, #63', 'fcvtzu w3, d3, #1',
-    'shl d0, d0, #32', 'sshr d1, d1, #1',
-  ],
 };
 
 // operand vectors: { regs: fn(i)->hex, sp, nzcv }
@@ -167,9 +150,8 @@ const VECTORS = [
   },
 ];
 
-const filter = (process.argv[2] && !process.argv[2].startsWith('--')) ? process.argv[2] : '';
-const snipfilter = (process.argv[3] && !process.argv[3].startsWith('--')) ? process.argv[3] : '';
-const REGEN = process.argv.includes('--regen');
+const filter = process.argv[2] || '';
+const snipfilter = process.argv[3] || '';
 // assemble all snippets in one file
 let asm = '.text\n';
 const names = [];
@@ -177,8 +159,8 @@ for (const [g, list] of Object.entries(GROUPS)) {
   if (filter && g !== filter) continue;
   list.forEach((s, i) => {
     if (snipfilter && !s.includes(snipfilter)) return;
-    asm += `${g}_${i}: ${s}\n`;
-    names.push([g, i, s]);
+    asm += `${g}_${names.length}: ${s}\n`;
+    names.push([g, names.length, s]);
   });
 }
 writeFileSync('/tmp/opencode/cases.s', asm);
@@ -200,61 +182,88 @@ const w8 = (x) => { const o = Buffer.alloc(8); let v = BigInt(x); for (let i = 0
 const PAT = [];
 for (let i = 0; i < 16; i++) PAT.push(...w4((0x01020304 + i * 0x11111111) >>> 0));
 
-const hx = (s) => { try { return BigInt(s.startsWith('0x') ? s : '0x' + s).toString(16); } catch { return s; } };
-// Normalized comparison record: fault + X + D-lows + FULL Q (lane ops
-// only move the top half) + SP + PC + NZCV + scratch windows.
-const norm = (o) => JSON.stringify([o.fault, o.r.map(hx), (o.fp || []).map(hx),
-  (o.q || []).map(hx), hx(o.sp), hx(o.pc), o.nzcv, o.mem]);
+async function oracle(word, regs, fds, sp, nzcv) {
+  // Fresh instance per case (closed after): instance reuse caused
+  // cross-case state pollution (a signed load read 0x16 from scrubbed
+  // zeros after unrelated cases ran) and translator-buffer exhaustion.
+  const uc = new ucMod.Unicorn(ucMod.ARCH_ARM64, ucMod.MODE_LITTLE_ENDIAN);
+  uc.mem_map(0, 0x10000, ucMod.PROT_ALL);
+  uc.mem_map(0x3f0000, 0x10000, ucMod.PROT_ALL);
+  // NOTE: mem_write needs typed arrays — plain JS Arrays silently fail.
+  uc.mem_write(0, Buffer.alloc(0x3000));
+  uc.mem_write(0x3f0000, Buffer.alloc(0x10000));
+  uc.mem_write(0x100, w4(word));
+  uc.mem_write(0x1000, Buffer.from(PAT.slice(0, 64)));
+  uc.mem_write(0x2000, Buffer.from(PAT.slice(0, 32)));
+  uc.mem_write(0x3fff00 - 64, Buffer.from(PAT.slice(0, 64)));
+  regs.forEach((v, i) => {
+    const id = i < 29 ? ucMod.ARM64_REG_X0 + i : (i === 29 ? ucMod.ARM64_REG_FP : ucMod.ARM64_REG_LR);
+    uc.reg_write_i64(id, BigInt(v));
+  });
+  fds.forEach((v, i) => {
+    uc.reg_write_i64(ucMod.ARM64_REG_D0 + i, BigInt(v));
+  });
+  uc.reg_write_i64(ucMod.ARM64_REG_SP, BigInt(sp));
+  uc.reg_write_i64(ucMod.ARM64_REG_NZCV, BigInt(parseInt(nzcv, 2) << 28));
+  let fault = null;
+  try { uc.emu_start(0x100, 0x104, 0, 1); } catch (e) { fault = String(e).split('\n')[0].slice(0, 40); }
+  const r = [];
+  for (let i = 0; i < 29; i++) r.push((BigInt(uc.reg_read_i64(ucMod.ARM64_REG_X0 + i)) & 0xffffffffffffffffn).toString(16));
+  r.push((BigInt(uc.reg_read_i64(ucMod.ARM64_REG_FP)) & 0xffffffffffffffffn).toString(16));
+  r.push((BigInt(uc.reg_read_i64(ucMod.ARM64_REG_LR)) & 0xffffffffffffffffn).toString(16));
+  const fp = [];
+  for (let i = 0; i < 32; i++) fp.push((BigInt(uc.reg_read_i64(ucMod.ARM64_REG_D0 + i)) & 0xffffffffffffffffn).toString(16));
+  const rsp = (BigInt(uc.reg_read_i64(ucMod.ARM64_REG_SP)) & 0xffffffffffffffffn).toString(16);
 
-function runOne(word, regs, fds, sp, nzcv) {
-  const args = ['0x' + word.toString(16),
-    ...regs.map((x) => '0x' + x.toString(16)), sp, nzcv,
-    ...fds.map((x) => '0x' + x.toString(16))];
-  const out = execFileSync(ROOT + '/target/debug/examples/one', args, { maxBuffer: 8 * 1024 * 1024 }).toString();
-  const L = Object.fromEntries(out.trim().split('\n').map((l) => {
-    const j = l.indexOf(' ');
-    return [l.slice(0, j), l.slice(j + 1)];
-  }));
-  return {
-    fault: L['status'] !== 'ok',
-    r: L.regs.split(' '), fp: L.fpregs.split(' '), q: L.qregs.split(' '),
-    sp: L.sp.split(' ')[0], pc: L.sp.split(' ')[2], nzcv: L.nzcv, mem: L.mem.split(' '),
-  };
+  const rpc = Number(uc.arm64_debug(5)).toString(16);
+  const rnz = (Number(uc.reg_read_i64(ucMod.ARM64_REG_NZCV)) >>> 28).toString(2).padStart(4, '0');
+  const mem = [];
+  for (const [base, len] of [[0x1000, 64], [0x2000, 32], [0x3fff00 - 64, 64]]) {
+    mem.push(Buffer.from(uc.mem_read(base, len)).toString('hex'));
+  }
+  try { uc.close(); } catch {}
+  return { fault: !!fault, r, fp, sp: rsp, pc: rpc, nzcv: rnz, mem };
 }
 
 let pass = 0, fail = 0;
 const fails = [];
-const goldens = (REGEN || !existsSync(GOLD)) ? {} : JSON.parse(readFileSync(GOLD, 'utf8'));
-const regenOut = {};
 for (let n = 0; n < names.length; n++) {
   const [g, i, src] = names[n];
   const word = parseInt(words[`${g}_${i}`], 16) >>> 0;
   for (let v = 0; v < VECTORS.length; v++) {
-    const key = `${g}_${i}_${v}`;
     const V = VECTORS[v];
     const regs = [];
     for (let k = 0; k < 31; k++) regs.push(BigInt(V.r(k)));
     const fds = [];
     for (let k = 0; k < 32; k++) fds.push(BigInt(V.fd(k)));
+    const want = await oracle(word, regs, fds, BigInt(V.sp), V.nzcv);
+    const args = ['0x' + word.toString(16),
+      ...regs.map((x) => '0x' + x.toString(16)), V.sp, V.nzcv,
+      ...fds.map((x) => '0x' + x.toString(16))];
     let got;
     try {
-      got = runOne(word, regs, fds, BigInt(V.sp), V.nzcv);
+      const out = execFileSync(ROOT + '/target/debug/examples/one', args, { maxBuffer: 8 * 1024 * 1024 }).toString();
+      const L = Object.fromEntries(out.trim().split('\n').map((l) => {
+        const j = l.indexOf(' ');
+        return [l.slice(0, j), l.slice(j + 1)];
+      }));
+      got = {
+        fault: L['status'] !== 'ok',
+        r: L.regs.split(' '), fp: L.fpregs.split(' '), sp: L.sp.split(' ')[0], pc: L.sp.split(' ')[2],
+        nzcv: L.nzcv, mem: L.mem.split(' '),
+      };
     } catch (e) { got = { fault: 'CRASH' }; }
-    if (REGEN) {
-      if (got.fault !== 'CRASH') regenOut[key] = got;
-      pass++;
-      continue;
-    }
-    const want = goldens[key];
-    if (!want) { fail++; fails.push(`${g} ${src} [V${v}] word=${words[`${g}_${i}`]}\n  DIFF: no golden (regen)`); continue; }
-    // fault pc: goldens store pi-cpu's pre-incremented pc; same build
-    // convention both sides, so compare directly (the -4 adjustment the
-    // oracle needed no longer applies).
-    // branches single-stepped: a bad target faults only at the next
-    // fetch — compare pc, not fault. Indirect branches (ret/blr) to odd
-    // targets: rounded pc — compare regs/flags only there.
+    const hx = (s) => { try { return BigInt(s.startsWith('0x') ? s : '0x' + s).toString(16); } catch { return s; } };
+    // fault pc: unicorn reports the faulting insn, pi-cpu pre-increments
+    // (same convention as cpu-diff.mjs).
+    if (want.fault && got.fault) got.pc = '0x' + ((BigInt('0x' + got.pc) - 4n) & 0xffffffffffffffffn).toString(16);
+    // branches single-stepped: a bad target faults on the fork immediately
+    // but on pi-cpu only at the next fetch — compare pc, not fault.
+    // Indirect branches (ret/blr) to odd targets: the fork reports a
+    // rounded pc — compare regs/flags only there.
     if (g === 'branch') { want.fault = false; got.fault = false; }
     if (src.startsWith('ret') || src.startsWith('blr')) { want.pc = got.pc; }
+    const norm = (o) => JSON.stringify([o.fault, o.r.map(hx), (o.fp || []).map(hx), hx(o.sp), hx(o.pc), o.nzcv, o.mem]);
     if (norm(want) === norm(got)) { pass++; }
     else {
       fail++;
@@ -263,7 +272,6 @@ for (let n = 0; n < names.length; n++) {
         if (want.fault !== got.fault) dl.push(`fault ${want.fault}/${got.fault}`);
         want.r.forEach((v, i) => { if (hx(v) !== hx(got.r[i])) dl.push(`x${i} ${hx(v)}/${hx(got.r[i])}`); });
         if (got.fp) want.fp.forEach((v, i) => { if (hx(v) !== hx(got.fp[i])) dl.push(`d${i} ${hx(v)}/${hx(got.fp[i])}`); });
-        if (got.q) want.q.forEach((v, i) => { if (hx(v) !== hx(got.q[i])) dl.push(`q${i} ${hx(v)}/${hx(got.q[i])}`); });
         if (hx(want.sp) !== hx(got.sp)) dl.push(`sp ${hx(want.sp)}/${hx(got.sp)}`);
         if (hx(want.pc) !== hx(got.pc)) dl.push(`pc ${hx(want.pc)}/${hx(got.pc)}`);
         if (want.nzcv !== got.nzcv) dl.push(`nz ${want.nzcv}/${got.nzcv}`);
@@ -272,11 +280,6 @@ for (let n = 0; n < names.length; n++) {
       }
     }
   }
-}
-if (REGEN) {
-  mkdirSync(join(__dirname, 'goldens'), { recursive: true });
-  writeFileSync(GOLD, JSON.stringify(regenOut));
-  console.log(`regenerated ${Object.keys(regenOut).length} goldens -> test/goldens/cpu-cases.json`);
 }
 console.log(`${pass} ok, ${fail} FAIL`);
 for (const f of fails) console.log(f);

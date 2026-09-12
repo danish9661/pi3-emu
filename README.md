@@ -1079,3 +1079,27 @@ dist/                 production bundle
   `public/linux-fromsrc/` and deliberately does NOT overwrite the live
   `public/linux/`; the prebuilt demo binary remains the deployed engine.
   `prepare_namespace`; fixed initramfs boots to the shell.
+- M26–M28 — Linux UX polish (hostname/MOTD, real getty+login,
+  browser→VM upload, GPIO control panel), dev rootfs with in-guest
+  `tcc`, SD snapshot Save/Load, and the true `pi3-ctl` GPIO bridge
+  (qemu device + sysfs path); see AGENTS.md.
+- M29–M32 — PWM/SPI/I2C bridges (JS + QEMU C devices), SAB on/off
+  toggle with an ST-build attempt (blocked: wasm32 JIT needs MTTCG),
+  npm workspaces (`pi3-emu` facade + `sab-toggle`).
+- M33–M39 — `pi3-emu` headless core, virtual time, AudioWorklet PWM,
+  fork patches reconstructed, MicroPython bare-metal port (REPL,
+  `machine` UART/Pin/I2C/SPI/IRQ, FAT12/VFS `/sd`, time/Timer) in
+  `ports/bcm2837`.
+- M40–M48 — `cpu/` (`pi-cpu`): own zero-dependency AArch64 interpreter
+  (~150× the fork's speed), virtual-time timer, BFM, GPIO IRQ, UART0,
+  1-source class + 756-case assembler-truth fuzzer, scalar VFP, wasm
+  build, and full device-model parity (uart1/i2c/spi/dma/pwm/mbox+FB/
+  mmu-ctl/sd/SMP); see AGENTS.md M40–M48.
+- M49 — unicorn.js deleted; pi-cpu is the only core. The demo page runs
+  `PiEmu`/`PiSmp` (wasm) for all 20 programs; `public/linux/` unchanged.
+  Fixed en route: the mailbox window shadowed by the IC range (fb),
+  8 SIMD + 8 fixed-point rows for firmware floats (all oracle-fitted),
+  and a swapped EXTR Rn/Rm (multf3 mantissa loss). Tests:
+  `test/pi-cpu-smoke.mjs` (22 goldens), `test/cpu-cases.mjs` (819),
+  9 upython suites via `test/pi-sess.mjs`; oracles archived under
+  `test/archive/`.

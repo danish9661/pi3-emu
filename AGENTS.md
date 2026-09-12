@@ -33,7 +33,11 @@ into guest memory before each slice, pull guest writes out after):
   the legacy-IC guests (irq/uart0/gpio); real CPU_INTERRUPT_HARD entry
   with native eret for the local-block guest (lirq).
 
-## Verified core facts (unicorn.js 2.2.0 build in public/)
+## Verified core facts (unicorn.js 2.2.0 build — RETIRED in M49, record kept)
+
+(The `unicorn.js` fork this section describes was deleted in M49; pi-cpu
+is the only core. The notes below remain as the historical
+reconstruction record for the bare-metal MMIO / slice work.)
 
 - Hook range end is INCLUSIVE (guard adjacent registers by address).
 - Memory hooks fire only for guest accesses, not host `mem_read/mem_write`.
@@ -1311,26 +1315,179 @@ unicorn.js stays until parity; removal is the stated end goal.
   with the 1-source arm gated off, so it belongs to the active
   facade/SDHCI/sd.elf workstream, not the decoder. MMU/local-block/
   arch-timer/SDHCI/mini-UART/firmware-REPL pi-cpu models (all working,
-  uncommitted) still need their own AGENTS.md entries.
+  in-tree as of 29ec341) still need their own AGENTS.md entries.
 
-## Key risks
+### M46 — firmware /sd mount verified (DONE, uncommitted)
 
-- Core patch (Phase 1) is the big unknown: if the unicorn.js build can't
-  be patched/rebuilt with exception injection + timer sysregs, the whole
-  plan changes (fallback: evaluate qemu-wasm embed as a second mode).
+- The `OSError: 19` / `readblocks b[0]=1` mount failure does NOT
+  reproduce on the current tree: with a fresh `make -C ports/bcm2837`,
+  guest `readblocks(0)` bytes match host `mem_read(BLOCK_DATA)` exactly
+  (`eb3c9050...`), boot auto-mounts (`/sd mounted: ['HELLO.TXT']`),
+  `os.listdir('/sd')` works, zero faults. Root cause was a stale
+  firmware build (frozen `sdcard.py` older than the model) — always
+  rebuild after touching frozen sources *or* the model ABI. Proven by
+  `test/upython-sd.mjs` 8/8 + `test/upython-vfs.mjs` 14/14 PASS (incl.
+  remount coherence) on commit `29ec341`.
+- (Separate, still open: `cpu-diff uart1/sd` parity, M45 NOTE above.)
+
+### M47 — Python runs on pi-cpu: scalar VFP + SUB/CCMP decoder fixes (DONE, uncommitted)
+
+- **VFP core:** D/S file on the Q low half (zero-extend on write;
+  d31 is real, no XZR alias). FP singles: size is `10`=S/`11`=D
+  (NOT `01` — first version faulted every S load/store; pairs use
+  `00/01/10` = S/D/Q). Extended the 0x16 pair + 0x1E single arms in
+  place (the old Q-only arms silently mis-executed S/D pairs as
+  16-byte Q). FP data-proc is a flat (mask,value) table — 76 rows,
+  machine-derived, 0 cross-collisions. `fmov`-imm expand:
+  sign=a, exp=(b?0x3FC/0x7C:0x400/0x80)|(cdefgh>>4),
+  frac=(cdefgh&15)<<off (oracle-fitted, 8+1 points). FPCR hardwired 0
+  (12 MRS reads, 0 MSR writes in the image); FPSR cumulative
+  (honest DZ/IO/OF/UF + exactness-proven IX, nothing live reads IX).
+- **Fork quirks mirrored (all probed, fuzzer-pinned):** SNaN quiets
+  preserving sign+payload (not DefaultNaN); V=1 on ANY unordered
+  compare (even quiet QNaN); FMSUB<->FNMSUB negation SWAPPED on the
+  fork (normals probe: FMSUB(2,3,4)=-2, FNMSUB=+2); away-mode
+  (frinta/fcvtas) flushes subnormal inputs to signed zero (other
+  modes unaffected — frintp/m proven clean).
+- **Fuzzer:** new `fp` group (77 snippets x 3 vectors incl. inf/NaN/
+  SNaN/subnormal/0/0 patterns = 231/231) + D0-D31 seeded/compared in
+  the harness; full battery 735/735 (245x3). Added missing arith
+  coverage: ccmp/ccmn reg+imm, csel/csinc/cset/csneg, neg/subs/adds
+  x31-vs-sp forms.
+- **SUB-shifted Rn31=XZR (was SP):** `neg x1,x1` computed SP-x1 =
+  0x3FFAAF and wild-faulted firmware (`str x0,[x25,x1,lsl#3]`);
+  form-dependent (extended keeps SP — fuzz-pinned). The old comment
+  keyed on S and had it backwards.
+- **CCMP-imm bit11 (was X[imm]):** `ccmp w0,#5` compared against X5,
+  so `<` behaved as `==` and `!=` raised TypeError (fell past the
+  equal-handler). Found via NZCV-per-step trace.
+- **Harness:** `cpu-diff` takes `PI3_KEYS` multi-key schedules on both
+  sides (run.rs already had it; fixed its tuple-sort byte-reorder)
+  and attaches SDHCI for firmware (pi-cpu disk always present).
+- **Result:** firmware keyed session (boot + `/sd mounted` + `1+1`
+  → `2`) FULL PASS console/regs/sp/pc/insns/fault; guest battery
+  green (lirq x1 chained-TB sliver only); upython-sd + upython-vfs
+  PASS on the rebuilt firmware.
+- **Open:** uart1/sd parity (unicorn faults at `adr 0x10016c`,
+  pi-cpu runs on — pre-existing, untouched); QNaN-quiet payload
+  passthrough rule untested (no fuzzer case hits it); `add sp`
+  Rd=31 write-SP latent (w() drops).
+
+### M48 — pi-cpu to wasm + device-model parity batch (DONE, uncommitted)
+
+- **Phase A (wasm core):** `cpu/src/runner.rs` (run loop moved verbatim
+  out of the `run` example — native diff and browser share it),
+  `cpu/src/wasm.rs` (`PiEmu`: load/run/console/keys/button/vt/card/
+  gpio/fault/pc/regs/mem), wasm-bindgen dep (wasm32-only).
+  `wasm-pack build` → 65 KB wasm; node smoke boots firmware to a
+  mounted REPL and runs `1+1`→`2` + sum guest. No UI wiring yet.
+- **uart1 full:** ENABLES latch + LSR + IO pulse-clear + CNTL/LCR/BAUD
+  backing + `[u1] ` line tag (uart1Emit rule); cpu-diff attaches.
+  PASS.
+- **i2c/spi slaves** (sensor 0x68, JEDEC flash): edge logic + window
+  backing; STATUS served from sync_out **snapshots** (live DONE let
+  polls exit a chunk early → constant 1-insn phase shift; i2c proved
+  it, spi needed the same); SPI CS dirty-flag (facade window shows
+  same-slice writes). i2c PASS; spi PASS.
+- **dma** (ch0 + ENABLE page as window backing, chain engine with
+  page-chunk IGNORE fills, END/INT publish, bank-1 bit16): PASS.
+  (Two traps bitten: fault-both labels read expected/actual —
+  "unicorn: true" means pi-cpu faulted; and the fault addr was
+  ENABLE+4, misread as DMA+0x54.)
+- **pwm** (CTL latch + 256 FIFO + 64/chunk drain ring + FULL/EMPT,
+  `pwm_take` for the worklet): PASS.
+- **mbox+FB** (property tags + allocate/pitch/geometry for canvas):
+  fb PASS (with vt, like clock).
+- **mmu-ctl compat:** MMU_CTL write programs the real regime
+  (TTBR0/T0SZ=16/MAIR/SCTLR.M) + `mmu_loose` dialect flag (0b01 =
+  table-descend, needed alongside strict-ARM mva blocks) + 48-bit L0
+  + device-window bypass in translate(). `test/mmu-parity.mjs`
+  (probe console vs pi-cpu run): PASS. cpu-diff keeps fault-both
+  (no attach — facade needs probe-retry there).
+- **sd:** PASS after attaching (was just a missing attach, like uart1).
+- **Process lessons (load-bearing):** rebuild BOTH debug+release after
+  lib changes (stale release trapped us 3×); fault-both "unicorn: X"
+  prints the EXPECTED literal — read the pi-cpu value.
+- **Open:** smp (needs 4 cores + 0x3F202000 spin-table; faults at
+  insn 7 now); periphs/debug fault-both by design; lirq x1 sliver;
+  M47 QNaN/add-sp notes stand.
+
+### M49 — unicorn.js removed: pi-cpu is the only core (DONE, uncommitted)
+
+unicorn.js is GONE (public/unicorn.js, packages/pi3-emu/ (facade + vendor),
+src/patches/, @alexaltea/unicorn-js dep, all *-probe oracles archived to
+test/archive/).
+The demo page (src/main.js, rewritten ~700 lines) runs PiEmu/PiSmp from
+cpu/src/wasm.rs (public/pi_cpu/, built by build.sh via wasm-pack) for all
+20 programs; public/linux/ (qemu-wasm) untouched. Verified: 16/16 browser
+boots + shell/uart REPL/float/gpio-button/fb-canvas E2Es, zero page errors.
+
+- **Mailbox shadow bug (REAL, fixed):** is_ic spans IC_BASE..MBOX_PAGE end,
+  swallowing the mailbox at 0x3F00B880 (reads hit `_ => 0`, MAIL1_WRITE
+  absorbed) — fb guest spun past the polls ("mailbox failed"). Fix: check
+  the mailbox arm BEFORE is_ic in read() AND write() (lib.rs). Lesson:
+  range-windows must be ordered narrow-first; the old facade's exact-addr
+  models never overlapped so nothing caught it (M48's "fb PASS" was both
+  sides equally broken — facade has no mailbox model).
+- **Firmware float gap (8 SIMD + 8 fixed-point rows, all oracle-fitted):**
+  movi-d, fmov x,v.d[1], fmov v.d[1],x, orr-vec, bit/bif (Vm is the
+  SELECTOR — first version had Rn/Rm swapped), fneg-2d, mov-elem-D,
+  scvtf/fcvtzs-fixed-#0 (D-file <-> D-file! int64<->double stay in Dn),
+  scvtf/ucvtf-fp-#N (fbits = 64-scale6[21:16]), fcvtzs/u-fp-#N (fbits =
+  64-scale6[15:10], float->fixed MULTIPLIES — first version divided).
+  Fixed-point #0 is a separate encoding (assembler rejects #0 for scaling
+  forms). Q=0 vector forms clear the top half (oracle-proven).
+- **EXTR Rn/Rm SWAPPED (the big one):** the extras arm computed
+  (Rn>>lsb)|(Rm<<(w-lsb)) instead of (Rn<<(w-lsb))|(Rm>>lsb) — hidden by
+  the lsb==0 and Rn==Rm (ROR-alias) cases. Symptom: multf3 mantissa lost
+  (10x10 -> 64.0), floats printed ~55x small. Found by differential
+  function-tracing (__floatunditf verified clean first, then tail
+  comparison). Methodology that paid: trace.rs (ELF+startpc+regs+patch+
+  overlay tracer), injected snippet with assembler-verified bls (gas
+  treats `bl <abs>` as relative — use explicit `bl . +/- delta` and
+  verify with objdump), per-step GPR diff vs unicorn stepper.
+- **Harness bugs bitten (all mine):** hex-vs-dec arg confusion (trace hx
+  is hex-only; sess is decimal; ASCII codes), unicorn emu_start needs LR
+  set + pc-resume loop, simd-rig Q-seed offsets/endianness, sess reply
+  ordering (fire-and-forget KEY needs discard waiters), release-vs-debug
+  staleness (ALWAYS rebuild both; a stale release mimics core bugs).
+- **SMP browser cutover:** PiSmp (512-slice, 2000 rounds) boots to the
+  full join in the page; updateStats shows park/counter/msgs.
+- **Tests now:** test/pi-cpu-smoke.mjs (22 goldens incl fb hash +
+  fault-pinned periphs/debug), test/cpu-cases.mjs (819 golden cases incl
+  simdguest group; oracle version archived; --regen), test/upython-*.mjs
+  (9 suites via test/pi-sess.mjs + cpu/examples/sess subprocess; REPL
+  floats green incl math.sqrt exact string).
+- **Open:** S-fixed-point forms skipped (unobserved, fault honestly);
+  bsl/dup-2d/ushr skipped (same); to-int-scale IX/OF flag merging is
+  approximate (nothing live reads them). `sess` pipe protocol: every
+  `_cmd` has a 240 s timeout (a dead child fails the suite LOUDLY with
+  the command shown — an early version hung silently on a lost reply),
+  fire-and-forget KEY lines consume discard-waiters in order, and
+  process-exit reaps children (suites leaked sess processes before).
+
+## Key risks (M49: unicorn retired — the first two risks below are closed)
+
+- ~~Core patch (Phase 1) is the big unknown~~ CLOSED by the M49 removal:
+  pi-cpu needs no fork patches; the only core is cpu/src/lib.rs.
 - IRQ delivery semantics must be exact (level vs edge, masking, DAIF.I).
+  (Still live inside Runner/Bus; pinned by gpio/uart0/irq/lirq goldens +
+  browser button-IRQ E2E.)
 - SDHCI/DMA under Linux is much harder than the FAT12 demo.
-- Keep M1–M19 regression green: 20 probes + browser E2Es must not break.
+- ~~Keep M1–M19 regression green: 20 probes + browser E2Es~~ SUPERSEDED:
+  test/pi-cpu-smoke.mjs (22 goldens) + test/cpu-cases.mjs (819) +
+  9 upython suites + browser E2Es (16/16 boots, REPL/float/button/fb).
 
 ## Working conventions
 
-- Build: `bash build.sh` (cargo board wasm + guest programs + copies
-  unicorn.js), then `npx vite build` for production.
-- Regression: `for p in branch csel clock dma fb gpio i2c instr irq mbox
-  mmu pwm sd smp spi stats uart0 uart1 lirq mva; do node test/$p-probe.mjs; done`
-  (all must PASS).
-- Browser E2E: vite on :5173 + headless chrome CDP (e.g. :9334), scripts
-  in /tmp/opencode/*-e2e.mjs (phase2b-e2e.mjs covers irq/uart0/lirq/gpio).
+- Build: `bash build.sh` (pi-board wasm + pi-cpu wasm via wasm-pack into
+  public/pi_cpu + guest programs), then `npx vite build` for production.
+- Regression: `node test/pi-cpu-smoke.mjs` (22 goldens),
+  `node test/cpu-cases.mjs` (819; `--regen` to re-pin),
+  `node test/upython-repl.mjs` (etc. — 9 suites via test/pi-sess.mjs +
+  `cargo build --release --example sess`).
+- Browser E2E: `npx vite preview` on :5173 + headless chrome scripts
+  (/tmp/opencode/picpu-e2e.mjs boots, picpu-interactive.mjs REPL/button).
 - Commit style: one long descriptive message per milestone, push to
   master.
 - README.md has a per-milestone History section — keep it updated.

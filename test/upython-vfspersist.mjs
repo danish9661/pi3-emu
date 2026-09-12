@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Pi3Emulator, loadUnicorn } from '../packages/pi3-emu/src/index.js';
+import { PiSess } from './pi-sess.mjs';
 
 // SD card snapshot round-trip: write files, exportCard the sector image,
 // fresh emulator + importCard before boot, boot-mounted /sd shows them.
@@ -20,17 +20,16 @@ if (!existsSync(FW)) {
   process.exit(0);
 }
 
-const ucMod = await loadUnicorn();
 const FW_BYTES = readFileSync(FW);
 async function cmd(emu, s, budget = 40000) {
   const before = emu.consoleText.length;
   for (const ch of s) {
     emu.pushKey(ch.charCodeAt(0));
-    for (let k = 0; k < 8; k++) emu.runSlice(512);
+    for (let k = 0; k < 8; k++) await emu.runSlice(512);
   }
   emu.pushKey(13);
   for (let i = 0; i < budget && (emu.consoleText.slice(before).match(/>>>/g) || []).length < 1; i++) {
-    emu.runSlice(4096);
+    await emu.runSlice(4096);
   }
   return emu.consoleText.slice(before);
 }
@@ -39,10 +38,10 @@ async function cmd(emu, s, budget = 40000) {
 // boot mount is live, so umount before the raw write (a VFS write-back
 // from its stale cache would clobber raw-written sectors), remount for
 // the VFS write.
-const emu1 = new Pi3Emulator(ucMod);
+const emu1 = new PiSess();
 emu1.attachSdhci();
 await emu1.loadFirmware(FW_BYTES);
-for (let i = 0; i < 9000 && !emu1.consoleText.includes('>>>'); i++) emu1.runSlice(4096);
+for (let i = 0; i < 9000 && !emu1.consoleText.includes('>>>'); i++) await emu1.runSlice(4096);
 await cmd(emu1, 'import sdcard, os');
 await cmd(emu1, 'os.umount("/sd")');
 check('setup write', (await cmd(emu1, 'sdcard.write("KEEP.TXT", b"persist me" * 50)')).includes('500'));
@@ -51,16 +50,16 @@ check('setup vfs write',
   (await cmd(emu1, 'f = open("/sd/VIAVFS.TXT", "w")')).includes('>>>') &&
   (await cmd(emu1, 'f.write("vfs side")')).includes('8') &&
   (await cmd(emu1, 'f.close()')).includes('>>>'));
-const image = emu1.exportCard();
+const image = await emu1.exportCard();
 check('export image', image instanceof Uint8Array && image.length % 512 === 0 && image.length >= 5 * 512,
   image ? String(image.length) : 'null');
 
 // Session 2: fresh emulator, import before boot, files survive.
-const emu2 = new Pi3Emulator(ucMod);
+const emu2 = new PiSess();
 emu2.attachSdhci();
-check('import image', emu2.importCard(image) === true);
+check('import image', await emu2.importCard(image) === true);
 await emu2.loadFirmware(FW_BYTES);
-for (let i = 0; i < 9000 && !emu2.consoleText.includes('>>>'); i++) emu2.runSlice(4096);
+for (let i = 0; i < 9000 && !emu2.consoleText.includes('>>>'); i++) await emu2.runSlice(4096);
 check('boot lists kept files', emu2.consoleText.includes('KEEP.TXT') && emu2.consoleText.includes('VIAVFS.TXT'),
   emu2.consoleText.slice(-120));
 check('kept raw file', (await cmd(emu2, 'import sdcard')).includes('>>>') &&
@@ -69,4 +68,5 @@ check('kept vfs file', (await cmd(emu2, 'open("/sd/VIAVFS.TXT").read()')).includ
 check('no faults', !emu2.lastFault, emu2.lastFault ? emu2.lastFault.message : '');
 
 if (fail.length) { console.log('UPYTHON-VFSPERSIST FAIL:', fail.join(', ')); process.exit(1); }
+emu1.close(); emu2.close();
 console.log('upython-vfspersist: PASS');
