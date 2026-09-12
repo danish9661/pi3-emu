@@ -26,10 +26,16 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - run: npm ci
+
+      # wasm-pack builds the pi-cpu browser core in build.sh (public/pi_cpu
+      # is gitignored and regenerated every build). Pinned installer is
+      # avoided on purpose: any recent wasm-pack emits compatible glue.
+      - name: Install wasm-pack
+        run: curl https://drager.github.io/wasm-pack/installer/init.sh -sSf | sh
 
       # The Linux boot image (qemu-system-aarch64.data, ~38 MB initramfs) and its
       # matching load.js are COMMITTED, so the deploy is self-contained: the

@@ -1466,6 +1466,37 @@ boots + shell/uart REPL/float/gpio-button/fb-canvas E2Es, zero page errors.
   fire-and-forget KEY lines consume discard-waiters in order, and
   process-exit reaps children (suites leaked sess processes before).
 
+### M50 — M30 peripheral windows in pi-cpu: every program green (DONE, uncommitted)
+
+periphs + debug were the last two fault-pinned guests (all other 20
+pass). The M30 windows now live in Bus, ported from the deleted facade
+models (recovered from git history as spec):
+
+- RNG 0x3F104000: CTRL latch (default 0) + fixed 45000 temp DATA
+  (mirrors rng.js/temp.js); CLK 0x3F100000, I2S 0x3F203000, BSC0
+  0x3F205000: zero windows (absorbing — guests only read them at rest).
+- AUX UART2-5 (0x3F216000/7000/8000/9000): per-UART window backing +
+  ENABLES latch, LSR served live (0x60 when enabled, mirrors uart25.js).
+  The existing UART1 ENABLES cell already satisfies the SPI1/SPI2
+  ENABLES read-back the periphs guest checks (same +0x04 address).
+- USB 0x3F980000 len 0x40000 (range check, no backing): GSNPSID reads
+  0x4F54280A (the debug guest accepts ONLY 280A while periphs accepts
+  either — both are real DWC2 revs, so serve 280A); writes to +0xFF0
+  (periphs) or +0x54 (debug) set usb_done → `done_flag` sel 7, wired
+  to periphs/debug DONE branches in src/main.js.
+- All new windows join the mapped-set + `is_device_win` (MMU bypass).
+- Debug guest fixes (its expectations, not the models — models match
+  real HW + the old facade): CLO mask → top byte (wall-clock race),
+  FR expect → 0x90 (idle TXFE|RXFE), MAIL1_STATUS expect → 0 (never
+  full at idle), SPI0 CS expect → 0x40000 (TXD always drained).
+- Result: periphs ALL PASS (8 checks + parked), debug 22/22 ALL PASS,
+  fault null. Smoke goldens updated (no more fault-pinned guests);
+  pw-verify 27/27 in the browser.
+- **Open (carried):** S-fixed forms, bsl/dup-2d/ushr, IX/OF merging
+  (unchanged); M30 windows beyond what the two guests touch (RNG
+  FIFO/IRQ, clock ENAB/BUSY behavior, I2S FIFOs, USB OTG) remain
+  stubs — enough for the guests, honest about the rest.
+
 ## Key risks (M49: unicorn retired — the first two risks below are closed)
 
 - ~~Core patch (Phase 1) is the big unknown~~ CLOSED by the M49 removal:
@@ -1490,5 +1521,11 @@ boots + shell/uart REPL/float/gpio-button/fb-canvas E2Es, zero page errors.
   (/tmp/opencode/picpu-e2e.mjs boots, picpu-interactive.mjs REPL/button).
 - Commit style: one long descriptive message per milestone, push to
   master.
+- CI (`.github/workflows/pages.yml`, deploys Pages on push to master):
+  node 22 (matches local + puppeteer engines), `npm ci`, wasm-pack via
+  the official installer (build.sh hard-requires it for public/pi_cpu),
+  then `npm run build`. After adding/removing a workspace package, run
+  `npm install` locally — `npm ci` fails when package-lock.json is out
+  of sync (seen when packages/pi3-emu was deleted).
 - README.md has a per-milestone History section — keep it updated.
 - Update this file as the plan evolves.
