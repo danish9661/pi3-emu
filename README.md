@@ -1128,3 +1128,29 @@ dist/                 production bundle
   ST deep execution stays upstream-blocked (49a56a7: dies on escaped
   setjmp/longjmp), so the entry is an explicit attempt/observe path
   for real browsers, verified here for wiring only.
+- M53 — own-kernel track, second blood (EL2→EL1 drop, UNCOMMITTED):
+  `ports/rpi-kernel/` now boots the 09_privilege_level shape — `_start`
+  checks CurrentEL==EL2 + MPIDR core 0 + CNTFRQ≠0, then `rust_main`
+  drops via SPSR_EL2/ELR_EL2/SP_EL1 + `eret`; `kernel_el1` prints
+  CurrentEL, the 19.2 MHz timer freq, spins 1 s on CNTPCT, then echoes
+  (`Echoing input now` + `[echo 'c']`). pi-cpu gained CurrentEL,
+  MPIDR_EL1, CNTFRQ_EL0 reads + SPSR_EL2/ELR_EL2/SP_EL1 latches +
+  HCR/CNTHCTL/CNTVOFF absorbs + a real EL2→EL1 `eret` (all encodings
+  from assembler truth). The reference tutorial
+  (`ports/rust-raspberrypi-OS-tutorials/`, .git stripped so git tracks
+  it as plain files) is vendored for the porting work. Verified:
+  native run prints EL2 banner + EL1/freq/spin/echo, fault null;
+  fuzzer 882/882, smoke 23/23, browser rpikernel (banner/EL1/echo,
+  zero page errors).
+- M54 — own-kernel bring-up batch (UNCOMMITTED): driver structure
+  (NullLock + DriverManager + console/print! + PL011/GPIO BSP,
+  dep-free on stable, UART CR=0/ICR/IBRD=1/FBRD=40/LCRH/CR=0x301) +
+  sync SVC round-trip (VBAR+0x200 entry, EC 0x15/ISS 0x1337/ELR
+  print, ELR+=4 skip, native eret) + 4K identity MMU
+  (L1[0]=0x401 1G block, TTBR0=0x280000, TCR=0x3519, MAIR=0xFF,
+  SCTLR.M, MMIO bypass) + 3 arch-timer IRQs (VBAR+0x280, TVAL
+  re-arm, CTL=0 conclude, SRC 0x2). Core: ESR/FAR/DAIF MRS+MSR,
+  SPSR/ELR_EL1 MSR latch (was no-op), SVC sync entry, LDRH/STRH
+  integer-halfword fix (was Illegal), CNTVOFF `msr xzr` absorb.
+  Kernel POST: EL2 banner → VBAR → EL1 → freq → drivers → SVC →
+  MMU → 3×timer → echo. Smoke golden updated (16 console strings).

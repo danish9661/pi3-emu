@@ -33,7 +33,9 @@ async function boot(prog) {
   };
 }
 
-// Sync guests: boot text goldens.
+// Sync guests: boot text goldens. rpikernel is NOT sync — its POST
+// (SVC→MMU→3×1s timer ticks) takes ~20M insns, so it gets its own
+// patient boot below instead of the 2.5 s golden path.
 const goldens = {
   shell: 'Hi\n>',
   sum: 'sum demo',
@@ -53,7 +55,6 @@ const goldens = {
   sd: 'payload matches',
   uart0: 'RXINTR armed',
   upython: '>>>',
-  rpikernel: 'Echoing input now',
   periphs: 'ALL PASS',
   debug: 'ALL PASS',
   bench: 'benchmark',
@@ -61,6 +62,31 @@ const goldens = {
 for (const [prog, want] of Object.entries(goldens)) {
   const { status, term } = await boot(prog);
   ok(`boot ${prog}`, status.startsWith('booted') && term.includes(want), status.slice(0, 60));
+}
+
+// rpikernel: patient boot (M54 POST takes ~20M insns: SVC→MMU→3 ticks),
+// then a typed key reaches the echo loop via the rAF push_key path.
+{
+  await page.selectOption('#prog', 'rpikernel');
+  await page.click('#run');
+  await page.waitForFunction(
+    () => /booted|warn:|ERROR|guest fault/.test(document.getElementById('status').textContent),
+    { timeout: TIMEOUT }
+  );
+  let rkterm = '';
+  for (let i = 0; i < 40; i++) {
+    await page.waitForTimeout(3000);
+    rkterm = await page.$eval('#term', (e) => e.textContent);
+    if (rkterm.includes('Echoing input now')) break;
+  }
+  const rkstatus = await page.$eval('#status', (e) => e.textContent);
+  ok('boot rpikernel', rkstatus.startsWith('booted') && rkterm.includes('Echoing input now')
+    && rkterm.includes('SVC EC 0x15') && rkterm.includes('[timer 3]'), rkstatus.slice(0, 60));
+  await page.click('#term');
+  await page.keyboard.type('H');
+  await page.waitForTimeout(8000);
+  rkterm = await page.$eval('#term', (e) => e.textContent);
+  ok('rpikernel echo H', rkterm.includes("[echo 'H']"));
 }
 
 // Interactive: shell typing.

@@ -377,6 +377,28 @@ function runUntilIdle() {
   return out;
 }
 
+// M54 kernel POST: fixed virtual-time budget, not TX-silence — the
+// kernel spends megainsns between prints (SVC→MMU→3×1s timer ticks)
+// and runUntilIdle's 2-quiet-slice break would stop 8k insns in,
+// inside the SVC glue, leaving #term empty. Mirrors the native smoke
+// budget (20M insns @ 4096 slices); keys typed later are picked up by
+// the sync rAF loops (irqRun path below handles rpikernel like upython).
+function runKernelPost() {
+  let out = '';
+  // ~20M insns; slice loop breaks early on guest fault (runSlice
+  // catches into faultStreak — stop feeding a faulted core).
+  for (let i = 0; i < 5000; i++) {
+    out += runSlice(SLICE_INSNS);
+    updateStats();
+    const halted = faultHalted();
+    if (halted) break;
+    // Early exit once the echo loop is up (saves ~seconds of spinning:
+    // the POST prints Echoing input now right before parking on getc).
+    if (out.includes('Echoing input now')) break;
+  }
+  return out;
+}
+
 // Explicit-done guests (clock/gpio/mmu/dma/pwm/i2c/spi/sd): slices until
 // the guest writes its DONE cell (polled via PiEmu.done()).
 function runUntilDone(prog) {
@@ -513,13 +535,15 @@ function blit() {
   fbCtx.putImageData(img, 0, 0);
 }
 
-// The irq, lirq and upython guests never park (infinite spin with IRQs
-// unmasked), so they run on rAF slices; IRQ delivery happens inside the
-// core at chunk boundaries (host-assisted IRQ_RET resume or native eret).
+// The irq, lirq, upython and rpikernel guests never park (infinite spin
+// with IRQs unmasked), so they run on rAF slices; IRQ delivery happens
+// inside the core at chunk boundaries (host-assisted IRQ_RET resume or
+// native eret). rpikernel joins this loop after runKernelPost so typed
+// keys reach its echo loop (handleKey's rAF path pushes directly).
 function irqRun() {
   let out = '';
   const frame = () => {
-    if (mode !== IRQ_MODE && mode !== LIRQ_MODE && mode !== UPY_MODE) return;
+    if (mode !== IRQ_MODE && mode !== LIRQ_MODE && mode !== UPY_MODE && mode !== 'rpikernel') return;
     const t0 = performance.now();
     do {
       out += runSlice(SLICE_INSNS);
@@ -632,7 +656,7 @@ function guestKey(code) {
 
 function handleKey(e) {
   if (!pi || runBtn.disabled) return;
-  if (mode === IRQ_MODE || mode === LIRQ_MODE || mode === UPY_MODE) {
+  if (mode === IRQ_MODE || mode === LIRQ_MODE || mode === UPY_MODE || mode === 'rpikernel') {
     // Continuous rAF loop picks the key up at the next slice.
     const c = e.key.length === 1 ? e.key.charCodeAt(0) : e.key === 'Enter' ? 13 : 0;
     if (!c) return;
@@ -658,7 +682,7 @@ function handleKey(e) {
 // On-screen keyboard: feed the same guestKey path as physical keys.
 function tapKeys(btn) {
   if (!pi || runBtn.disabled) return;
-  if (mode === IRQ_MODE || mode === LIRQ_MODE || mode === UPY_MODE) {
+  if (mode === IRQ_MODE || mode === LIRQ_MODE || mode === UPY_MODE || mode === 'rpikernel') {
     const action = btn.dataset.action;
     const push = (c) => { try { pi.push_key(c); } catch (_) {} };
     if (action === 'enter') {
@@ -833,7 +857,14 @@ async function run() {
     } else if (sel === 'rpikernel') {
       mode = 'rpikernel';
       await bootProg(PROGRAMS.rpikernel);
-      draw(runUntilIdle()); // M52 kernel: banner + getc echo loop at 0x80000
+      // M54: the kernel idles on vt-driven timer ticks, not on TX
+      // silence — runUntilIdle would break after 2 quiet slices (8k
+      // insns), deep inside the SVC glue, and leave #term empty. Run
+      // a virtual-time POST budget instead (same shape as the smoke
+      // golden: 20M insns covers EL2→SVC→MMU→3 ticks; the echo loop
+      // then stays live for typed keys via the sync rAF loops below).
+      draw(runKernelPost());
+      irqRun(); // keep the echo loop + timer IRQs live; keys via push_key
       setStatus(
         `booted — running rpikernel — own Rust kernel @ 0x80000, PL011 echo — type a key`
       );

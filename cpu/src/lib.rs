@@ -2134,6 +2134,30 @@ pub struct Cpu {
     /// them in the vector glue and eret back).
     pub elr_el1: u64,
     pub spsr_el1: u64,
+    /// EL2 drop state for the M53 kernel track (rust-raspberrypi-OS
+    /// 09_privilege_level shape): SPSR_EL2/ELR_EL2 latched by MSR,
+    /// SP_EL1 latched by MSR, current EL (2 at reset, 1 after an
+    /// EL2->EL1 eret). HCR/CNTHCTL/CNTVOFF MSRs are absorbed (no trap
+    /// model yet). Encodings from assembler truth (see M53 AGENTS entry):
+    /// CurrentEL MRS=0xD5384240, MPIDR_EL1 MRS=0xD53800A1,
+    /// CNTFRQ_EL0 MRS=0xD53BE002, SPSR_EL2=0xD53C4003/0xD51C4004,
+    /// ELR_EL2=0xD53C4025/0xD51C4026, SP_EL1=0xD51C4107/0xD53C4108,
+    /// HCR_EL2=0xD51C1109, CNTHCTL=0xD53CE10A/0xD51CE10B,
+    /// CNTVOFF=0xD51CE06C, eret=0xD69F03E0.
+    pub spsr_el2: u64,
+    pub elr_el2: u64,
+    pub sp_el1: u64,
+    pub cur_el: u8,
+    spsr_el2_msrd: bool,
+    /// M54 sync-exception state (ch11/12 shape): ESR_EL1/FAR_EL1
+    /// filled on SVC entry; ESR MSR absorbed (MRS returns the latched
+    /// syndrome). Encodings from assembler truth: ESR MRS=0xD5385200,
+    /// MSR=0xD5185200; FAR MRS=0xD5386000; DAIF MRS=0xD53B4220 (MSR
+    /// 0xD51B4220 writes the 4-bit field); ELR {3,0,4,0,1}
+    /// MRS=0xD5384020/MSR=0xD5184020; SPSR {3,0,4,0,0}
+    /// MRS=0xD5384000/MSR=0xD5184000; SVC=0xD4+imm16.
+    pub esr_el1: u64,
+    pub far_el1: u64,
     n: bool,
     z: bool,
     c: bool,
@@ -2147,7 +2171,7 @@ pub struct Cpu {
 
 impl Cpu {
     pub fn new(entry: u64) -> Self {
-        Cpu { x: [0; 31], sp: 0, pc: entry, q: [0; 32], vbar_el1: 0, daif: 0xf, elr_el1: 0, spsr_el1: 0, n: false, z: false, c: false, v: false, fpsr_cum: 0 }
+        Cpu { x: [0; 31], sp: 0, pc: entry, q: [0; 32], vbar_el1: 0, daif: 0xf, elr_el1: 0, spsr_el1: 0, spsr_el2: 0, elr_el2: 0, sp_el1: 0, cur_el: 2, spsr_el2_msrd: false, esr_el1: 0, far_el1: 0, n: false, z: false, c: false, v: false, fpsr_cum: 0 }
     }
 
     #[inline]
@@ -2634,6 +2658,31 @@ impl Cpu {
 
     /// ERET: restore N/Z/C/V + DAIF from SPSR_EL1, resume at ELR_EL1.
     pub fn eret(&mut self) {
+        if self.cur_el == 2 && self.spsr_el2_msrd {
+            // EL2->EL1 drop (M53 kernel track, 09_privilege_level shape):
+            // consume the latched SPSR_EL2/ELR_EL2, mask DAIF like the
+            // SPSR's I bit says, switch the stack to SP_EL1, report EL1.
+            // cur_el==2 ONLY happens after an explicit MSR to an EL2
+            // register (spsr_el2_msrd below): IRQ-entry guests resume at
+            // EL1 with SPSR_EL1/ELR_EL1 (the pre-M53 path) and must NOT
+            // take this branch (lirq's native eret died here: spsr_el2
+            // reads 0 -> pc=0 -> Illegal(0) at 4117).
+            let s = self.spsr_el2;
+            self.n = (s >> 31) & 1 != 0;
+            self.z = (s >> 30) & 1 != 0;
+            self.c = (s >> 29) & 1 != 0;
+            self.v = (s >> 28) & 1 != 0;
+            let i = (s >> 7) & 1 != 0;
+            if i {
+                self.daif |= 0x2;
+            } else {
+                self.daif &= !0x2;
+            }
+            self.sp = self.sp_el1;
+            self.pc = self.elr_el2;
+            self.cur_el = 1;
+            return;
+        }
         let s = self.spsr_el1;
         self.n = (s >> 31) & 1 != 0;
         self.z = (s >> 30) & 1 != 0;
@@ -3023,8 +3072,25 @@ impl Cpu {
             }
             return Ok(());
         }
-        // Exception-generating (SVC/HVC/SMC/BRK/...): out of scope.
+        // Exception-generating: SVC only (M54 ch12 shape). SVC fills
+        // ESR_EL1 (EC=0x15, ISS=imm16) and takes the EL1h sync vector
+        // synchronously: ELR=fault pc, SPSR=pstate(), DAIF masked,
+        // pc=VBAR+0x200. Anything else in 0xD4 (HVC/SMC/BRK/...):
+        // out of scope as before. Encoding: SVC word=0xD4+imm16<<5+01
+        // (low byte 0x01; HVC is 0x02, SMC 0x03 — the old (w&0xff)==1
+        // test was right for the wrong reason, documented here so it
+        // survives: `svc #0x1337`=0xD40266E1 ends 0xE1, NOT 0x01).
         if (w >> 24) == 0xD4 {
+            if (w & 0b11) == 0b01 {
+                let imm = ((w >> 5) & 0xffff) as u64;
+                self.esr_el1 = (0x15 << 26) | imm;
+                self.elr_el1 = pc;
+                self.spsr_el1 = self.pstate();
+                self.daif = 0xf;
+                let vbar = if self.vbar_el1 == 0 { 0x100000 } else { self.vbar_el1 };
+                self.pc = vbar + 0x200;
+                return Ok(());
+            }
             return Err(ill);
         }
         // Hints (NOP/ISB/DMB/DSB/...): functional no-ops in this model.
@@ -3083,11 +3149,45 @@ impl Cpu {
                     self.w(rd, v, true);
                 }
             } else if op0 == 3 && op1 == 0 && crn == 4 && crm == 0 && (op2 == 0 || op2 == 1) {
-                // SPSR_EL1 {3,0,4,0,0} / ELR_EL1 {3,0,4,0,1} (op2 picks).
-                // MRS returns the entry snapshot; MSR is a no-op.
-                if l != 0 {
+                // SPSR_EL1 {3,0,4,0,0} MRS=0xD5384000/MSR=0xD5184000 /
+                // ELR_EL1 {3,0,4,0,1} MRS=0xD5384020/MSR=0xD5184020
+                // (op2 picks). M54: MSR latches (the handler context
+                // restore needs it); MRS returns the entry snapshot.
+                if l == 0 {
+                    let v = self.r(rd);
+                    if op2 == 0 {
+                        self.spsr_el1 = v;
+                    } else {
+                        self.elr_el1 = v;
+                    }
+                } else {
                     let v = if op2 == 0 { self.spsr_el1 } else { self.elr_el1 };
                     self.w(rd, v, true);
+                }
+            } else if op0 == 3 && op1 == 0 && crn == 5 && crm == 2 && op2 == 0 {
+                // ESR_EL1 {3,0,5,2,0} MRS=0xD5385200/MSR=0xD5185200:
+                // syndrome filled by SVC entry (MRS returns it, MSR
+                // absorbs like hardware's syndrome write).
+                if l == 0 {
+                    self.esr_el1 = self.r(rd);
+                } else {
+                    let v = self.esr_el1;
+                    self.w(rd, v, true);
+                }
+            } else if op0 == 3 && op1 == 0 && crn == 6 && crm == 0 && op2 == 0 {
+                // FAR_EL1 {3,0,6,0,0} MRS=0xD5386000: fault address
+                // (MRS only; MSR absorbed — data-abort slice fills it).
+                if l != 0 {
+                    let v = self.far_el1;
+                    self.w(rd, v, true);
+                }
+            } else if op0 == 3 && op1 == 3 && crn == 4 && crm == 2 && op2 == 1 {
+                // DAIF {3,3,4,2,1} MRS=0xD53B4220/MSR=0xD51B4220:
+                // the 4-bit field (bit3=D,bit2=A,bit1=I,bit0=F).
+                if l != 0 {
+                    self.w(rd, self.daif as u64, true);
+                } else {
+                    self.daif = (self.r(rd) & 0xf) as u8;
                 }
             } else if op0 == 3 && op1 == 3 && crn == 4 && crm == 2 && op2 == 0 {
                 // NZCV {3,3,4,2,0} (MRS/MSR differ in L only).
@@ -3147,6 +3247,84 @@ impl Cpu {
                     self.daif &= !(crm as u8 & 0xf);
                 } else {
                     self.daif |= crm as u8 & 0xf;
+                }
+            } else if op0 == 3 && op1 == 0 && crn == 4 && crm == 2 && op2 == 2 {
+                // CurrentEL {3,0,4,2,2} MRS=0xD5384240: report the EL.
+                // (NOT {3,0,0,0,2} — first cut used a hand-derived
+                // encoding and the kernel parked at 0x8004C forever;
+                // CRn=4/CRm=2 straight from the objdump above.)
+                if l != 0 {
+                    self.w(rd, (self.cur_el as u64) << 2, true);
+                }
+            } else if op0 == 3 && op1 == 0 && crn == 0 && crm == 0 && op2 == 5 {
+                // MPIDR_EL1 {3,0,0,0,5} MRS=0xD53800A1: single core 0,
+                // like the old facade unicorn core (affinity 0).
+                if l != 0 {
+                    self.w(rd, 0, true);
+                }
+            } else if op0 == 3 && op1 == 3 && crn == 14 && crm == 0 && op2 == 0 {
+                // CNTFRQ_EL0 {3,3,14,0,0} MRS=0xD53BE002: the real Pi 3
+                // arch-timer rate (19.2 MHz). The 09 boot.s parks when
+                // this reads 0; pi-cpu always reports the hardware rate.
+                if l != 0 {
+                    self.w(rd, 19_200_000, true);
+                }
+            } else if op0 == 3 && op1 == 0 && crn == 0 && crm == 0 && op2 == 5 {
+                // MPIDR_EL1 {3,0,0,0,5} MRS=0xD53800A1: single core 0.
+                if l != 0 {
+                    self.w(rd, 0, true);
+                }
+            } else if op0 == 3 && op1 == 3 && crn == 14 && crm == 0 && op2 == 0 {
+                // CNTFRQ_EL0 {3,3,14,0,0} MRS=0xD53BE002: real Pi 3 rate.
+                if l != 0 {
+                    self.w(rd, 19_200_000, true);
+                }
+            } else if op0 == 3 && op1 == 4 && crn == 4 && crm == 0 && (op2 == 0 || op2 == 1) {
+                // SPSR_EL2 {3,4,4,0,0} / ELR_EL2 {3,4,4,0,1} (op2 picks,
+                // MRS=0xD53C4003/0xD53C4025, MSR=0xD51C4004/0xD51C4026):
+                // latched by MSR, consumed by the EL2->EL1 eret.
+                if l == 0 {
+                    let v = self.r(rd);
+                    if op2 == 0 {
+                        self.spsr_el2 = v;
+                        // Gate for the EL2->EL1 eret branch: only an
+                        // explicit MSR SPSR_EL2 arms it (IRQ-entry guests
+                        // resumewith SPSR_EL1/ELR_EL1 and must not drop).
+                        self.spsr_el2_msrd = true;
+                    } else {
+                        self.elr_el2 = v;
+                    }
+                } else if op2 == 0 {
+                    let v = self.spsr_el2;
+                    self.w(rd, v, true);
+                } else {
+                    let v = self.elr_el2;
+                    self.w(rd, v, true);
+                }
+            } else if op0 == 3 && op1 == 4 && crn == 4 && crm == 1 && op2 == 0 {
+                // SP_EL1 {3,4,4,1,0} (MSR=0xD51C4107, MRS=0xD53C4108):
+                // the EL1 stack the eret drop installs.
+                if l == 0 {
+                    self.sp_el1 = self.r(rd);
+                } else {
+                    let v = self.sp_el1;
+                    self.w(rd, v, true);
+                }
+            } else if op1 == 4 && ((crn == 1 && crm == 1 && op2 == 1)
+                || (crn == 14 && crm == 1 && (op2 == 1 || op2 == 3))
+                || (crn == 14 && crm == 0 && op2 == 3))
+            {
+                // EL2 timer/trap setup with no trap model yet (absorbed):
+                // HCR_EL2 {3,4,1,1,1} MSR=0xD51C1109, CNTHCTL_EL2
+                // {3,4,14,1,1}: MRS 0xD53CE11F/MSR 0xD51CE11F (Rd field
+                // differs MRS xzr=11111 vs MSR — match by fields, not
+                // word), CNTVOFF_EL2 {3,4,14,0,3}: rustc emits
+                // `msr cntvoff_el2,xzr`=0xD51CE07F (Rd=11111 leaks into
+                // the CRm/op2 field — op2 reads 3 either way, gate on
+                // the register not the exact word).
+                // MRS reads return 0.
+                if l != 0 {
+                    self.w(rd, 0, true);
                 }
             }
             // Anything else (cache ops, PMU, ...): no-op.
@@ -3451,6 +3629,9 @@ impl Cpu {
         }
 
         // STR/LDR (unsigned imm, unscaled, pre/post-index, register offset)
+        // M54: bit26==0/size==1 (LDRH/STRH, e.g. `ldrh w11,[x8,#8]`=
+        // 0x7940110B) is the INTEGER halfword form, not SIMD — the old
+        // gate faulted it as Illegal. Only bit26==1 diverts to SIMD.
         if ((w >> 25) & 0x1f) == 0x1c {
             let size = bits(w, 31, 30);
             if bits(w, 26, 26) == 1 {

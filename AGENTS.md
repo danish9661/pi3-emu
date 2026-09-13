@@ -1577,6 +1577,121 @@ Verified here: page wiring (iframe src, xterm/engine start, zero
 page errors); full ST shell boot still requires a real browser and
 remains blocked upstream.
 
+### M53 — own-kernel EL2→EL1 drop (DONE, uncommitted)
+
+Second blood on the own-kernel track (`ports/rpi-kernel/`): the kernel
+now boots the rust-raspberrypi-OS **09_privilege_level** shape instead
+of the M52 bare print loop. `_start` checks `CurrentEL==EL2` (0x8,
+else park), `MPIDR` core 0 (else park), zeroes `.bss`, requires
+`CNTFRQ_EL0≠0` (else park — all three parks are the 09 `boot.s`
+shape, `wfe` replaced by a plain spin since pi-cpu no-ops `wfe`),
+then `rust_main(stack_top)` prints the EL2 banner and drops via
+`CNTHCTL/CNTVOFF/HCR` (absorbed) + `SPSR_EL2=0x3C5` (D/A/I/F masked,
+M=EL1h) + `ELR_EL2=kernel_el1` + `SP_EL1` + `eret`. `kernel_el1`
+prints `CurrentEL`, the timer frequency, spins 1 s on `CNTPCT`, then
+echoes (`Echoing input now` + `[echo 'c']` — the 09 `kernel_main`
+tail). Reference vendored at
+`ports/rust-raspberrypi-OS-tutorials/` (full clone, `.git` stripped
+so git tracks it as plain files — a nested `.git` would break the
+outer repo; 15 MB / 1213 files, kept whole so any chapter's driver
+can be ported next without re-fetching).
+
+pi-cpu core additions (all encodings from
+`aarch64-none-elf-as`/`objdump`, never hand-hex):
+- `Cpu`: `spsr_el2/elr_el2/sp_el1/cur_el(2 at reset)/spsr_el2_msrd`
+  fields.
+- MRS: CurrentEL `{3,0,4,2,2}`→`cur_el<<2`, MPIDR_EL1 `{3,0,0,0,5}`→0
+  (single core 0), CNTFRQ_EL0 `{3,3,14,0,0}`→19_200_000 (the real Pi
+  3 rate; 09 parks on 0).
+- MSR latches: SPSR_EL2/ELR_EL2 `{3,4,4,0,0/1}` (MSR SPSR arms
+  `spsr_el2_msrd`), SP_EL1 `{3,4,4,1,0}`; absorbs HCR_EL2
+  `{3,4,1,1,1}`, CNTHCTL_EL2 `{3,4,14,1,1}` (note: real op2=1 —
+  `msr cnthctl_el2,xzr`=0xD51CE11F — first cut used op2=0 and the
+  kernel parked), CNTVOFF_EL2 `{3,4,14,0,3}`.
+- `eret()`: when `cur_el==2 && spsr_el2_msrd` (explicit EL2 MSR seen),
+  consume SPSR_EL2/ELR_EL2 (NZCV + I-bit→DAIF.I), install SP_EL1,
+  `cur_el=1`, resume at ELR. The `spsr_el2_msrd` gate is load-bearing:
+  without it lirq's native EL1 eret (SPSR_EL1 path, zero EL2 regs)
+  wrongly took the EL2 branch → pc=0 → `Illegal(0)` at insn 4117
+  (caught by smoke: 22/23, lirq FAIL; fixed to 23/23).
+- Lesson repeated: hand-derived encodings lie — CurrentEL is
+  `{3,0,4,2,2}` (`mrs x0,currentel`=0xD5384240), NOT `{3,0,0,0,2}`;
+  the first cut parked the kernel at 0x8004C forever.
+
+Verified by execution (NOT committed, per user instruction): native
+`run rpi-kernel.elf 20000000 ... 72 15000000` prints EL2 banner +
+`in EL1 (CurrentEL 0x4)` + `timer freq 19200000 Hz` + spin + echo,
+fault null; fuzzer 882/882; smoke 23/23; `npx vite build` clean;
+browser rpikernel on the rebuilt wasm prints banner/EL1/freq/spin +
+typed `[echo 'H']` with zero page errors (the pre-rebuild preview
+served a stale ELF — rebuilt `dist/` fixed it).
+
+### M54 — own-kernel bring-up batch (DONE, uncommitted)
+
+Four tutorial tracks landed in `ports/rpi-kernel/` at once (designed
+by 4 parallel research subagents, integrated single-handed to avoid
+merge conflicts — the user asked about multi-agent editing: parallel
+`edit` calls to the same files race and conflict, so research fanned
+out but all writes went through one integrator):
+
+**A. Driver structure** (dep-free 05 shape): `synchronization.rs`
+(NullLock), `driver.rs` (Manager, 2 slots), `console.rs`
+(Write/Read/All, no statistics), `print.rs` (`print!`/`println!`
+via `format_args!` — NO nightly `format_args_nl!`, stable 1.97.1),
+`bsp/uart.rs` (PL011 raw volatile: CR=0 → ICR=0x7FF → IBRD=1 →
+FBRD=40 → LCRH=0x70 → CR=0x301; FR TXFF/BUSY spins are model
+no-ops, CR must keep bit9+bit0 or keys drop), `bsp/gpio.rs` (pins
+14/15 ALT0 + PUD dance, absorbed), `bsp/driver.rs` (GPIO+UART
+statics, map→register→init→register-console). Panic handler prints
+raw `PANIC` over the UART (a silent spin cost a full debug round —
+the first M54 boot printed nothing with fault null because
+`print!` ran before `register_console` and died in `expect()`).
+`main.rs` ordering bug of the same family: `install_vectors` ran
+before `init_drivers` and its `adr x0,vec_start` word never
+executed — banner first, then drivers, then VBAR.
+
+**B. Sync SVC** (ch12 shape): `SVC #imm` fills ESR (EC=0x15,
+ISS=imm16) + ELR=pc + SPSR=pstate() + DAIF mask + pc=VBAR+0x200
+synchronously in `step()` (NOT chunk-edge like IRQ). Vector glue
+saves x0/x1, calls `svc_handler(elr,spsr,esr)` printing EC/ISS/ELR,
+then ELR+=4 skip + native eret. Core fixes: SPSR_EL1/ELR_EL1 MSR
+now latch (were no-ops — handler `eret` needs them); ESR_EL1
+MRS/MSR + FAR_EL1 MRS + DAIF MRS/MSR added (all words from
+`aarch64-none-elf-as`, never hand-hex). Lesson: SVC low bits are
+`0b01` (`svc #0x1337`=0xD40266E1 ends 0xE1) — the first gate tested
+`(w&0xff)==1` and faulted `Illegal(0xD40266E1)`.
+
+**C. Timer IRQ** (ch20 + lirq shape): `kernel_el1` arms TVAL=freq +
+CTL=1 + `daifclr`, handler prints `[timer N] src`, re-arms ×2 then
+CTL=0 conclude + TIMER_DONE. `LOCAL+0x60` reads 0x2 (CNTPNS, GPU
+clear). Native `eret` (cur_el==1 path). Smoke: 3 ticks then echo.
+
+**D. Identity MMU** (mva 4K shape, NOT the tutorial's 64K — the core
+is 4K-only and faults TG0≠4K): `asm_clear_l1` (naked, x9-x11)
+zeroes 0x280000 (a Rust loop kept base in a caller-saved reg the
+`mmu: off` print clobbered → Translation at TTBR0 write), L1[0]=
+0x401, TCR=0x3519 (T0SZ=25/TG0=4K), MAIR=0xFF, TTBR0=0x280000,
+SCTLR.M|C|I, ISBs. Post-MMU rule (load-bearing): NO `adrp` to
+`.data` statics after enable — rustc's pre-enable-PC page math
+mis-forms (`UnmappedData(0x124F810)` killed the timer handler's
+TIMER_COUNT adrp AND the UART static's adrp); `adr` (±1 MB,
+PC-exact) everywhere in handler/poll paths (`sym` operands).
+`kernel.ld` pins `.data` at 0x90000 (RAM + adrp/adr range) and
+`.tables` at 0x280000.
+
+**Core LDRH fix (real decoder bug):** `ldrh w11,[x8,#8]`=
+0x7940110B faulted `Illegal` — the 0x1C arm diverted bit26==0/
+size==1 to SIMD. Truth: bit26==1 is SIMD; bit26==0/size==1 is the
+integer halfword form (same arm as LDRB/W). One-line gate fix.
+
+Verified by execution (NOT committed, per user rule): native
+`run rpi-kernel.elf 20000000 ... 72 16000000` prints the full POST
+(EL2 banner → VBAR → EL1 → freq → drivers → SVC EC/ISS/ELR →
+after → mmu off/on → 3×timer → echo H), fault null; fuzzer
+882/882; smoke 23/23; `npm run build` clean. Browser + docs are
+the two remaining boxes (vite preview + Playwright rpikernel,
+AGENTS M54 + README entries — this text).
+
 ## Key risks (M49: unicorn retired — the first two risks below are closed)
 
 - ~~Core patch (Phase 1) is the big unknown~~ CLOSED by the M49 removal:
