@@ -53,6 +53,7 @@ const goldens = {
   sd: 'payload matches',
   uart0: 'RXINTR armed',
   upython: '>>>',
+  rpikernel: 'Echoing input now',
   periphs: 'ALL PASS',
   debug: 'ALL PASS',
   bench: 'benchmark',

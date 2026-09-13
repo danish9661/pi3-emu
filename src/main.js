@@ -15,6 +15,7 @@ const DONE_SLICES = 30000; // safety cap for the explicit-done guests
 const FB_ADDR = 0x200000; // allocated framebuffer inside guest RAM
 
 const LINUX_MODE = 'linux';
+const LINUX_ST_MODE = 'linux-st';
 const SMP_MODE = 'smp';
 const CLOCK_MODE = 'clock';
 const GPIO_MODE = 'gpio';
@@ -53,6 +54,7 @@ export const PROGRAMS = {
   uart0: 'uart0.elf',
   lirq: 'lirq.elf',
   upython: 'firmware.elf',
+  rpikernel: 'rpi-kernel.elf',
   periphs: 'periphs.elf',
   debug: 'debug.elf',
   bench: 'bench.elf',
@@ -70,7 +72,7 @@ try {
   }
 } catch (_) {}
 function syncLinuxSels() {
-  const show = progSel.value === LINUX_MODE ? 'inline-block' : 'none';
+  const show = (progSel.value === LINUX_MODE || progSel.value === LINUX_ST_MODE) ? 'inline-block' : 'none';
   if (linuxConfigSel) linuxConfigSel.style.display = show;
   if (linuxThreadsSel) linuxThreadsSel.style.display = show;
 }
@@ -564,7 +566,8 @@ function smpRunSync() {
 // rather than driving it from JS: the page wires xterm to the emulated
 // PL011 via xterm-pty and boots the raspi3ap machine (4x Cortex-A53, 512 MB)
 // with the prebuilt kernel8.img + DTB + busybox rootfs.
-function runLinux() {
+function runLinux(base, forcedThreads) {
+  base = base || './linux/index.html';
   cancelAnimationFrame(gpioFrame);
   cancelAnimationFrame(fbFrame);
   cancelAnimationFrame(irqFrame);
@@ -580,10 +583,10 @@ function runLinux() {
   const linuxBoot = document.getElementById('linuxBoot');
   if (linuxBoot) { linuxBoot.hidden = false; linuxBoot.textContent = 'booting Linux…'; }
   const cfg = linuxConfigSel ? linuxConfigSel.value : 'minimal';
-  const threads = linuxThreadsSel ? linuxThreadsSel.value : 'auto';
+  const threads = forcedThreads || (linuxThreadsSel ? linuxThreadsSel.value : 'auto');
   window.__linuxConfig = cfg;
   window.__linuxThreads = threads;
-  const linuxUrl = './linux/index.html#cfg=' + encodeURIComponent(cfg) +
+  const linuxUrl = base + '#cfg=' + encodeURIComponent(cfg) +
     '&threads=' + encodeURIComponent(threads);
   // Always boot a FRESH iframe: reusing one via src=/location assignment is
   // unreliable when only the hash changes (cfg/threads live in the hash) —
@@ -600,7 +603,10 @@ function runLinux() {
   term.parentNode.insertBefore(frame, term.nextSibling);
   frame.src = linuxUrl;
   frame.hidden = false;
-  setStatus('booting Linux (' + cfg + ' / threads ' + threads + ') — qemu-wasm raspi3ap — serial console in the frame below');
+  const engineTag = base.indexOf('linux-st') !== -1
+    ? 'qemu-wasm raspi3ap single-thread engine (no SharedArrayBuffer needed)'
+    : 'qemu-wasm raspi3ap';
+  setStatus('booting Linux (' + cfg + ' / threads ' + threads + ') — ' + engineTag + ' — serial console in the frame below');
   hint.textContent = 'Linux runs in the embedded frame (threads: auto = MTTCG when isolated, else single-thread fallback). Press Reboot to reload the VM.';
   runBtn.textContent = 'Reboot';
   runBtn.disabled = false;
@@ -683,6 +689,16 @@ async function run() {
   // not by the pi-cpu core — bail out before initializing anything.
   if (progSel.value === LINUX_MODE) {
     runLinux();
+    return;
+  }
+  if (progSel.value === LINUX_ST_MODE) {
+    // Direct boot of the dedicated single-thread engine (public/linux-st/,
+    // initramfs boot, no SharedArrayBuffer needed). This bypasses the
+    // sentinel-gated auto-handoff in public/linux/index.html: an explicit
+    // user choice to try the ST engine. Deep ST execution is still the
+    // upstream-blocked path (see README/M32 + 49a56a7); this option makes
+    // the attempt observable in a real browser.
+    runLinux('./linux-st/index.html', 'off');
     return;
   }
   cancelAnimationFrame(gpioFrame);
@@ -813,6 +829,13 @@ async function run() {
       draw(runUntilIdle()); // second console: parks on getc like the shell
       setStatus(
         `booted — running uart1 — BCM2835 AUX mini UART @ 0x3F215000 — output tagged [u1] — press Reboot to re-run`
+      );
+    } else if (sel === 'rpikernel') {
+      mode = 'rpikernel';
+      await bootProg(PROGRAMS.rpikernel);
+      draw(runUntilIdle()); // M52 kernel: banner + getc echo loop at 0x80000
+      setStatus(
+        `booted — running rpikernel — own Rust kernel @ 0x80000, PL011 echo — type a key`
       );
     } else if (sel === 'sd') {
       mode = 'sd';

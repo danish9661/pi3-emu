@@ -1115,3 +1115,16 @@ dist/                 production bundle
   exact large ints). One genuine oracle divergence kept spec-correct:
   the stock fork's BSL uses Rd-as-selector (truth-table-proven fork
   bug, zero hits in any guest). Fuzzer 882/882, smoke 22/22.
+- M52 — own-kernel track opens + single-thread Linux gets its own boot
+  entry: `ports/rpi-kernel/` (standalone crate, `kernel.ld` at the real
+  Pi boot address `0x80000`, `_start` sets SP + zeroes `.bss`, PL011
+  print + `Echoing input now` echo loop — the 05_gpio_uart milestone
+  shape) runs first-try green on pi-cpu (banner + `[echo 'H']`, fault
+  null), wired as the `rpikernel` demo program + smoke golden via
+  `build-kernel.sh` (hooked into `build.sh`). The demo also gains a
+  separate `linux-st` option that boots `public/linux-st/` directly
+  (threads forced off, initramfs path) instead of only via the
+  sentinel-gated auto-handoff; no `.bootable` sentinel is created —
+  ST deep execution stays upstream-blocked (49a56a7: dies on escaped
+  setjmp/longjmp), so the entry is an explicit attempt/observe path
+  for real browsers, verified here for wiring only.

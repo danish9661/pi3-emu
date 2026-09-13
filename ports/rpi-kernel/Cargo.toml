@@ -1,0 +1,15 @@
+[package]
+name = "rpi-kernel"
+version = "0.1.0"
+edition = "2021"
+
+# Own workspace: detached from programs/ (0x100000 guests) and the root
+# workspace (host targets) so plain `cargo build` nowhere tries to build
+# an aarch64-unknown-none bare-metal kernel for the host.
+[workspace]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"

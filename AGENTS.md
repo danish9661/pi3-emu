@@ -1532,6 +1532,51 @@ IX/OF), all oracle-fitted against the stock core before its removal
 - **Open (carried):** BSL-vs-oracle divergence (documented above,
   inert); M30 stubs (unchanged).
 
+### M52 — kernel track opens + linux-st direct boot option (DONE, uncommitted)
+
+Two independent slices in one commit (user asked for a single commit):
+
+**A. Own-Rust-kernel track (first blood).** `ports/rpi-kernel/` is a
+standalone crate (own `[workspace]` — detached from `programs/` at
+0x100000 and the root host workspace, so no default `cargo build`
+touches it): `kernel.ld` `ENTRY(_start)` at `0x80000` (the real Pi
+boot address; `load_elf` honors `e_entry`, verified `Entry 0x80000`
+via readelf), `_start` sets SP to `0x3FFFF0` + zeroes `.bss` via
+`__bss_start/__bss_end` + `b rust_main`, `rust_main` inits the PL011
+(115200 @ 3 MHz, 8N1, UARTEN|TXE|RXE), prints
+`rpi-kernel M52: hello from 0x80000` + `Echoing input now` (the
+05_drivers_gpio_uart shape), then echoes each key as
+`[echo 'c']`. Only proven pi-cpu instructions (no EL/MMU/timer yet —
+still the stretch list). Build: `build-kernel.sh` (own
+`.cargo/config.toml` with `-Tkernel.ld` + `rust-lld`), hooked into
+`build.sh`; ELF committed at `public/programs/rpi-kernel.elf`.
+Wired as the `rpikernel` demo program (`PROGRAMS` + select + idle
+branch — the getc spin idles like the shell) + smoke golden (key
+`H`@40000) + pw-verify golden. Verified first-try:
+`run rpi-kernel.elf 200000 ... 72 40000` prints banner + echo,
+fault null.
+- Stretch (still open): CNTFRQ_EL0/CurrentEL/MPIDR reads,
+  ELR/SPSR/SP_EL1 latch for an EL2→EL1 `eret` drop, 4K MMU at EL1,
+  CNTPCT tick + local-block wiring, SMP spin tables — the gap table
+  from the M51 audit.
+
+**B. `linux-st` direct boot option.** The demo had only `linux`
+(MT engine); the ST engine was reachable solely via the
+sentinel-gated auto-handoff (`__pi3NeedSt` → `../linux-st/.bootable`,
+never created since ST deep execution is upstream-blocked: 49a56a7
+— RR `rr_cpu_thread_fn` init got past `tb_ptr_ptr`, then ~5 min
+silent, death on uncaught `Infinity` = escaped setjmp/longjmp across
+private heaps; needs main-thread-only execution upstream, not
+flags). New `linux-st` select option boots `public/linux-st/
+index.html` directly with threads forced `off` (initramfs path,
+`runLinux('./linux-st/index.html', 'off')` in `src/main.js`) —
+bypassing the handoff gate as an explicit attempt/observe path.
+Deliberately NO `.bootable` sentinel: creating one would assert a
+verified shell boot and flip auto-handoff into a known-dying engine.
+Verified here: page wiring (iframe src, xterm/engine start, zero
+page errors); full ST shell boot still requires a real browser and
+remains blocked upstream.
+
 ## Key risks (M49: unicorn retired — the first two risks below are closed)
 
 - ~~Core patch (Phase 1) is the big unknown~~ CLOSED by the M49 removal:

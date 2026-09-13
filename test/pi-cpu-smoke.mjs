@@ -59,6 +59,8 @@ const CASES = [
   ['sd', 'sd', ['200000'], {}, { console: ['HELLO'], fault: 'null' }],
   ['uart0', 'uart0', ['200000', '4096', '262144', '0', '0', '0', '72', '40000'], {},
     { console: ['uart0', "[rx 'H']"], fault: 'null' }],
+  ['rpi-kernel', 'rpi-kernel', ['200000', '4096', '0', '0', '0', '0', '72', '40000'], {},
+    { console: ['rpi-kernel M52', 'Echoing input now', "[echo 'H']"], fault: 'null' }],
   ['firmware-boot', 'firmware', ['2002944', '4096', '262144'], {},
     { console: ['/sd mounted', 'MicroPython', '>>>'], fault: 'null' }],
   ['bench', 'bench', ['200000'], {}, { console: ['benchmark'], fault: 'null' }],
