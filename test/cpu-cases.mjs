@@ -135,6 +135,25 @@ const GROUPS = {
     'scvtf d0, d0, #1', 'scvtf d0, d0, #31', 'ucvtf d0, d0, #1',
     'fcvtzs w1, d1, #1', 'fcvtzs x2, d2, #63', 'fcvtzu w3, d3, #1',
     'shl d0, d0, #32', 'sshr d1, d1, #1',
+    // M51 S-fixed + bit-select + dup/ushr rows (every word from
+    // aarch64-none-elf-as; verified against the stock-unicorn oracle in
+    // /tmp/opencode/verify51.mjs (values + Q tops) and verify-flags.mjs
+    // (values + FPSR, incl. adversarial single-rounding sweep) before
+    // pinning here. Notes: S-fixed int side is the low S32 (high D/Q
+    // bits ignored); `ucvtf s0, s0` plain needed its own row (0x7E21D800);
+    // BSL is spec-order (Vm selector) — the stock oracle computes
+    // (Rn&Rd)|(Rm&~Rd) there (truth-table-proven oracle bug), so BSL
+    // goldens pin the architecture behavior, grounded via oracle BIT;
+    // DUP-from-XZR verified (=0) but excluded from the fuzzer per plan.
+    'scvtf s0, s0, #1', 'scvtf s0, s0, #31', 'scvtf s0, s0, #32',
+    'ucvtf s0, s0, #1', 'scvtf s0, s0', 'ucvtf s0, s0',
+    'fcvtzs w0, s0, #1', 'fcvtzs w0, s0, #31',
+    'fcvtzs x0, s0, #1', 'fcvtzs x0, s0, #63',
+    'fcvtzu w0, s0, #1', 'fcvtzu x0, s0, #1',
+    'bsl v0.8b, v1.8b, v2.8b', 'bsl v3.16b, v4.16b, v5.16b',
+    'dup v0.2d, x0', 'dup v3.2d, x7',
+    'ushr d0, d0, #1', 'ushr d0, d0, #63', 'ushr d0, d0, #64',
+    'ushr v0.2d, v0.2d, #1', 'ushr v0.2d, v0.2d, #64',
   ],
 };
 

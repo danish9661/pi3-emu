@@ -62,9 +62,15 @@ const CASES = [
   ['firmware-boot', 'firmware', ['2002944', '4096', '262144'], {},
     { console: ['/sd mounted', 'MicroPython', '>>>'], fault: 'null' }],
   ['bench', 'bench', ['200000'], {}, { console: ['benchmark'], fault: 'null' }],
-  // Fault-by-design (unmapped-window probes): console shape + fault pinned.
-  ['periphs', 'periphs', ['200000'], {}, { console: [], fault: 'UnmappedData(1058029568)' }],
-  ['debug', 'debug', ['200000'], {}, { console: ['pi3-emu debug'], fault: 'UnmappedData(1058029568)' }],
+  ['periphs', 'periphs', ['2000000'], {}, {
+    console: ['RNG CTRL OK', 'Temperature OK', 'Clock Manager OK', 'I2S OK',
+      'SPI1 ENABLES OK', 'USB GSNPSID OK', 'UART2-5 LSR OK', 'ALL PASS'],
+    fault: 'null',
+  }],
+  ['debug', 'debug', ['500000'], {}, {
+    console: ['debug/diagnostic', 'ALL PASS', 'Pass: 22'],
+    fault: 'null',
+  }],
 ];
 
 let pass = 0, fail = 0, skip = 0;

@@ -1497,6 +1497,41 @@ models (recovered from git history as spec):
   FIFO/IRQ, clock ENAB/BUSY behavior, I2S FIFOs, USB OTG) remain
   stubs — enough for the guests, honest about the rest.
 
+### M51 — decoder completions (DONE, uncommitted)
+
+Closed the carried M49/M50 opens (S-fixed-point, bsl/dup-2d/ushr,
+IX/OF), all oracle-fitted against the stock core before its removal
+(restored to /tmp from git for the purpose; rigs live only in
+/tmp/opencode/, never in-repo):
+
+- S-fixed mirrors: scvtf/ucvtf s,s,#N (same 64-scale rule, 32-bit int
+  side, high D/Q bits ignored) + #0 plains. **Find:** the first cut
+  missed the `ucvtf s0, s0` plain row (0x7E21D800) — pi-cpu faulted
+  where the oracle executes; added.
+- BSL `.8b/.16b`: Vm-selector order like BIT/BIF. **Oracle divergence
+  (independently re-verified, kept spec-correct):** the stock fork
+  computes Rd=(Rn&Rd)|(Rm&~Rd) (Rd as selector — truth-table-proven
+  over machine-checked classes; its BIT implements the identical
+  formula correctly and agrees with ours exactly, so this is a
+  BSL-only fork bug). Inert: zero BSL hits in all 23 guest ELFs.
+- DUP `.2d` from X (full-Q replicate; XZR→0 verified, excluded from
+  the fuzzer), USHR D + `.2d` (shift=128-imm7, #64→0, D top zeroed),
+  pre-existing EOR-`.8b` top-clear (never checked before — confirmed).
+- IX exactness (REAL bug, fixed): `fp_from_int` fired IX on magnitude
+  (`mag > 2^53/2^24`), over-firing on exactly-representable large
+  ints (2^30→f32, 2^60→f64); now a significance test
+  (`bitlen − trailing_zeros ≤ 53/24`, `fp_sig_bits`). Fixed-point
+  single-rounding proven, not assumed: int→float scale is
+  exponent-only/exact and significand-preserving (so the one check
+  covers the scaled quotient), float→fixed widen+scale exact with a
+  single truncation — 706 adversarial value+flag cases + 1800
+  randomized int×fbits cases, all green.
+- Fuzzer: 21 snippets appended to `simdguest`, goldens regenerated
+  (882/882, old 819 byte-identical — zero drift); smoke 22/22,
+  upython-repl PASS, browser `1.5+2.25→3.75` green on the rebuilt wasm.
+- **Open (carried):** BSL-vs-oracle divergence (documented above,
+  inert); M30 stubs (unchanged).
+
 ## Key risks (M49: unicorn retired — the first two risks below are closed)
 
 - ~~Core patch (Phase 1) is the big unknown~~ CLOSED by the M49 removal:

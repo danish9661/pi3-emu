@@ -26,6 +26,19 @@ pub const DMA_ENABLE_PAGE: u64 = 0x3f00e000; // ENABLE lives here (facade maps t
 pub const PWM_BASE: u64 = 0x3f20c000; // PWM FIFO-mode + audio samples
 pub const SMP_BASE: u64 = 0x3f202000; // SMP spin-table mailbox (host-arbitrated)
 pub const SD_BASE: u64 = 0x3f300000;
+// M30 windows (periphs/debug guests): HW RNG + temp (shared block),
+// clock manager, I2S/PCM, BSC0, AUX mini-UARTs 2-5, DWC2 USB (SNPSID +
+// DONE only — no full OTG model).
+pub const RNG_BASE: u64 = 0x3f104000;
+pub const CLK_BASE: u64 = 0x3f100000;
+pub const I2S_BASE: u64 = 0x3f203000;
+pub const I2C0_BASE: u64 = 0x3f205000;
+pub const UART2_BASE: u64 = 0x3f216000;
+pub const UART3_BASE: u64 = 0x3f217000;
+pub const UART4_BASE: u64 = 0x3f218000;
+pub const UART5_BASE: u64 = 0x3f219000;
+pub const USB_BASE: u64 = 0x3f980000;
+pub const USB_LEN: u64 = 0x40000;
 pub const IC_BASE: u64 = 0x3f00b200;
 /// Magic cell for host-assisted IRQ resume (mirrors the facade's
 /// IC_BASE+0x2C protocol): the vector glue writes nonzero, the harness
@@ -146,6 +159,16 @@ pub struct Bus {
     uart1_back: [u32; 64],
     uart1_enabled: bool,
     uart1_line_start: bool,
+    // M30 windows (periphs/debug guests — mirrors rng.js, clockmgr.js,
+    // i2s.js, uart25.js, usb.js): RNG CTRL latch (DATA reads a fixed
+    // 45.0 C like the temp model), AUX mini-UART 2-5 window backing +
+    // enable latches (LSR served live), USB park flag (SNPSID + DONE
+    // only). CLK/I2S/I2C0 are zero windows (absorbing, like the
+    // facade's untouched windows).
+    rng_ctrl: u32,
+    uart25_back: [[u32; 64]; 4],
+    uart25_enabled: [bool; 4],
+    usb_done: bool,
     // I2C window backing (DLEN/A/FIFO/DONE cells; C/S are computed).
     // I2C window backing (DLEN/A/FIFO/DONE cells; C/S are computed).
     i2c_back: [u32; 32],
@@ -276,6 +299,10 @@ impl Bus {
             uart1_back: [0; 64],
             uart1_enabled: false,
             uart1_line_start: true,
+            rng_ctrl: 0,
+            uart25_back: [[0; 64]; 4],
+            uart25_enabled: [false; 4],
+            usb_done: false,
             i2c_back: [0; 32],
             i2c_pub_c: 0,
             i2c_pub_s: 0,
@@ -392,6 +419,33 @@ impl Bus {
         Self::is_page(addr, size, SMP_BASE)
     }
 
+    fn is_rng(addr: u64, size: u64) -> bool {
+        Self::is_page(addr, size, RNG_BASE)
+    }
+
+    fn is_clk(addr: u64, size: u64) -> bool {
+        Self::is_page(addr, size, CLK_BASE)
+    }
+
+    fn is_i2s(addr: u64, size: u64) -> bool {
+        Self::is_page(addr, size, I2S_BASE)
+    }
+
+    fn is_i2c0(addr: u64, size: u64) -> bool {
+        Self::is_page(addr, size, I2C0_BASE)
+    }
+
+    fn is_uart25(addr: u64, size: u64) -> bool {
+        Self::is_page(addr, size, UART2_BASE)
+            || Self::is_page(addr, size, UART3_BASE)
+            || Self::is_page(addr, size, UART4_BASE)
+            || Self::is_page(addr, size, UART5_BASE)
+    }
+
+    fn is_usb(addr: u64, size: u64) -> bool {
+        addr >= USB_BASE && addr.checked_add(size).map_or(false, |e| e <= USB_BASE + USB_LEN)
+    }
+
     /// Mapped device windows (any access size starting inside one). The
     /// host-assisted guests (mmu) leave MMIO unmapped in their tables
     /// and rely on the host bypass (like the facade, whose windows stay
@@ -412,6 +466,12 @@ impl Bus {
             || Self::is_pwm(addr, 1)
             || Self::is_dma(addr, 1)
             || Self::is_mmuctl(addr, 1)
+            || Self::is_rng(addr, 1)
+            || Self::is_clk(addr, 1)
+            || Self::is_i2s(addr, 1)
+            || Self::is_i2c0(addr, 1)
+            || Self::is_uart25(addr, 1)
+            || Self::is_usb(addr, 1)
     }
 
     /// DMA ch0 window cell: CS/CONBLK_AD in the channel window, ENABLE
@@ -892,7 +952,8 @@ impl Bus {
     /// Explicit-done park flag per guest (the browser's runUntil*Done
     /// loops poll this instead of JS model state): 0 = clock/gpio
     /// (TMR+0x20), 1 = mmu (MMU_CTL+0x04), 2 = dma (ENABLE+0x54),
-    /// 3 = pwm (+0x54), 4 = i2c (+0x54), 5 = spi (+0x54), 6 = sd (+0x54).
+    /// 3 = pwm (+0x54), 4 = i2c (+0x54), 5 = spi (+0x54), 6 = sd (+0x54),
+    /// 7 = periphs/debug (USB DONE: +0xFF0 or +0x54).
     /// Window-backed cells read their backing; absorbed writes (spi/sd)
     /// are carried by latches. Anything else reads 0.
     pub fn done_flag(&self, sel: u32) -> u32 {
@@ -904,6 +965,7 @@ impl Bus {
             4 => self.i2c_back.get(0x54 / 4).copied().unwrap_or(0) != 0,
             5 => self.spi_done,
             6 => self.sd_done,
+            7 => self.usb_done,
             _ => false,
         };
         b as u32
@@ -1368,6 +1430,56 @@ impl Bus {
             };
             return Ok(v & mask(size));
         }
+        // M30 windows (periphs/debug guests): RNG CTRL latch + fixed
+        // 45.0 C temp DATA (mirrors rng.js/temp.js), zero CLK/I2S/I2C0
+        // windows, AUX UART2-5 (ENABLES latch + live LSR, mirrors
+        // uart25.js), USB GSNPSID + DONE park (mirrors usb.js).
+        if Self::is_rng(addr, size) {
+            let v: u64 = match addr - RNG_BASE {
+                0x00 => self.rng_ctrl as u64,
+                0x04 => 45000,
+                _ => 0,
+            };
+            return Ok(v & mask(size));
+        }
+        if Self::is_clk(addr, size) || Self::is_i2s(addr, size) || Self::is_i2c0(addr, size) {
+            return Ok(0); // untouched windows read zero, like the facade
+        }
+        if Self::is_uart25(addr, size) {
+            let bases = [UART2_BASE, UART3_BASE, UART4_BASE, UART5_BASE];
+            let mut k = 0usize;
+            for (i, b) in bases.iter().enumerate() {
+                if addr >= *b {
+                    k = i;
+                }
+            }
+            let off = addr - bases[k];
+            let v: u64 = match off {
+                // LSR served live (mirrors uart25.js syncOut): TX_EMPTY
+                // + TX_IDLE once enabled, else 0.
+                0x54 => {
+                    if self.uart25_enabled[k] {
+                        (1 << 5) | (1 << 6)
+                    } else {
+                        0
+                    }
+                }
+                _ => {
+                    let idx = (off / 4) as usize;
+                    self.uart25_back[k].get(idx).copied().unwrap_or(0) as u64
+                }
+            };
+            return Ok(v & mask(size));
+        }
+        if Self::is_usb(addr, size) {
+            // DWC2 core revision (real 4.20a ID; the debug guest only
+            // accepts 280A while periphs accepts either — serve 280A).
+            let v: u64 = match addr - USB_BASE {
+                0x40 => 0x4f54_280a,
+                _ => 0,
+            };
+            return Ok(v & mask(size));
+        }
         // DMA ch0 + ENABLE page: full window backing (the facade
         // windows are RAM — guest writes read back until sync_out
         // overwrites CS; sync_in pulls CS/CONBLK/ENABLE from here).
@@ -1654,6 +1766,52 @@ impl Bus {
                         self.uart1_tx(b);
                     }
                 }
+            }
+            return Ok(());
+        }
+        // M30 windows: RNG CTRL latch (DATA is the fixed temp read);
+        // CLK/I2S/I2C0 absorb; AUX UART2-5 window backing + ENABLES
+        // latch (mirrors uart25.js syncIn: sticky on any nonzero write);
+        // USB park (periphs writes +0xFF0, debug writes +0x54 — either
+        // parks the guest, like the facade's USB_DONE).
+        if Self::is_rng(addr, size) {
+            if addr - RNG_BASE == 0x00 {
+                self.rng_ctrl = (val & mask(size)) as u32;
+            }
+            return Ok(());
+        }
+        if Self::is_clk(addr, size) || Self::is_i2s(addr, size) || Self::is_i2c0(addr, size) {
+            return Ok(());
+        }
+        if Self::is_uart25(addr, size) {
+            let bases = [UART2_BASE, UART3_BASE, UART4_BASE, UART5_BASE];
+            let mut k = 0usize;
+            for (i, b) in bases.iter().enumerate() {
+                if addr >= *b {
+                    k = i;
+                }
+            }
+            let off = addr - bases[k];
+            let idx = (off / 4) as usize;
+            if let Some(cell) = self.uart25_back[k].get_mut(idx) {
+                let base = (off % 4) as u32;
+                for i in 0..size {
+                    let sh = 8 * (base + i as u32);
+                    if sh < 32 {
+                        *cell &= !(0xff << sh);
+                        *cell |= (((val >> (8 * i)) & 0xff) as u32) << sh;
+                    }
+                }
+                if off == 0x04 && *cell != 0 {
+                    self.uart25_enabled[k] = true;
+                }
+            }
+            return Ok(());
+        }
+        if Self::is_usb(addr, size) {
+            let off = addr - USB_BASE;
+            if (off == 0xff0 || off == 0x54) && val != 0 {
+                self.usb_done = true;
             }
             return Ok(());
         }
@@ -2262,7 +2420,17 @@ impl Cpu {
     }
 
     /// Int-to-float convert (SCVTF/UCVTF). IXC iff the integer is not
-    /// exactly representable (|v| > 2^53 double / 2^24 single).
+    /// exactly representable. That is a SIGNIFICAND test, not a magnitude
+    /// test: an integer is exact iff it is zero or its significant-bit
+    /// count (bit-length minus trailing zeros) fits the mantissa (53 for
+    /// double, 24 for single). The old `mag > 2^53/2^24` check over-fired
+    /// IX on exactly-representable large values (e.g. 2^30 -> f32, 2^60
+    /// -> f64) — proven against the oracle (fixed-point flag suite:
+    /// oracle FPSR.IX=0 where we set it). Scaling by 2^fbits in the
+    /// fixed-point rows is exponent-only (exact, no over/underflow in
+    /// these ranges) and preserves the significand, so this single check
+    /// is also the honest IX for the SCALED quotient — no separate
+    /// scaled-exactness analysis needed.
     fn fp_from_int(&mut self, v: u64, ibits: u32, unsigned: bool, is64fp: bool) -> u64 {
         if is64fp {
             let r: f64 = match (ibits, unsigned) {
@@ -2277,7 +2445,7 @@ impl Cpu {
                 (_, false) => (v as i32).unsigned_abs() as u128,
                 _ => (v as u32) as u128,
             };
-            if r.is_finite() && mag > (1u128 << 53) {
+            if r.is_finite() && fp_sig_bits(mag) > 53 {
                 self.fpsr_set(4);
             }
             r.to_bits()
@@ -2294,7 +2462,7 @@ impl Cpu {
                 (_, false) => (v as i32).unsigned_abs() as u128,
                 _ => (v as u32) as u128,
             };
-            if r.is_finite() && mag > (1u128 << 24) {
+            if r.is_finite() && fp_sig_bits(mag) > 24 {
                 self.fpsr_set(4);
             }
             r.to_bits() as u64
@@ -2648,6 +2816,20 @@ fn fp_is_snan64(b: u64) -> bool {
 #[inline]
 fn fp_is_snan32(b: u32) -> bool {
     b & 0x7f80_0000 == 0x7f80_0000 && b & 0x0040_0000 == 0 && b & 0x003f_ffff != 0
+}
+
+/// Significant-bit count of a nonzero magnitude (bit-length minus
+/// trailing zeros); zero has none. An integer is exactly representable
+/// as an IEEE float iff this fits the mantissa (53 double / 24 single).
+/// Used for honest IXC on int->float converts (oracle-proven: the old
+/// magnitude test over-fired on exact powers like 2^30->f32).
+#[inline]
+fn fp_sig_bits(mag: u128) -> u32 {
+    if mag == 0 {
+        0
+    } else {
+        128 - mag.leading_zeros() - mag.trailing_zeros()
+    }
 }
 
 /// Quiet a signaling NaN preserving sign+payload (fork-verified: the
@@ -3677,6 +3859,54 @@ impl Cpu {
                 self.q[rd as usize] = r as u128;
                 return Ok(());
             }
+            // BSL .8b/.16b (assembler truth dec51.s; two arrangement rows
+            // like EOR; Q=0 clears the top half — oracle-confirmed).
+            // Operand order is the ARCHITECTURE order (Vm is the selector:
+            // Rd = (Rn&Rm)|(Rd&~Rm), identical to BIT). WARNING: the stock
+            // unicorn oracle implements BSL WRONG — truth-table-proven over
+            // 7 input classes to compute Rd=(Rn&Rd)|(Rm&~Rd) (Rd as
+            // selector, Rm/Rd swapped in the helper), i.e. it behaves as
+            // AND when Rd=0. Its BIT/BIF/EOR/ORR are all correct (BIT even
+            // agrees with our BSL, same formula), so this is a BSL-only
+            // oracle bug — do NOT "fit" BSL to the oracle output. Kept
+            // spec-correct; no live guest executes BSL (zero hits in the
+            // firmware image).
+            if (w & 0xffe0_fc00) == 0x2e60_1c00 || (w & 0xffe0_fc00) == 0x6e60_1c00 {
+                let qd = self.q[rd as usize];
+                let qn = self.q[rn as usize];
+                let qm = self.q[rm as usize];
+                let r = (qn & qm) | (qd & !qm);
+                self.q[rd as usize] = if bits(w, 30, 30) == 0 {
+                    r & 0xffff_ffff_ffff_ffff
+                } else {
+                    r
+                };
+                return Ok(());
+            }
+            // DUP .2d from X (M51): replicate the general register into
+            // both double lanes (full Q write, no top question).
+            if (w & 0xffff_fc00) == 0x4e08_0c00 {
+                let v = self.r(rn) as u128;
+                self.q[rd as usize] = v | (v << 64);
+                return Ok(());
+            }
+            // USHR (immediate) D-lane + .2d vector (M51, dec51.s):
+            // logical shift = 128-imm7 (imm7 = bits[22:16]); shift 64
+            // yields zero. D top half zeroed (oracle-fitted).
+            if (w & 0xffc0_fc00) == 0x7f40_0400 {
+                let sh = 128 - ((w >> 16) & 0x7f);
+                let v = if sh >= 64 { 0 } else { self.fr(rn) >> sh };
+                self.q[rd as usize] = v as u128;
+                return Ok(());
+            }
+            if (w & 0xffc0_fc00) == 0x6f40_0400 {
+                let sh = 128 - ((w >> 16) & 0x7f);
+                let q = self.q[rn as usize];
+                let lane = |x: u64| if sh >= 64 { 0 } else { x >> sh };
+                self.q[rd as usize] =
+                    (lane(q as u64) as u128) | ((lane((q >> 64) as u64) as u128) << 64);
+                return Ok(());
+            }
             // MOV (element) D-lane (only D moves in the image): dst
             // lane = bit20, src lane = bit14 (both machine-derived
             // from the two observed words); the other lane is preserved.
@@ -3723,11 +3953,16 @@ impl Cpu {
             // Fixed-to-float DIVIDES by 2^fbits (fixed value = int /
             // 2^fbits); float-to-fixed MULTIPLIES (fixed int = trunc(a
             // x 2^fbits)) — oracle-proven (the -1.5 x2 = -3 case caught
-            // an inverted first version). Both scalings are
-            // single-rounding-exact, so values reuse the plain helpers;
-            // the convert then flags honestly. (The inherited IX from
-            // fp_from_int can over-fire on scaled values; nothing live
-            // reads IX.)
+            // an inverted first version). Single-rounding proof (adversarial
+            // oracle suite verify-flags.mjs, values + FPSR): the int->float
+            // scale is exponent-only (exact, no OF/UF in these ranges) and
+            // preserves the significand, so fp_from_int's significance-based
+            // IX is already the honest flag for the SCALED quotient; the
+            // float->fixed widen (f32->f64) and power-of-2 scale are both
+            // exact, leaving fp_to_int64's single truncation (+IOC/IX) as
+            // the only rounding. Values + flags match the oracle on all
+            // adversarial cases (2^53+1-class ints, boundary products,
+            // NaN/inf/subnormal sources, fbits extremes).
             if (w & 0xffc0_fc00) == 0x5f40_e400 {
                 let fbits = 64 - bits(w, 21, 16);
                 let v = self.fp_from_int(self.fr(rn), 64, false, true);
@@ -3740,6 +3975,37 @@ impl Cpu {
                 let v = self.fp_from_int(self.fr(rn), 64, true, true);
                 let r = f64::from_bits(v) / 2f64.powi(fbits as i32);
                 self.fw(rd, r.to_bits(), true);
+                return Ok(());
+            }
+            // S-float fixed-point mirrors (assembler truth dec51.s, oracle
+            // differential verify51.mjs): same scale rules; the integer
+            // side is 32-bit (low S bits — nonzero high D/Q bits are
+            // ignored, oracle-proven). #0 plains are exact rows
+            // (fbits=0, scale ignored — same finding as D). NOTE the
+            // UCVTF-plain row (0x7E21D800): the first cut only had the
+            // SCVTF one and faulted `ucvtf s0, s0` (oracle executes it).
+            if (w & 0xffc0_fc00) == 0x5f00_e400 {
+                let fbits = 64 - bits(w, 21, 16);
+                let v = self.fp_from_int(self.fr(rn), 32, false, false);
+                let r = f32::from_bits(v as u32) / 2f32.powi(fbits as i32);
+                self.fw(rd, r.to_bits() as u64, false);
+                return Ok(());
+            }
+            if (w & 0xffc0_fc00) == 0x7f00_e400 {
+                let fbits = 64 - bits(w, 21, 16);
+                let v = self.fp_from_int(self.fr(rn), 32, true, false);
+                let r = f32::from_bits(v as u32) / 2f32.powi(fbits as i32);
+                self.fw(rd, r.to_bits() as u64, false);
+                return Ok(());
+            }
+            if (w & 0xffff_fc00) == 0x5e21_d800 {
+                let v = self.fp_from_int(self.fr(rn), 32, false, false);
+                self.fw(rd, v, false);
+                return Ok(());
+            }
+            if (w & 0xffff_fc00) == 0x7e21_d800 {
+                let v = self.fp_from_int(self.fr(rn), 32, true, false);
+                self.fw(rd, v, false);
                 return Ok(());
             }
             {
@@ -3755,6 +4021,22 @@ impl Cpu {
                     let ibits = if sf { 64 } else { 32 };
                     let v = self.fp_to_int64(a.to_bits(), ibits, unsigned, 0);
                     // Dest width from sf (X=64/W=32); w() zero-extends W.
+                    self.w(rd, v, sf);
+                    return Ok(());
+                }
+                // S-float source mirrors (M51, dec51.s): same 64-scale
+                // rule; the S value widens exactly to f64 first (so the
+                // high D bits never leak in — oracle-proven).
+                if fcvf == 0x1e18_0000
+                    || fcvf == 0x9e18_0000
+                    || fcvf == 0x1e19_0000
+                    || fcvf == 0x9e19_0000
+                {
+                    let fbits = 64 - bits(w, 15, 10);
+                    let a = f32::from_bits(self.fr(rn) as u32) as f64 * 2f64.powi(fbits as i32);
+                    let unsigned = fcvf == 0x1e19_0000 || fcvf == 0x9e19_0000;
+                    let ibits = if sf { 64 } else { 32 };
+                    let v = self.fp_to_int64(a.to_bits(), ibits, unsigned, 0);
                     self.w(rd, v, sf);
                     return Ok(());
                 }

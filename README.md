@@ -1103,3 +1103,15 @@ dist/                 production bundle
   `test/pi-cpu-smoke.mjs` (22 goldens), `test/cpu-cases.mjs` (819),
   9 upython suites via `test/pi-sess.mjs`; oracles archived under
   `test/archive/`.
+- M50 — M30 peripheral windows in `Bus`: RNG (CTRL latch + fixed
+  45000 temp), zero CLK/I2S/BSC0 windows, AUX UART2–5 (ENABLES latch +
+  live LSR), USB GSNPSID (`0x4F54280A`, the one revision both guests
+  accept) + DONE park (`done_flag` sel 7). Debug guest's four stale
+  expectations fixed to real-HW values (CLO mask, FR `0x90`,
+  MAIL1_STATUS 0, SPI CS `0x40000`). Result: periphs ALL PASS, debug
+  22/22, fault null — every program green; Playwright 27/27.
+- M51 — decoder completions: S-fixed-point converts, BSL/DUP/USHR
+  vector rows, exact IXC significance test (fixed a real over-fire on
+  exact large ints). One genuine oracle divergence kept spec-correct:
+  the stock fork's BSL uses Rd-as-selector (truth-table-proven fork
+  bug, zero hits in any guest). Fuzzer 882/882, smoke 22/22.

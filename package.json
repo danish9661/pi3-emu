@@ -2,7 +2,9 @@
   "name": "pi-emu-spike",
   "private": true,
   "type": "module",
-  "workspaces": ["packages/*"],
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "dev": "vite",
     "build": "bash build.sh && vite build",
@@ -13,6 +15,7 @@
     "puppeteer-core": "^25.8.0"
   },
   "devDependencies": {
+    "playwright": "^1.62.1",
     "vite": "^6.0.0"
   }
 }

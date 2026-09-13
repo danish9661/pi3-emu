@@ -73,9 +73,10 @@ pub extern "C" fn rust_main() -> ! {
 
     puts("=== pi3-emu debug/diagnostic ===\r\n\r\n");
 
-    // System timer
+    // System timer (CLO advances in microseconds since boot; only the
+    // top byte is masked so the check is deterministic, not racy).
     puts("[System Timer]\r\n");
-    if check("CLO", TMR_BASE + 0x04, 0xFFFF_FFFF, 0) {
+    if check("CLO", TMR_BASE + 0x04, 0xFF00_0000, 0) {
         pass += 1;
     } else { fail += 1; }
 
@@ -88,9 +89,9 @@ pub extern "C" fn rust_main() -> ! {
         pass += 1;
     } else { fail += 1; }
 
-    // PL011 UART0
+    // PL011 UART0 (idle: TXFE + RXFE set, like the old facade model).
     puts("\r\n[UART0 (PL011)]\r\n");
-    if check("FR", UART0_BASE + 0x18, 0xFF, 0) {
+    if check("FR", UART0_BASE + 0x18, 0xFF, 0x90) {
         pass += 1;
     } else { fail += 1; }
 
@@ -100,9 +101,9 @@ pub extern "C" fn rust_main() -> ! {
         pass += 1;
     } else { fail += 1; }
 
-    // VideoCore mailbox
+    // VideoCore mailbox (MAIL1 never full at idle).
     puts("\r\n[VideoCore Mailbox]\r\n");
-    if check("STATUS", MBOX_BASE + 0x18, 0x8000_0000, 0x8000_0000) {
+    if check("STATUS", MBOX_BASE + 0x18, 0x8000_0000, 0) {
         pass += 1;
     } else { fail += 1; }
 
@@ -147,9 +148,9 @@ pub extern "C" fn rust_main() -> ! {
         pass += 1;
     } else { fail += 1; }
 
-    // SPI0
+    // SPI0 (idle: TX-empty bit always set, like the old facade model).
     puts("\r\n[SPI0]\r\n");
-    if check("CS", SPI0_BASE, 0xFFFF_FFFF, 0) {
+    if check("CS", SPI0_BASE, 0xFFFF_FFFF, 0x0004_0000) {
         pass += 1;
     } else { fail += 1; }
 

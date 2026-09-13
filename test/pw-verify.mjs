@@ -53,6 +53,9 @@ const goldens = {
   sd: 'payload matches',
   uart0: 'RXINTR armed',
   upython: '>>>',
+  periphs: 'ALL PASS',
+  debug: 'ALL PASS',
+  bench: 'benchmark',
 };
 for (const [prog, want] of Object.entries(goldens)) {
   const { status, term } = await boot(prog);

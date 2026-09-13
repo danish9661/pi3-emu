@@ -24,9 +24,11 @@ const LIRQ_MODE = 'lirq';
 const UPY_MODE = 'upython';
 
 // Explicit-done selector for PiEmu.done(): 0 = clock/gpio (TMR+0x20),
-// 1 = mmu, 2 = dma, 3 = pwm, 4 = i2c, 5 = spi, 6 = sd (all +0x54).
+// 1 = mmu, 2 = dma, 3 = pwm, 4 = i2c, 5 = spi, 6 = sd (all +0x54),
+// 7 = periphs/debug (USB DONE: +0xFF0 or +0x54).
 const DONE_SEL = {
   clock: 0, gpio: 0, mmu: 1, dma: 2, pwm: 3, i2c: 4, spi: 5, sd: 6,
+  periphs: 7, debug: 7,
 };
 
 const GPIO_LEDS = [21, 22, 23, 24, 25, 26, 27, 28];
@@ -818,6 +820,20 @@ async function run() {
       draw(runUntilDone('sd')); // FAT12 card: boot sector, root dir, HELLO.TXT
       setStatus(
         `booted — running sd — BCM2835 SDHCI (EMMC) @ 0x3F300000 — FAT12 card, HELLO.TXT read — press Reboot to re-run`
+      );
+    } else if (sel === 'periphs') {
+      mode = 'periphs';
+      await bootProg(PROGRAMS.periphs);
+      draw(runUntilDone('periphs')); // M30 windows: parks on USB DONE
+      setStatus(
+        `booted — running periphs — M30 peripherals (RNG/clock/I2S/SPI1/USB/UART2-5) — press Reboot to re-run`
+      );
+    } else if (sel === 'debug') {
+      mode = 'debug';
+      await bootProg(PROGRAMS.debug);
+      draw(runUntilDone('debug')); // diagnostic sweep: parks on USB DONE
+      setStatus(
+        `booted — running debug — diagnostic report across all windows — press Reboot to re-run`
       );
     } else {
       mode = 'single';
