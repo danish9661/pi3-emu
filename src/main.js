@@ -15,6 +15,7 @@ const DONE_SLICES = 30000; // safety cap for the explicit-done guests
 const FB_ADDR = 0x200000; // allocated framebuffer inside guest RAM
 
 const LINUX_MODE = 'linux';
+const PI_LINUX_MODE = 'pi-linux';
 const SMP_MODE = 'smp';
 const CLOCK_MODE = 'clock';
 const GPIO_MODE = 'gpio';
@@ -324,6 +325,55 @@ async function bootProg(name, { slice = SLICE_INSNS } = {}) {
   return bytes;
 }
 
+// M58 pi-linux boot: slice qemu-system-aarch64.data (same table as
+// public/linux/load.js), hand the three blobs to the wasm core's
+// load_linux(), run an initial slice budget so #term shows progress
+// immediately (n/pc/fault), then irqRun() keeps it advancing.
+async function bootPiLinux() {
+  await loadCore();
+  const resp = await fetch('./linux/qemu-system-aarch64.data');
+  if (!resp.ok) throw new Error('cannot fetch ./linux/qemu-system-aarch64.data');
+  const buf = await resp.arrayBuffer();
+  const DTB_END = 32753, KERN_END = 22505969;
+  const bytes = new Uint8Array(buf);
+  const dtb = bytes.slice(0, DTB_END);
+  const kernel = bytes.slice(DTB_END, KERN_END);
+  const initrd = bytes.slice(KERN_END);
+  pi = new PiEmu();
+  pi.set_slice(SLICE_INSNS);
+  pi.set_vt_ips(VIRTUAL_IPS);
+  const entry = pi.load_linux(kernel, dtb, initrd);
+  lastWall = performance.now();
+  lastFault = null;
+  lastFaultText = null;
+  faultStreak = 0;
+  gpioBtn = 0;
+  try { window.__lastFault = null; } catch (_) {}
+  // Initial budget (~2M insns, chunked like the triage runner) so the
+  // first paint already shows the kernel deep in early boot.
+  let out = '';
+  for (let i = 0; i < 500; i++) {
+    out += runSlice(SLICE_INSNS);
+    const halted = faultHalted();
+    if (halted) break;
+    try {
+      const n = pi.insns();
+      if (Number.isFinite(n) && n >= 2000000) break;
+    } catch (_) { break; }
+  }
+  try {
+    const n = pi.insns();
+    const pc = (pi.pc() >>> 0).toString(16);
+    let f = null;
+    try { f = pi.fault(); } catch (_) { f = null; }
+    const fs = (f === null || f === undefined) ? 'null' : String(f);
+    out += `\n[pi-linux] kernel8.img @0x${entry.toString(16)} — n=${n} pc=0x${pc} fault=${fs} — executing on own core\n`;
+    try { window.__piLinux = { n, pc, fault: f === undefined ? null : f }; } catch (_) {}
+  } catch (_) {}
+  updateStats();
+  return out ? draw(out) : undefined;
+}
+
 // ---- stats ----
 function updateStats() {
   const wall = (performance.now() - stats.wallStart) / 1000;
@@ -534,15 +584,17 @@ function blit() {
   fbCtx.putImageData(img, 0, 0);
 }
 
-// The irq, lirq, upython and rpikernel guests never park (infinite spin
-// with IRQs unmasked), so they run on rAF slices; IRQ delivery happens
-// inside the core at chunk boundaries (host-assisted IRQ_RET resume or
-// native eret). rpikernel joins this loop after runKernelPost so typed
-// keys reach its echo loop (handleKey's rAF path pushes directly).
+// The irq, lirq, upython, rpikernel and pi-linux guests never park
+// (infinite spin with IRQs unmasked), so they run on rAF slices; IRQ
+// delivery happens inside the core at chunk boundaries (host-assisted
+// IRQ_RET resume or native eret). rpikernel joins this loop after
+// runKernelPost so typed keys reach its echo loop (handleKey's rAF
+// path pushes directly); pi-linux joins it after its slice budget so
+// the real kernel keeps executing across frames.
 function irqRun() {
   let out = '';
   const frame = () => {
-    if (mode !== IRQ_MODE && mode !== LIRQ_MODE && mode !== UPY_MODE && mode !== 'rpikernel') return;
+    if (mode !== IRQ_MODE && mode !== LIRQ_MODE && mode !== UPY_MODE && mode !== 'rpikernel' && mode !== PI_LINUX_MODE) return;
     const t0 = performance.now();
     do {
       out += runSlice(SLICE_INSNS);
@@ -654,7 +706,7 @@ function guestKey(code) {
 
 function handleKey(e) {
   if (!pi || runBtn.disabled) return;
-  if (mode === IRQ_MODE || mode === LIRQ_MODE || mode === UPY_MODE || mode === 'rpikernel') {
+  if (mode === IRQ_MODE || mode === LIRQ_MODE || mode === UPY_MODE || mode === 'rpikernel' || mode === PI_LINUX_MODE) {
     // Continuous rAF loop picks the key up at the next slice.
     const c = e.key.length === 1 ? e.key.charCodeAt(0) : e.key === 'Enter' ? 13 : 0;
     if (!c) return;
@@ -680,7 +732,7 @@ function handleKey(e) {
 // On-screen keyboard: feed the same guestKey path as physical keys.
 function tapKeys(btn) {
   if (!pi || runBtn.disabled) return;
-  if (mode === IRQ_MODE || mode === LIRQ_MODE || mode === UPY_MODE || mode === 'rpikernel') {
+  if (mode === IRQ_MODE || mode === LIRQ_MODE || mode === UPY_MODE || mode === 'rpikernel' || mode === PI_LINUX_MODE) {
     const action = btn.dataset.action;
     const push = (c) => { try { pi.push_key(c); } catch (_) {} };
     if (action === 'enter') {
@@ -876,6 +928,23 @@ async function run() {
       draw(runUntilDone('debug')); // diagnostic sweep: parks on USB DONE
       setStatus(
         `booted — running debug — diagnostic report across all windows — press Reboot to re-run`
+      );
+    } else if (sel === PI_LINUX_MODE) {
+      // M58 pi-linux: the REAL kernel8.img + DTB + initrd on OUR OWN
+      // core (pi-cpu wasm, 512M RAM) — not the qemu-wasm iframe. The
+      // .data slicing mirrors public/linux/load.js (dtb 0:32753,
+      // kernel 32753:22505969, rest initrd); load_linux() places the
+      // blobs and resets per the ARM64 boot protocol. Progress: the
+      // kernel runs fault-null through early boot (fixup/reloc, page
+      // tables, percpu); console is still silent (UART next), so the
+      // terminal shows a live progress line (n/pc/x0) instead of a
+      // shell prompt. Keys feed the PL011 RX FIFO for when the kernel
+      // starts consuming input.
+      mode = PI_LINUX_MODE;
+      await bootPiLinux();
+      irqRun(); // keep the kernel executing across frames
+      setStatus(
+        `booted — pi-linux on own core — real kernel8.img executing (progress below) — press Reboot to re-run`
       );
     } else {
       mode = 'single';

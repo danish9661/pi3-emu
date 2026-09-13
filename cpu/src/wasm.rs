@@ -7,7 +7,7 @@
 use wasm_bindgen::prelude::*;
 
 use crate::runner::{Runner, BTN_BIT};
-use crate::{load_elf, Bus, Cpu};
+use crate::{load_elf, load_linux, Bus, Cpu};
 
 #[wasm_bindgen]
 pub struct PiEmu {
@@ -36,6 +36,32 @@ impl PiEmu {
         self.bus.vt_ips = vt;
         let entry = load_elf(&mut self.bus, bytes).map_err(|e| JsValue::from_str(&e))?;
         self.cpu = Cpu::new(entry);
+        self.runner = Runner::new();
+        self.runner.slice = 4096;
+        Ok(entry as u32)
+    }
+
+    /// M58 pi-linux track: load the REAL kernel8.img + DTB + initrd
+    /// (raw blobs, NOT ELF) at the fixed M56 PAs (kernel 0x200000, DTB
+    /// 0x3000000, initrd 0x4000000; RAM expands to 512M) and reset per
+    /// the ARM64 boot protocol (x0=DTB PA, EL2, MMU off). The .data
+    /// slicing (dtb 0:32753, kernel 32753:22505969, rest initrd — see
+    /// public/linux/load.js) happens in JS; the three slices arrive
+    /// here as byte arrays. Returns the kernel entry PA.
+    pub fn load_linux(
+        &mut self,
+        kernel: &[u8],
+        dtb: &[u8],
+        initrd: &[u8],
+    ) -> Result<u32, JsValue> {
+        // Preserve host tunables across loads (the UI sets these once).
+        let vt = self.bus.vt_ips;
+        let entry = load_linux(&mut self.bus, kernel, dtb, initrd)
+            .map_err(|e| JsValue::from_str(&e))?;
+        self.bus.vt_ips = vt;
+        self.cpu = Cpu::new(entry);
+        self.cpu
+            .linux_reset(entry, crate::LINUX_DTB_PA, 0x1FFF_FFF0);
         self.runner = Runner::new();
         self.runner.slice = 4096;
         Ok(entry as u32)

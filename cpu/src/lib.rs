@@ -483,26 +483,18 @@ impl Bus {
     /// accessible with translation on) — so translation identity-maps
     /// these instead of walking. Unmapped NON-device VAs still fault
     /// (the debug guest depends on it).
+    /// M58 hot-path: every fetch/read/write calls this (3× per insn
+    /// with MMU on), so it is three range compares — the peripheral
+    /// block 0x3F00_0000..0x3F98_0000+USB_LEN plus the local block
+    /// page at 0x4000_0000. Cheaper than 19 is_*() calls (each with
+    /// checked_add) and exact for the bypass set (translate() only
+    /// needs "device vs RAM", never which one; LOCAL page included —
+    /// CORE_IRQ_SRC must bypass too). TMR_BASE/DMA_BASE sit just
+    /// below MBOX_PAGE (0x3F003000/0x3F007000 < 0x3F00B000), so the
+    /// peripheral floor is TMR_BASE, not MBOX_PAGE.
     fn is_device_win(addr: u64) -> bool {
-        Self::is_uart(addr, 1)
-            || Self::is_timer(addr, 1)
-            || Self::is_gpio(addr, 1)
-            || Self::is_ic(addr, 1)
-            || Self::is_page(addr, 1, MBOX_PAGE)
-            || Self::is_page(addr, 1, LOCAL_BASE)
-            || Self::is_sd(addr, 1)
-            || Self::is_miniuart(addr, 1)
-            || Self::is_i2c(addr, 1)
-            || Self::is_spi(addr, 1)
-            || Self::is_pwm(addr, 1)
-            || Self::is_dma(addr, 1)
-            || Self::is_mmuctl(addr, 1)
-            || Self::is_rng(addr, 1)
-            || Self::is_clk(addr, 1)
-            || Self::is_i2s(addr, 1)
-            || Self::is_i2c0(addr, 1)
-            || Self::is_uart25(addr, 1)
-            || Self::is_usb(addr, 1)
+        (addr >= TMR_BASE && addr < USB_BASE + USB_LEN)
+            || (addr >= LOCAL_BASE && addr < LOCAL_BASE + 0x1000)
     }
 
     /// DMA ch0 window cell: CS/CONBLK_AD in the channel window, ENABLE
@@ -1356,15 +1348,30 @@ impl Bus {
         0
     }
 
-    pub fn read(&mut self, addr: u64, size: u64) -> Result<u64, Fault> {
-        let addr = self.translate(addr)?;
-        if self.in_ram(addr, size) {
-            let a = addr as usize;
-            let mut v = 0u64;
-            for i in 0..size {
-                v |= (self.mem[a + i as usize] as u64) << (8 * i);
+    pub fn read(&mut self, mut addr: u64, size: u64) -> Result<u64, Fault> {
+        // M58 hot-path: skip translate() entirely when the MMU is off
+        // (all goldens + the kernel's 47k-instruction head.S prologue).
+        // With MMU on, the device-window test precedes the walk so MMIO
+        // never pays for a page-table walk it bypasses anyway.
+        if (self.mmu_sctlr & 1) == 0 {
+            if self.in_ram(addr, size) {
+                let a = addr as usize;
+                let mut v = 0u64;
+                for i in 0..size {
+                    v |= (self.mem[a + i as usize] as u64) << (8 * i);
+                }
+                return Ok(v);
             }
-            return Ok(v);
+        } else {
+            addr = self.translate(addr)?;
+            if self.in_ram(addr, size) {
+                let a = addr as usize;
+                let mut v = 0u64;
+                for i in 0..size {
+                    v |= (self.mem[a + i as usize] as u64) << (8 * i);
+                }
+                return Ok(v);
+            }
         }
         if Self::is_uart(addr, size) {
             let off = addr - UART0;
@@ -1695,14 +1702,25 @@ impl Bus {
         Err(Fault::UnmappedData(addr))
     }
 
-    pub fn write(&mut self, addr: u64, size: u64, val: u64) -> Result<(), Fault> {
-        let addr = self.translate(addr)?;
-        if self.in_ram(addr, size) {
-            let a = addr as usize;
-            for i in 0..size {
-                self.mem[a + i as usize] = ((val >> (8 * i)) & 0xff) as u8;
+    pub fn write(&mut self, mut addr: u64, size: u64, val: u64) -> Result<(), Fault> {
+        // M58 hot-path: same MMU-off fast path as read().
+        if (self.mmu_sctlr & 1) == 0 {
+            if self.in_ram(addr, size) {
+                let a = addr as usize;
+                for i in 0..size {
+                    self.mem[a + i as usize] = ((val >> (8 * i)) & 0xff) as u8;
+                }
+                return Ok(());
             }
-            return Ok(());
+        } else {
+            addr = self.translate(addr)?;
+            if self.in_ram(addr, size) {
+                let a = addr as usize;
+                for i in 0..size {
+                    self.mem[a + i as usize] = ((val >> (8 * i)) & 0xff) as u8;
+                }
+                return Ok(());
+            }
         }
         if Self::is_uart(addr, size) {
             let off = addr - UART0;
@@ -2242,7 +2260,12 @@ impl Bus {
     }
 
     pub fn fetch(&self, pc: u64) -> Result<u32, Fault> {
-        let pc = self.translate(pc)?;
+        // M58 hot-path: MMU-off identity (goldens + kernel prologue).
+        let pc = if (self.mmu_sctlr & 1) == 0 {
+            pc
+        } else {
+            self.translate(pc)?
+        };
         if self.in_ram(pc, 4) {
             let a = pc as usize;
             return Ok(u32::from_le_bytes([
