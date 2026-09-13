@@ -42,7 +42,28 @@ fn main() {
     runner.budget = budget;
     runner.slice = slice;
     bus.vt_ips = 262144;
-    runner.run_to(&mut cpu, &mut bus, budget);
+    // PI3_SAMPLE_EVERY=N: print n/pc/x0/x30 every N insns (trajectory to
+    // find where progress stops; default 0 = only the final line).
+    let every: u64 = std::env::var("PI3_SAMPLE_EVERY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if every == 0 {
+        runner.run_to(&mut cpu, &mut bus, budget);
+    } else {
+        let mut done = 0u64;
+        while done < budget && runner.fault_string().is_none() {
+            let target = (done + every).min(budget);
+            runner.run_to(&mut cpu, &mut bus, target);
+            done = runner.n;
+            println!("sample\tn={} pc=0x{:x} x0=0x{:x} x30=0x{:x} fault={}",
+                runner.n, cpu.pc, cpu.x[0], cpu.x[30],
+                runner.fault_string().unwrap_or_else(|| "null".into()));
+            if runner.n < target {
+                break;
+            }
+        }
+    }
     println!("triage\tn={} pc=0x{:x} x0=0x{:x} fault={} console={:?}",
         runner.n, cpu.pc, cpu.x[0],
         runner.fault_string().unwrap_or_else(|| "null".into()),

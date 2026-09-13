@@ -3943,16 +3943,19 @@ impl Cpu {
                 // assembler — never hand-derive these fields again.
                 if bits(w, 21, 21) == 1 {
                     // register offset (M57 LSL-FIX, kernel-proven): the
-                    // amount is bit12 S shifted BY size (amount = size
-                    // if S==1 else 0 — i.e. LSL #3 for X regs), NOT the
-                    // raw bit12 (amount 0/1). The old code passed S
-                    // itself, so `str x12,[x0,x10,lsl#3]` (S=1) shifted
-                    // by 1: every L2 entry landed at table+idx*2+off,
-                    // aliasing pairs of entries and leaving the walked
-                    // idx (e.g. L2[69/71]) zero. Guests never use
-                    // scaled register offsets (fuzzer has them green
-                    // either way — same-slice write-then-read observes
-                    // the dirty value consistently), so no golden moves.
+                    // amount is bit12 S selecting the NATURAL shift —
+                    // LSL #esz-log2 for option==0b011 (plain LSL form).
+                    // Assembler truth: `ldr x1,[x0,x1]`=0xF8616801
+                    // (S=0, LSL #0) vs `ldr x1,[x0,x1,lsl#3]`=
+                    // 0xF8617801 (S=1, LSL #3). The old code passed S
+                    // itself as amount, so `str x12,[x0,x10,lsl#3]`
+                    // shifted by 1 (pairwise aliasing, walked idx
+                    // zero). Guests never use scaled register offsets
+                    // (fuzzer green either way), so no golden moves.
+                    // NOTE size==access-size: the kernel's W-form
+                    // `ldr w1,[x0,x1]` (size=0b10, S=1) shifts by 2
+                    // (esz=4), NOT 3 — amount=size is log2(esz) by
+                    // construction (size 0/1/2/3 -> 1/2/4/8 bytes).
                     let rm = bits(w, 20, 16);
                     let option = bits(w, 15, 13);
                     let s = bits(w, 12, 12);

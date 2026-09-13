@@ -1800,7 +1800,11 @@ regression proof smoke 23/23 + fuzzer 882/882):
 7. **LSL-register-amount fix.** `str x12,[x0,x10,lsl#3]` passed S
    itself (0/1) as the shift instead of size (3): every L2 entry
    aliased pairwise, walked idx stayed zero. Other arms already
-   correct (H:1, S/D:esz-shift).
+   correct (H:1, S/D:esz-shift). Follow-up (post-M57, kernel W-form
+   `ldr w1,[x0,x1]`=0x88027E61): amount=size is log2(esz), so the
+   W-form shifts by 2 (esz=4), X-form by 3 — same line, proven by
+   the spin-loop target VA decoding to garbage (0xffffffc0126ed580)
+   before and the correct percpu word after.
 8. **Atomics lane** (14-word truth table + 20-word negative survey):
    exclusive family `bits[29:24]==0b001000` (LDAXR/STLXR/LDAR/STLR/
    CAS/CASP) always live; LSE lane post-0x1c-arm by ORDER (Rm==0
