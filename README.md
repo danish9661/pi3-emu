@@ -1154,3 +1154,11 @@ dist/                 production bundle
   integer-halfword fix (was Illegal), CNTVOFF `msr xzr` absorb.
   Kernel POST: EL2 banner → VBAR → EL1 → freq → drivers → SVC →
   MMU → 3×timer → echo. Smoke golden updated (16 console strings).
+- M56 — real-Linux track opens (UNCOMMITTED): pi-cpu grows 512M
+  `linux_mode` RAM + `load_linux()` (kernel8.img @0x200000, DTB
+  @0x3000000, initrd @0x4000000) + `Cpu::linux_reset()` (x0=DTB,
+  EL2, MMU off) + `test/linux-triage.mjs` triage harness. First
+  fault by execution: the kernel enables its MMU then touches a
+  `0xffffffc0…` high-half VA pi-cpu cannot walk (TTBR0-only) —
+  next slice is TTBR1. Regression green (smoke 23/23, fuzzer
+  882/882). qemu-wasm stays the reference oracle only.

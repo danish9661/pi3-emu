@@ -13,6 +13,12 @@ pub mod runner;
 pub mod wasm;
 
 pub const RAM_SIZE: u64 = 0x400000;
+// M56 Linux track: 512 MB guest RAM (matches qemu raspi3ap `-m 512M`).
+// The 4 MB default cannot hold the 22 MB kernel8.img + DTB + initramfs.
+// Expanded conditionally at load: `ram_size()` returns 512M once
+// `linux_mode` is set by `load_linux()`, else the legacy 4M (all goldens,
+// fuzzers, upython suites, and the wasm demo keep exact legacy behavior).
+pub const LINUX_RAM_SIZE: u64 = 0x20000000;
 pub const UART0: u64 = 0x3f201000;
 pub const TMR_BASE: u64 = 0x3f003000;
 pub const GPIO_BASE: u64 = 0x3f200000;
@@ -68,6 +74,11 @@ pub enum Fault {
 pub struct Bus {
     mem: Vec<u8>,
     pub console: Vec<u8>,
+    /// M56 Linux track: once `load_linux()` runs, RAM expands to 512M
+    /// and `ram_size()` (not the `RAM_SIZE` const) gates every range
+    /// check. New code must use `in_ram()`; legacy `is_ram()` stays
+    /// for the 4M goldens.
+    linux_mode: bool,
     // System-timer model (BCM2837 0x3F003000), mirroring the host facade:
     // compares pulled from the window, match-pending latched with crossed
     // flags, CS writes absorbed as keep-masks (the model's inverted W1C —
@@ -255,7 +266,7 @@ pub struct Bus {
 
 impl Bus {
     pub fn new() -> Self {
-        Bus {
+        let mut b = Bus {
             mem: vec![0; RAM_SIZE as usize],
             console: Vec::new(),
             tmr_mem: vec![0; 0x1000],
@@ -348,11 +359,29 @@ impl Bus {
             pwm_fifo: Vec::new(),
             pwm_ring: Vec::new(),
             pwm_drained: 0,
+            linux_mode: false,
+        };
+        b
+    }
+
+    /// Active RAM size: 512M in Linux mode, legacy 4M otherwise.
+    /// `is_ram`/`translate` consult this so every golden keeps the
+    /// legacy map until `load_linux()` expands it.
+    pub fn ram_size(&self) -> u64 {
+        if self.linux_mode {
+            LINUX_RAM_SIZE
+        } else {
+            RAM_SIZE
         }
     }
 
     pub fn is_ram(addr: u64, size: u64) -> bool {
         addr.checked_add(size).map_or(false, |e| e <= RAM_SIZE)
+    }
+
+    /// Instance RAM check (Linux-mode aware).
+    pub fn in_ram(&self, addr: u64, size: u64) -> bool {
+        addr.checked_add(size).map_or(false, |e| e <= self.ram_size())
     }
 
     fn is_uart(addr: u64, size: u64) -> bool {
@@ -613,7 +642,7 @@ impl Bus {
             let shift = 12 + 9 * (3 - level);
             let idx = ((va >> shift) & 0x1ff) as u64;
             let da = base.wrapping_add(idx * 8);
-            if !Self::is_ram(da, 8) {
+            if !self.in_ram(da, 8) {
                 return Err(Fault::Translation(va));
             }
             let a = da as usize;
@@ -820,7 +849,7 @@ impl Bus {
 
     /// Guest-RAM u32 load for the mailbox walker (out-of-range reads 0).
     fn mem_u32(&self, addr: u64) -> u32 {
-        if Self::is_ram(addr, 4) {
+        if self.in_ram(addr, 4) {
             let a = addr as usize;
             u32::from_le_bytes([self.mem[a], self.mem[a + 1], self.mem[a + 2], self.mem[a + 3]])
         } else {
@@ -830,7 +859,7 @@ impl Bus {
 
     /// Guest-RAM u32 store for the mailbox walker (out-of-range ignored).
     fn mem_write_u32(&mut self, addr: u64, v: u32) {
-        if Self::is_ram(addr, 4) {
+        if self.in_ram(addr, 4) {
             let a = addr as usize;
             for (i, b) in v.to_le_bytes().iter().enumerate() {
                 self.mem[a + i] = *b;
@@ -844,7 +873,7 @@ impl Bus {
         self.mem_write_u32(addr + off as u64 + 8, 0x80000000);
         for i in 0..tsize {
             let a = addr + off as u64 + 12 + i as u64;
-            if Self::is_ram(a, 1) {
+            if self.in_ram(a, 1) {
                 self.mem[a as usize] = *out.get(i).unwrap_or(&0);
             }
         }
@@ -979,7 +1008,7 @@ impl Bus {
         let dst_inc = ti & 2 != 0;
         let src_ign = ti & (1 << 6) != 0;
         let dst_ign = ti & (1 << 7) != 0;
-        let fill = if src_ign && Self::is_ram(src, 1) {
+        let fill = if src_ign && self.in_ram(src, 1) {
             self.mem[src as usize]
         } else {
             0
@@ -1005,7 +1034,7 @@ impl Bus {
             } else {
                 for (i, b) in buf.iter_mut().enumerate() {
                     let a = s + i as u64;
-                    *b = if Self::is_ram(a, 1) { self.mem[a as usize] } else { 0 };
+                    *b = if self.in_ram(a, 1) { self.mem[a as usize] } else { 0 };
                 }
                 if dst_ign && chunk > 0 {
                     let last = buf[chunk as usize - 1];
@@ -1016,7 +1045,7 @@ impl Bus {
             }
             for (i, b) in buf.iter().enumerate() {
                 let a = d + i as u64;
-                if Self::is_ram(a, 1) {
+                if self.in_ram(a, 1) {
                     self.mem[a as usize] = *b;
                 }
             }
@@ -1036,7 +1065,7 @@ impl Bus {
         let mut cb = conblk & !0x1f;
         let mut inten = false;
         for _ in 0..64 {
-            if cb == 0 || !Self::is_ram(cb, 32) {
+            if cb == 0 || !self.in_ram(cb, 32) {
                 break;
             }
             // Snapshot the CB first (the transfer below needs &mut).
@@ -1178,7 +1207,7 @@ impl Bus {
         let mut out = Vec::with_capacity(len);
         for i in 0..len as u64 {
             let a = addr.wrapping_add(i);
-            if Self::is_ram(a, 1) {
+            if self.in_ram(a, 1) {
                 out.push(self.mem[a as usize]);
             } else {
                 out.push(0);
@@ -1206,11 +1235,8 @@ impl Bus {
     }
 
     pub fn read(&mut self, addr: u64, size: u64) -> Result<u64, Fault> {
-        if addr == 0x3f007054 {
-            eprintln!("RENTER {:#x} sz={}", addr, size);
-        }
         let addr = self.translate(addr)?;
-        if Self::is_ram(addr, size) {
+        if self.in_ram(addr, size) {
             let a = addr as usize;
             let mut v = 0u64;
             for i in 0..size {
@@ -1543,11 +1569,8 @@ impl Bus {
     }
 
     pub fn write(&mut self, addr: u64, size: u64, val: u64) -> Result<(), Fault> {
-        if addr == 0x3f007054 {
-            eprintln!("WENTER {:#x} sz={} sctlr={:#x}", addr, size, self.mmu_sctlr);
-        }
         let addr = self.translate(addr)?;
-        if Self::is_ram(addr, size) {
+        if self.in_ram(addr, size) {
             let a = addr as usize;
             for i in 0..size {
                 self.mem[a + i as usize] = ((val >> (8 * i)) & 0xff) as u8;
@@ -2093,7 +2116,7 @@ impl Bus {
 
     pub fn fetch(&self, pc: u64) -> Result<u32, Fault> {
         let pc = self.translate(pc)?;
-        if Self::is_ram(pc, 4) {
+        if self.in_ram(pc, 4) {
             let a = pc as usize;
             return Ok(u32::from_le_bytes([
                 self.mem[a],
@@ -2172,6 +2195,30 @@ pub struct Cpu {
 impl Cpu {
     pub fn new(entry: u64) -> Self {
         Cpu { x: [0; 31], sp: 0, pc: entry, q: [0; 32], vbar_el1: 0, daif: 0xf, elr_el1: 0, spsr_el1: 0, spsr_el2: 0, elr_el2: 0, sp_el1: 0, cur_el: 2, spsr_el2_msrd: false, esr_el1: 0, far_el1: 0, n: false, z: false, c: false, v: false, fpsr_cum: 0 }
+    }
+
+    /// M56 Linux-track reset: ARM64 boot protocol regs (x0=DTB PA,
+    /// x1=x2=x3=0), MMU off, EL2, DAIF masked, SP seeded high.
+    /// Call after `load_linux()` with `LINUX_DTB_PA`.
+    pub fn linux_reset(&mut self, entry: u64, dtb_pa: u64, sp: u64) {
+        self.x = [0; 31];
+        self.x[0] = dtb_pa;
+        self.sp = sp;
+        self.pc = entry;
+        self.cur_el = 2;
+        self.daif = 0xf;
+        self.vbar_el1 = 0;
+        self.elr_el1 = 0;
+        self.spsr_el1 = 0;
+        self.spsr_el2 = 0;
+        self.elr_el2 = 0;
+        self.spsr_el2_msrd = false;
+        self.esr_el1 = 0;
+        self.far_el1 = 0;
+        self.n = false;
+        self.z = false;
+        self.c = false;
+        self.v = false;
     }
 
     #[inline]
@@ -3130,7 +3177,6 @@ impl Cpu {
                     } else if crn == 2 && op2 == 2 {
                         bus.mmu_tcr = v;
                     } else if crn == 1 && op2 == 0 {
-                        eprintln!("SCTLR-W {:#x}", v);
                         bus.mmu_sctlr = v;
                     }
                 } else if crn == 2 && op2 == 0 {
@@ -5098,5 +5144,55 @@ pub fn load_elf(bus: &mut Bus, bytes: &[u8]) -> Result<u64, String> {
         }
     }
     Ok(entry)
+}
+
+// ---- M56 Linux-track loader (raw blobs at fixed PAs) ----
+
+/// ARM64 Linux boot layout on pi-cpu (matches the qemu raspi3ap oracle:
+/// `-m 512M`, kernel raw `Image`, DTB + initramfs as separate blobs).
+/// All fit in `LINUX_RAM_SIZE` (512M); none fit in legacy 4M RAM.
+pub const LINUX_KERNEL_PA: u64 = 0x200000;
+pub const LINUX_DTB_PA: u64 = 0x3000000;
+pub const LINUX_INITRD_PA: u64 = 0x4000000;
+
+/// Write a raw blob at a physical address (Linux-mode RAM).
+/// Bounds-checked against `ram_size()`; errors name the blob.
+fn load_raw(bus: &mut Bus, pa: u64, bytes: &[u8], name: &str) -> Result<(), String> {
+    let end = pa
+        .checked_add(bytes.len() as u64)
+        .ok_or_else(|| format!("{} wraps", name))?;
+    if end > bus.ram_size() {
+        return Err(format!(
+            "{} 0x{:x}..0x{:x} outside RAM 0x{:x}",
+            name,
+            pa,
+            end,
+            bus.ram_size()
+        ));
+    }
+    bus.mem[pa as usize..end as usize].copy_from_slice(bytes);
+    Ok(())
+}
+
+/// Load a real Pi 3 boot (raw kernel `Image` + DTB + initrd cpio.gz) at
+/// the fixed PAs above. Expands RAM to 512M (`linux_mode`), zeroes the
+/// extra RAM (fresh `vec!`, so stale 4M contents never leak), and
+/// returns the kernel entry PA (= `LINUX_KERNEL_PA`; the ARM64 `Image`
+/// header has no ELF entry — execution starts at the load address).
+/// Boot regs (x0=DTB PA, x1=x2=x3=0, MMU off, EL2) are the caller's job
+/// (see `Cpu::linux_reset`); DTB `chosen` patching (bootargs +
+/// `linux,initrd-start/end`) is the harness's job (test/linux-*.mjs).
+pub fn load_linux(
+    bus: &mut Bus,
+    kernel: &[u8],
+    dtb: &[u8],
+    initrd: &[u8],
+) -> Result<u64, String> {
+    bus.mem = vec![0; LINUX_RAM_SIZE as usize];
+    bus.linux_mode = true;
+    load_raw(bus, LINUX_KERNEL_PA, kernel, "kernel")?;
+    load_raw(bus, LINUX_DTB_PA, dtb, "dtb")?;
+    load_raw(bus, LINUX_INITRD_PA, initrd, "initrd")?;
+    Ok(LINUX_KERNEL_PA)
 }
 

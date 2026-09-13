@@ -1716,6 +1716,51 @@ after → mmu off/on → 3×timer → echo H), fault null; fuzzer
 the two remaining boxes (vite preview + Playwright rpikernel,
 AGENTS M54 + README entries — this text).
 
+### M56 — real-Linux track opens: RAM + loader + first-fault triage (DONE, uncommitted)
+
+User-locked goal restated (see PRIME DIRECTIVE): boot the REAL
+upstream `raspberrypi/linux` kernel8.img on pi-cpu in the browser,
+qemu-wasm as oracle only. Four research subagents fanned out
+(read-only); every claim below was re-verified by the integrator by
+execution (per the subagent rule — two agent outputs needed
+correction: the `load.js` slice table and the `load_elf` entry story).
+
+- Reference assets (committed `.data`, 26700273 B): dtb `0:32753`
+  (32753 B), kernel8.img `32753:22505969` (22473216 B, ~21.4 MB
+  raw `Image`), rootfs `22505969:26700273` (4194304 B = 4 MiB).
+  qemu argv (`public/linux/module.js:115-133`): `-M raspi3ap
+  -m 512M -smp 4 -dtb/-kernel/-drive if=sd -append <KERNEL_COMMON
+  root=/dev/mmcblk0 rootwait ...>`; ST uses `-initrd` instead.
+  Kernel tag `1.20230405` + `bcm2711_defconfig` + busybox 1.36.1
+  (`scripts/linux-rootfs/image.Dockerfile`). Decision:
+  **initramfs-first** (no SDHCI/DMA/ext2 work needed for the first
+  shell; SD path deferred).
+- pi-cpu additions: `LINUX_RAM_SIZE` 512M + `linux_mode` flag
+  (`ram_size()`/`in_ram()`; legacy `is_ram()` 4M untouched so all
+  23 smoke + 882 fuzzer goldens are byte-identical),
+  `LINUX_KERNEL_PA=0x200000` / `LINUX_DTB_PA=0x3000000` /
+  `LINUX_INITRD_PA=0x4000000`, `load_linux()` (fresh zeroed 512M
+  RAM + 3 raw blobs, returns kernel PA), `Cpu::linux_reset()`
+  (x0=DTB PA, x1=x2=x3=0, EL2, DAIF masked, MMU off, SP seed).
+  `translate()` table-walk + DMA/mailbox/mem helpers now use
+  `in_ram()` (Linux-aware); fetch/read/write paths use `in_ram()`.
+  Removed two `eprintln!` debug lines (SCTLR-W, R/WENTER) the triage
+  no longer needs.
+- Harness: `cpu/examples/triage.rs` (slices `.data` in-process,
+  `load_linux`, `linux_reset`, `Runner` chunks at vt 262144,
+  prints entry/ram/sizes + first fault) + `test/linux-triage.mjs`
+  (`node test/linux-triage.mjs [budget] [slice]`).
+- FIRST FAULT (by execution, 200k budget): `n=47968 pc=0xdb1444
+  x0=0x187e000 fault=UnmappedData(0xffffffc008ba1aa8)`. Reading:
+  the kernel enabled its MMU (SCTLR writes observed pre-fault),
+  then touched a `0xffffffc0...` kernel VA (TTBR1 high-half /
+  `PAGE_OFFSET` linear map) that pi-cpu cannot walk (TTBR0-only,
+  4K-only, no TTBR1/T1SZ/ASID/perms). So the next slice is
+  **TTBR1 + high-half walk** (then data-abort vectors, ID regs,
+  atomics, NEON — ranked in the gap table; `test/archive/` holds
+  the M20-era notes, oracle only).
+- Regression still green: smoke 23/23, fuzzer 882/882.
+
 ## Key risks (M49: unicorn retired — the first two risks below are closed)
 
 - ~~Core patch (Phase 1) is the big unknown~~ CLOSED by the M49 removal:
