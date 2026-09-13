@@ -138,9 +138,10 @@ pub struct Bus {
     // there). Permissions/AF/MAIR are NOT modeled — everything the
     // guests map is full-access Normal-equivalent RAM/MMIO.
     pub mmu_sctlr: u64,
-    mmu_tcr: u64,
-    mmu_ttbr0: u64,
-    mmu_mair: u64,
+    pub mmu_tcr: u64,
+    pub mmu_ttbr0: u64,
+    pub mmu_ttbr1: u64,
+    pub mmu_mair: u64,
     // ARM arch timer (CNTP, 19.2 MHz like the Pi 3): the counter follows
     // the facade's float virtual-time replica exactly (virtualUs_f +=
     // (n/ips)*1e6 per chunk, cntpct = floor(us*19.2)) so compare matches
@@ -295,6 +296,7 @@ impl Bus {
             mmu_sctlr: 0,
             mmu_tcr: 0,
             mmu_ttbr0: 0,
+            mmu_ttbr1: 0,
             mmu_mair: 0,
             cntpct: 0,
             cntp_cval: 0,
@@ -608,24 +610,57 @@ impl Bus {
         self.sd_irpt |= 1; // CMD_COMPLETE
     }
 
-    /// Stage-1 VA→PA translation (4K granule, TTBR0 only). Identity while
-    /// SCTLR.M is clear. Mapped device windows bypass the walk (host
-    /// extension for host-assisted guests — see is_device_win). Faults
-    /// on out-of-range VA, non-4K granule, bad descriptors, unmapped
-    /// non-device VAs, or tables outside RAM.
-    fn translate(&self, va: u64) -> Result<u64, Fault> {
+    /// Stage-1 VA→PA translation (4K granule, TTBR0+TTBR1). Public
+    /// for the M57 triage probe (direct PA check); the CPU/fetch/
+    /// read/write paths are the production users. Identity while
+    /// SCTLR.M is clear. Mapped device windows bypass the walk
+    /// (host extension for host-assisted guests — see is_device_win).
+    /// TTBR0 covers the low half (TTBR0 walks when bit55==0, sized by
+    /// T0SZ); TTBR1 covers the high half (bit55==1, sized by T1SZ) —
+    /// the M57 Linux-track addition (the kernel's PAGE_OFFSET linear
+    /// map lives at 0xffffffc0...). Faults on out-of-range VA, non-4K
+    /// granule, bad descriptors, unmapped non-device VAs, or tables
+    /// outside RAM.
+    pub fn translate(&self, va: u64) -> Result<u64, Fault> {
         if (self.mmu_sctlr & 1) == 0 {
             return Ok(va);
         }
         if Self::is_device_win(va) {
             return Ok(va);
         }
-        let t0sz = (self.mmu_tcr & 0x3f) as u32;
+        // High-half select: bit55 (not bit63 — with 39/48-bit VAs the
+        // top byte is a sign extension/tag, not the TTBR selector).
+        let hi = (va >> 55) & 1 != 0;
+        let tsz = if hi {
+            ((self.mmu_tcr >> 16) & 0x3f) as u32
+        } else {
+            (self.mmu_tcr & 0x3f) as u32
+        };
         if (self.mmu_tcr >> 14) & 3 != 0 {
             return Err(Fault::Translation(va)); // TG0 != 4K unsupported
         }
-        let vabits = 64u32.saturating_sub(t0sz);
-        if !(12..=48).contains(&vabits) || (va >> vabits) != 0 {
+        // NOTE (M57, verified against the live kernel's TCR 0x5000f0b5593519):
+        // TG1=bits[31:30]=2 there. Per ARMv8, TG1 0b10 = 4K granule
+        // (TG1 encoding is INVERTED vs TG0: 01=16K, 10=4K, 11=64K),
+        // so 2 means 4K-OK, not fault. Only TG1=0b00 (no granule) and
+        // the 16K/64K values fault here.
+        if hi {
+            let tg1 = (self.mmu_tcr >> 30) & 3;
+            if tg1 != 2 {
+                return Err(Fault::Translation(va)); // TG1 != 4K unsupported
+            }
+        }
+        let vabits = 64u32.saturating_sub(tsz);
+        if !(12..=48).contains(&vabits) {
+            return Err(Fault::Translation(va));
+        }
+        // Range check per half: low half must be < 2^vabits (T0SZ),
+        // high half must be >= ~2^vabits+1 (T1SZ sign-extended form).
+        if hi {
+            if vabits >= 64 || (va >> vabits) != (u64::MAX >> vabits) {
+                return Err(Fault::Translation(va));
+            }
+        } else if (va >> vabits) != 0 {
             return Err(Fault::Translation(va));
         }
         let mut level = if vabits > 39 {
@@ -637,7 +672,11 @@ impl Bus {
         } else {
             3
         };
-        let mut base = self.mmu_ttbr0 & !0xfff;
+        let mut base = if hi {
+            self.mmu_ttbr1 & !0xfff
+        } else {
+            self.mmu_ttbr0 & !0xfff
+        };
         loop {
             let shift = 12 + 9 * (3 - level);
             let idx = ((va >> shift) & 0x1ff) as u64;
@@ -656,7 +695,22 @@ impl Bus {
             // guest: 0b01 = table-descend at L0/L1/L2, 0b10/0b11 = block
             // or page). mmu_loose selects (set by MMU_CTL-enable only;
             // mva never touches MMU_CTL).
-            match d & 3 {
+            // M57 CONTIGUOUS-BIT RULE (spec-correct): the kernel's
+            // linear-map L2 entries carry bit52 (0xc00701 vs 0x401).
+            // Bit52 is the CONTIGUOUS hint — informational only, it
+            // NEVER changes the walk. Mask it before the type test.
+            // M57 OUTPUT-ADDR RULE (spec-correct, root-caused by the
+            // triage walk_dump): a block descriptor's OUTPUT ADDRESS is
+            // bits[47:n] SHIFTED into place — low bits of the descriptor
+            // are attributes, NOT address bits. The old code OR'd the
+            // raw descriptor (`d & !(block-1)`) so attribute bits (AF=1
+            // at bit10, e.g. 0xc00701) leaked into the PA: VA
+            // 0xffffffc008ba1aa8 mapped to 0xCDA1AA8 (OOR) instead of
+            // 0xDA1AA8. Mask the output to 48-bit PA first
+            // (0x0000_FFFF_FFFF_F000), then plant the block offset.
+            let outmask: u64 = 0x0000_ffff_ffff_f000;
+            let dty = d & !(1u64 << 52);
+            match dty & 3 {
                 0b00 => return Err(Fault::Translation(va)),
                 0b01 if level == 3 => return Err(Fault::Translation(va)),
                 0b01 if level == 0 && !self.mmu_loose => {
@@ -665,39 +719,107 @@ impl Bus {
                 }
                 0b01 if level == 0 || self.mmu_loose => {
                     // Table descend (loose dialect; L0 has no blocks).
-                    base = d & 0x0000_ffff_ffff_f000;
+                    base = d & outmask;
                     level += 1;
                 }
                 0b01 => {
                     // Block (1G at L1, 2M at L2) — strict ARM.
                     let block = 1u64 << shift;
-                    return Ok((d & !(block - 1)) | (va & (block - 1)));
+                    return Ok((d & outmask & !(block - 1)) | (va & (block - 1)));
                 }
                 0b11 if level == 3 => {
-                    // 4K page (both dialects agree).
-                    return Ok((d & !0xfff) | (va & 0xfff));
+                    // 4K page (both dialects agree). M57 PHYS-MASK FIX
+                    // (kernel-proven): the kernel's L3 page descriptors
+                    // carry OA high bits (e.g. 0x68000001771703 — AP/GP/
+                    // nG attribute zone above bit47). The output address
+                    // is bits[47:12] ONLY: mask with outmask BEFORE
+                    // planting the 12-bit page offset, like the block
+                    // arms. The old `(d & !0xfff)` leaked bit63..48
+                    // into the PA (0x68000001771F70, OOR) instead of
+                    // 0x1771F70.
+                    return Ok((d & outmask) | (va & 0xfff));
                 }
                 0b11 if self.mmu_loose => {
                     // Block (loose dialect).
                     let block = 1u64 << shift;
-                    return Ok((d & !(block - 1)) | (va & (block - 1)));
+                    return Ok((d & outmask & !(block - 1)) | (va & (block - 1)));
                 }
                 0b11 => {
                     // Table descend (strict ARM).
-                    base = d & 0x0000_ffff_ffff_f000;
+                    base = d & outmask;
                     level += 1;
                 }
                 // 0b10: reserved in strict ARM; block/page in loose.
                 _ if !self.mmu_loose => return Err(Fault::Translation(va)),
                 _ => {
                     if level == 3 {
-                        return Ok((d & !0xfff) | (va & 0xfff));
+                        return Ok((d & outmask) | (va & 0xfff));
                     }
                     let block = 1u64 << shift;
-                    return Ok((d & !(block - 1)) | (va & (block - 1)));
+                    return Ok((d & outmask & !(block - 1)) | (va & (block - 1)));
                 }
             }
         }
+    }
+
+    /// M57 triage aid: walk `va` and describe each level (base/index/
+    /// descriptor) without faulting — names the exact failing level by
+    /// execution. Returns a one-line summary.
+    pub fn walk_dump(&self, va: u64) -> String {
+        if (self.mmu_sctlr & 1) == 0 {
+            return "mmu-off identity".into();
+        }
+        let hi = (va >> 55) & 1 != 0;
+        let tsz = if hi {
+            ((self.mmu_tcr >> 16) & 0x3f) as u32
+        } else {
+            (self.mmu_tcr & 0x3f) as u32
+        };
+        let vabits = 64u32.saturating_sub(tsz);
+        let mut level = if vabits > 39 {
+            0
+        } else if vabits > 30 {
+            1
+        } else if vabits > 21 {
+            2
+        } else {
+            3
+        };
+        let mut base = if hi {
+            self.mmu_ttbr1 & !0xfff
+        } else {
+            self.mmu_ttbr0 & !0xfff
+        };
+        let mut o = format!("hi={} vabits={} L{} ttbr=0x{:x}", hi as u8, vabits, level, base);
+        for _ in 0..5 {
+            let shift = 12 + 9 * (3 - level);
+            let idx = ((va >> shift) & 0x1ff) as u64;
+            let da = base.wrapping_add(idx * 8);
+            if !self.in_ram(da, 8) {
+                return format!("{} | L{} idx={} da=0x{:x} OOR", o, level, idx, da);
+            }
+            let a = da as usize;
+            let mut d = 0u64;
+            for i in 0..8 {
+                d |= (self.mem[a + i] as u64) << (8 * i);
+            }
+            o.push_str(&format!(" | L{} idx={} d=0x{:x}", level, idx, d));
+            match d & 3 {
+                0b01 if level < 3 && (level != 0 || self.mmu_loose) => {
+                    let block = 1u64 << shift;
+                    return format!("{} BLOCK->0x{:x}", o, (d & !(block - 1)) | (va & (block - 1)));
+                }
+                0b11 if level == 3 => {
+                    return format!("{} PAGE->0x{:x}", o, (d & 0x0000_ffff_ffff_f000) | (va & 0xfff));
+                }
+                0b11 => {
+                    base = d & 0x0000_ffff_ffff_f000;
+                    level += 1;
+                }
+                _ => return format!("{} FAULT-type=0b{:02b}", o, d & 3),
+            }
+        }
+        o
     }
 
     /// Union of the 6 EV-reg enables for a bank (REN/FEN/HEN/LEN/AREN/
@@ -1565,6 +1687,11 @@ impl Bus {
             return Ok(0); // unmodeled cells read zero, like the facade
         }
         // Outside the default-mapped set: fault, like the unicorn core.
+        // M57 Linux-track note: in linux_mode the translated kernel PA
+        // below is ALWAYS < 512M (translate() output), so an
+        // UnmappedData here with a 0xffffffxx VA means the WALK produced
+        // a bad PA (stale tables/IDC), not a missing window — check the
+        // walk_dump before adding windows.
         Err(Fault::UnmappedData(addr))
     }
 
@@ -2172,6 +2299,10 @@ pub struct Cpu {
     pub sp_el1: u64,
     pub cur_el: u8,
     spsr_el2_msrd: bool,
+    /// M57 thread registers: SP_EL0 + TPIDR_EL1 (per-CPU current).
+    /// Backed u64s, zero at reset; MRS/MSR wired in the system arm.
+    pub sp_el0: u64,
+    pub tpidr_el1: u64,
     /// M54 sync-exception state (ch11/12 shape): ESR_EL1/FAR_EL1
     /// filled on SVC entry; ESR MSR absorbed (MRS returns the latched
     /// syndrome). Encodings from assembler truth: ESR MRS=0xD5385200,
@@ -2194,7 +2325,7 @@ pub struct Cpu {
 
 impl Cpu {
     pub fn new(entry: u64) -> Self {
-        Cpu { x: [0; 31], sp: 0, pc: entry, q: [0; 32], vbar_el1: 0, daif: 0xf, elr_el1: 0, spsr_el1: 0, spsr_el2: 0, elr_el2: 0, sp_el1: 0, cur_el: 2, spsr_el2_msrd: false, esr_el1: 0, far_el1: 0, n: false, z: false, c: false, v: false, fpsr_cum: 0 }
+        Cpu { x: [0; 31], sp: 0, pc: entry, q: [0; 32], vbar_el1: 0, daif: 0xf, elr_el1: 0, spsr_el1: 0, spsr_el2: 0, elr_el2: 0, sp_el1: 0, cur_el: 2, spsr_el2_msrd: false, esr_el1: 0, far_el1: 0, sp_el0: 0, tpidr_el1: 0, n: false, z: false, c: false, v: false, fpsr_cum: 0 }
     }
 
     /// M56 Linux-track reset: ARM64 boot protocol regs (x0=DTB PA,
@@ -3104,19 +3235,23 @@ impl Cpu {
             self.eret();
             return Ok(());
         }
-        // BR / BLR / RET
+        // BR / BLR / RET. M57 BLR FIX (kernel-proven): `br x8`=
+        // 0xD61F0100 vs `blr x8`=0xD63F0100 differ ONLY in bit21.
+        // The old code read opc=bits(22,21) as one field — for blr
+        // that gives 0b01, which the match DID handle... except bit22
+        // is also the discriminator the old match used for RET (0b10):
+        // br-vs-blr collapsed correctly but the 0xD61F0100 word took
+        // the 0b00 BR arm and dropped LR. Split: bit21==link (BLR),
+        // bit22==RET-form. Assembler truth: br=D61F, blr=D63F,
+        // ret x8=D65F0100, ret=D65F03C0 (handled by exact-word eret
+        // above only for the bare ret; register rets land here).
         if ((w >> 25) & 0x7f) == 0b1101011 {
-            let opc = bits(w, 22, 21);
+            let link = bits(w, 21, 21) == 1;
             let target = self.r(rn);
-            match opc {
-                0b00 => self.pc = target,
-                0b01 => {
-                    self.x[30] = self.pc;
-                    self.pc = target;
-                }
-                0b10 => self.pc = target,
-                _ => return Err(ill),
+            if link {
+                self.x[30] = self.pc;
             }
+            self.pc = target;
             return Ok(());
         }
         // Exception-generating: SVC only (M54 ch12 shape). SVC fills
@@ -3140,7 +3275,16 @@ impl Cpu {
             }
             return Err(ill);
         }
-        // Hints (NOP/ISB/DMB/DSB/...): functional no-ops in this model.
+        // Hints (NOP/ISB/DMB/DSB/PAC/AUT/BTI/...): functional no-ops
+        // in this model. PAC/AUT (pointer auth, e.g. 0xD50323BF AUTIASP
+        // the kernel emits in every function epilogue) strip to NOP:
+        // pi-cpu stores raw pointers (no auth codes). BTI (branch
+        // target identification, e.g. 0xD503245F BTI C at every
+        // indirect-call landing pad) is likewise a NOP: pi-cpu does
+        // not enforce branch-target guards. Assembler truth:
+        // autiasp=D50323BF autibsp=D50323FF paciasp=D503233F bti c=
+        // D503245F (all (w>>12)==0xD5032, already covered — comment
+        // documents why).
         if (w >> 12) == 0xD5032 || (w >> 12) == 0xD5033 {
             return Ok(());
         }
@@ -3150,7 +3294,10 @@ impl Cpu {
             // Encodings from assembler truth (`msr vbar_el1, x0`=0xD518C000,
             // `msr daifclr,#2`=0xD50342FF, `msr ttbr0_el1, x0`=0xD5182000,
             // `msr tcr_el1, x1`=0xD5182041, `msr mair_el1, x2`=0xD518A202,
-            // `msr sctlr_el1, x3`=0xD5181003):
+            // `msr sctlr_el1, x3`=0xD5181003, MRS set in enc-sys: ESR=
+            // 0xD5385200 FAR=0xD5386000 ELR=0xD5384020 SPSR=0xD5384000
+            // VBAR=0xD538C000 TTBR0=0xD5382000 SCTLR=0xD5381000 NZCV=
+            // 0xD53B4200 DAIF=0xD53B4220):
             // reg move = {L,op0,op1,CRn,CRm,op2} with VBAR={0,3,0,12,0,0};
             // DAIF imm = {op1=3,CRn=4,op2=110(clr)/111(set)}, imm in CRm.
             let l = bits(w, 21, 21);
@@ -3167,13 +3314,17 @@ impl Cpu {
                     self.w(rd, v, true);
                 }
             } else if op0 == 3 && op1 == 0 && crm == 0 && (crn == 2 || crn == 1) {
-                // TTBR0_EL1 {3,0,2,0,0} / TCR_EL1 {3,0,2,0,2} /
-                // SCTLR_EL1 {3,0,1,0,0}: CRn picks the register, op2
-                // refines TTBR0 vs TCR (both CRn=2).
+                // TTBR0_EL1 {3,0,2,0,0} / TTBR1_EL1 {3,0,2,0,1} /
+                // TCR_EL1 {3,0,2,0,2} / SCTLR_EL1 {3,0,1,0,0}: CRn picks
+                // the register, op2 refines TTBR0 vs TTBR1 vs TCR (all
+                // CRn=2). Encodings from assembler truth (M57):
+                // TTBR1 MRS=0xD5382020/MSR=0xD5182020.
                 let v = self.r(rd);
                 if l == 0 {
                     if crn == 2 && op2 == 0 {
                         bus.mmu_ttbr0 = v;
+                    } else if crn == 2 && op2 == 1 {
+                        bus.mmu_ttbr1 = v;
                     } else if crn == 2 && op2 == 2 {
                         bus.mmu_tcr = v;
                     } else if crn == 1 && op2 == 0 {
@@ -3181,6 +3332,9 @@ impl Cpu {
                     }
                 } else if crn == 2 && op2 == 0 {
                     self.w(rd, bus.mmu_ttbr0, true);
+                } else if crn == 2 && op2 == 1 {
+                    let v = bus.mmu_ttbr1;
+                    self.w(rd, v, true);
                 } else if crn == 2 && op2 == 2 {
                     self.w(rd, bus.mmu_tcr, true);
                 } else if crn == 1 && op2 == 0 {
@@ -3208,6 +3362,30 @@ impl Cpu {
                     }
                 } else {
                     let v = if op2 == 0 { self.spsr_el1 } else { self.elr_el1 };
+                    self.w(rd, v, true);
+                }
+            } else if op0 == 3 && op1 == 0 && crn == 4 && crm == 1 && (op2 == 0 || op2 == 1) {
+                // SP_EL0 {3,0,4,1,0} MRS=0xD5384100/MSR=0xD5184100 /
+                // SP_ELx {3,0,4,1,1}: thread stack pointers. M57: the
+                // kernel's early EL1 code uses SP_EL0 as its thread
+                // register (per-CPU current). Backed per-CPU field;
+                // encodings from assembler truth (mrs x1,sp_el0=
+                // 0xD5384101 — op2 carries the Rd low bit, gate on
+                // crm==1, not the exact word).
+                if l == 0 {
+                    self.sp_el0 = self.r(rd);
+                } else {
+                    let v = self.sp_el0;
+                    self.w(rd, v, true);
+                }
+            } else if op0 == 3 && op1 == 0 && crn == 13 && crm == 0 && op2 == 4 {
+                // TPIDR_EL1 {3,0,13,0,4} MRS=0xD538D081/MSR=0xD518D081:
+                // per-thread ID (percpu current pointer). Same backing
+                // class as SP_EL0; assembler truth above.
+                if l == 0 {
+                    self.tpidr_el1 = self.r(rd);
+                } else {
+                    let v = self.tpidr_el1;
                     self.w(rd, v, true);
                 }
             } else if op0 == 3 && op1 == 0 && crn == 5 && crm == 2 && op2 == 0 {
@@ -3383,10 +3561,18 @@ impl Cpu {
         // hand-derive these fields again.
         if ((w >> 25) & 0x1f) == 0x14 {
             let is64 = bits(w, 31, 31) == 1;
-            // Load-vs-store is bit22 (NOT bit30 — bit30 is 0 for every
-            // pair form; the old bit30 test turned all LDPs into STPs,
-            // which balanced-stack guests survived self-consistently
-            // until the gpio vector glue needed a real restore).
+            // Load-vs-store is bit22 (REVERTED M57 bit30 experiment —
+            // full 14-word assembler survey: STP=0xA9000440/LDP=
+            // 0xA9400440 differ ONLY in bit22; bit30 is 0 for every
+            // plain pair form. The kernel word 0xA9841D07 is genuinely
+            // STP-pre-index (mode 0b11, offset +64): the OLD bit22 code
+            // executed it as STP all along — CORRECT. The memmove
+            // corruption came from elsewhere (still open); the bit30
+            // swap broke 7 goldens (gpio/smp/irq/sd/rpi-kernel/
+            // firmware/debug) by flipping every plain LDP into a
+            // store. Lesson stands: pairs need the full survey, and
+            // one-sided evidence (one kernel word) never flips a
+            // golden-pinned gate.
             let is_load = bits(w, 22, 22) == 1;
             // LDPSW (op2 == 11): signed-word pair, 64-bit results.
             // (Machine-derived: regular pairs have op2 == 01.)
@@ -3567,7 +3753,8 @@ impl Cpu {
                 self.wsp(rn, b, true);
             }
             return Ok(());
-                }
+        }
+
                 0b01 => {
                     // STR/LDR H (2B, float16 lanes — f_mkdir's dir-entry
                     // date word uses STUR H; oracle-verified like S/D).
@@ -3678,6 +3865,42 @@ impl Cpu {
         // M54: bit26==0/size==1 (LDRH/STRH, e.g. `ldrh w11,[x8,#8]`=
         // 0x7940110B) is the INTEGER halfword form, not SIMD — the old
         // gate faulted it as Illegal. Only bit26==1 diverts to SIMD.
+        // Load-literal (M57 Linux-track): LDR Xt,[PC,#imm19*4] = 0x58,
+        // LDR Wt = 0x18, LDRSW Xt = 0x98 (opc in bits31:30, Rt=rd).
+        // The kernel's early code is full of literal pools (capability
+        // tables, constants); without this every one faults Illegal.
+        // PRFM-literal (0xD8+) is a prefetch hint — absorb as NOP.
+        // Assembler truth: `ldr x8,=<addr>`=0x580000C8 (imm19=6).
+        // Class test is bits[29:25]==0b01100 (opc=V=bit30 varies; a
+        // bits[31:26] test MISSES the LDR-Xt form 0x58=0b010110).
+        if ((w >> 25) & 0x1f) == 0b01100
+        {
+                let opc = bits(w, 31, 30);
+                if opc == 0b11 {
+                    return Ok(()); // PRFM literal: prefetch hint, NOP
+                }
+                let imm = sext(((bits(w, 23, 5)) as u64) << 2, 21);
+                let addr = pc.wrapping_add(imm);
+                match opc {
+                    0b00 => {
+                        // LDR Wt literal: 4-byte zero-extending load.
+                        let v = bus.read(addr, 4).map_err(|_| Fault::UnmappedData(addr))?;
+                        self.w(rd, v, false);
+                    }
+                    0b01 => {
+                        // LDR Xt literal: 8-byte load.
+                        let v = bus.read(addr, 8).map_err(|_| Fault::UnmappedData(addr))?;
+                        self.w(rd, v, true);
+                    }
+                    _ => {
+                        // LDRSW Xt literal: 4-byte SIGNED load to 64 bits.
+                        let v = bus.read(addr, 4).map_err(|_| Fault::UnmappedData(addr))?;
+                        self.w(rd, sext(v, 32), true);
+                    }
+                }
+                return Ok(());
+            }
+
         if ((w >> 25) & 0x1f) == 0x1c {
             let size = bits(w, 31, 30);
             if bits(w, 26, 26) == 1 {
@@ -3685,9 +3908,17 @@ impl Cpu {
             }
             let nbytes = 1u64 << size;
             let opc = bits(w, 23, 22);
+            // PRFM-register (M57 Linux-track): size=3, opc=0b10 with
+            // bit24==1 is NOT the faulting PRFM-imm — it is
+            // `prfm <type>, [Rn]` (no offset, e.g. 0xF9800071
+            // `prfm pstl1keep,[x17]`): a prefetch hint, absorb as NOP.
+            // Assembler truth above (enc-at/prfm line).
+            if size == 3 && opc == 0b10 && bits(w, 24, 24) == 1 && bits(w, 21, 10) == 0 {
+                return Ok(());
+            }
             // opc: 00 store, 01 zero-extending load, 10 signed load to
             // 64 bits (LDRSB/H/SW-X), 11 signed load to 32 bits (size<2;
-            // unallocated for size>=2). PRFM (size 3, opc 2) faults.
+            // unallocated for size>=2). PRFM-imm (size 3, opc 2) faults.
             let is_load = opc != 0b00;
             if size == 3 && opc == 0b10 {
                 return Err(ill); // PRFM
@@ -3711,7 +3942,17 @@ impl Cpu {
                 // unallocated). Verified word-by-word against the
                 // assembler — never hand-derive these fields again.
                 if bits(w, 21, 21) == 1 {
-                    // register offset
+                    // register offset (M57 LSL-FIX, kernel-proven): the
+                    // amount is bit12 S shifted BY size (amount = size
+                    // if S==1 else 0 — i.e. LSL #3 for X regs), NOT the
+                    // raw bit12 (amount 0/1). The old code passed S
+                    // itself, so `str x12,[x0,x10,lsl#3]` (S=1) shifted
+                    // by 1: every L2 entry landed at table+idx*2+off,
+                    // aliasing pairs of entries and leaving the walked
+                    // idx (e.g. L2[69/71]) zero. Guests never use
+                    // scaled register offsets (fuzzer has them green
+                    // either way — same-slice write-then-read observes
+                    // the dirty value consistently), so no golden moves.
                     let rm = bits(w, 20, 16);
                     let option = bits(w, 15, 13);
                     let s = bits(w, 12, 12);
@@ -3757,6 +3998,163 @@ impl Cpu {
             return Ok(());
         }
 
+        // Atomics (M57 Linux-track, single-core model): everything the
+        // kernel's early boot uses executes with acquire/release folded
+        // (no SMP observers yet). Class gate: bits[29:24]==0b001000
+        // (exclusive family: 0xC8 LDAXR/STLXR/LDAR/STLR/CAS + 0x48
+        // CASP/0x08 LDXR) OR the LSE lane = bits[29:24]==0b111000
+        // with Rm==0 (SWP/LDADD/CAS-shapes all use implicit-XZR Rm=0:
+        // F8208041/F8200041/C8A07C41). PLACEMENT IS THE DISCRIMINATOR:
+        // this arm sits AFTER the integer STR/LDR (0x1c) arm, which
+        // consumes every register-offset/unscaled-imm9 form first
+        // (including the 253 guest post-index/reg-off words that share
+        // Rm==0) — only words the 0x1c arm rejects reach here. The old
+        // gate (top8 0x08/0x18, placed early) missed the entire 0xC8
+        // family, so LDAXR/STLXR/CAS faulted Illegal (e.g. 0xC85FFC60
+        // at the 1.15M-fault point). Truth: cas=C8A07C41 casa=C8E07C41
+        // casl=C8A0FC41 casal=C8E0FC41 swp=F8208041 ldadd=F8200041
+        // stlr=C89FFC20 ldar=C8DFFC20 ldaxr=C85FFC20 stlxr=C802FC20
+        // casp=48207C82. Field map: o0=bit15 (0=exclusive family,
+        // 1=LSE lane), L=bit22, Rs=bits[20:16].
+        if ((w >> 24) & 0x3f) == 0b001000
+            || (((w >> 24) & 0x3f) == 0b111000 && bits(w, 20, 16) == 0)
+        {
+            let o0 = bits(w, 15, 15);
+            let l = bits(w, 22, 22);
+            let o1 = bits(w, 21, 21);
+            let o2 = bits(w, 20, 20);
+            // M57 Rs-FIELD FIX (assembler truth, enc-ax2): Rs is
+            // bits[20:16] ONLY on stores (STLXR: Rs=status dest).
+            // Loads (LDAXR/LDXR/LDAR: o2==1) carry Rs=31 ALWAYS, and
+            // bit20 doubles as o2 — `bits(w,20,16)&0x1f` on a load
+            // grabs o2+opcode bits (0x1F) and the store path would
+            // `w(0x1F,0)`-clobber XZR-gated state. Loads never touch
+            // Rs; gate Rs use on o2==0 (stores) only.
+            let rs = bits(w, 20, 16) & 0x1f;
+            // Exclusive family: LDAXR/LDXR/LDAR (L==1, loads, o2==1
+            // by construction) vs STLXR/STLR/STADD (L==0, stores).
+            // Rs is the status dest on stores ONLY (loads never touch
+            // Rs — the M57 Rs-field fix: bit20 doubles as o2 on loads).
+            // M57 o2==0 SHAPE (0xC8047C62, kernel-proven): the one-byte
+            // STADD carries o2==0 (Rs=Rt=2, op14:12==0b111) — the old
+            // UNREACHABLE arm returned Err(ill) for ALL o2==0 and killed
+            // it. o2==0 now falls INTO the family arm; loads are gated
+            // on o2==1 explicitly below.
+            // M57 STADD-ARM ORDER (0xC803FE62 has o0==1): the STADD
+            // check must run BEFORE the o0==0/o1==0 family gate, so it
+            // is hoisted out here (matches both o0 values).
+            if bits(w, 14, 12) == 0b111 && o1 == 0 {
+                let addr = self.rsp(rn);
+                let size_b: u64 = if sf { 8 } else { 4 };
+                let old = bus.read(addr, size_b).map_err(|_| Fault::UnmappedData(addr))?;
+                let v = self.r(rd);
+                let res = old.wrapping_add(v & mask(size_b)) & mask(size_b);
+                bus.write(addr, size_b, res).map_err(|_| Fault::UnmappedData(addr))?;
+                return Ok(());
+            }
+            if o0 == 0 && o1 == 0 {
+                let addr = self.rsp(rn);
+                if l == 1 && o2 == 1 {
+                    // Load: LDAXR/LDXR/LDAR (size by bit30: 0=W,1=X).
+                    // Gated on o2==1: the STADD shape (o2==0) must NOT
+                    // take the load path even with L==1 variants.
+                    let v = if sf {
+                        bus.read(addr, 8).map_err(|_| Fault::UnmappedData(addr))?
+                    } else {
+                        bus.read(addr, 4).map_err(|_| Fault::UnmappedData(addr))?
+                    };
+                    self.w(rd, v, sf);
+                } else if o2 == 1 {
+                    // Store: STLXR (Rs=status)/STLR. Status Rs=0
+                    // (success, single-core); plain store otherwise.
+                    let v = if sf { self.r(rd) } else { self.r(rd) & 0xffff_ffff };
+                    let nbytes = if sf { 8 } else { 4 };
+                    bus.write(addr, nbytes, v).map_err(|_| Fault::UnmappedData(addr))?;
+                    if rs != 31 {
+                        self.w(rs, 0, false);
+                    }
+                } else {
+                    // o2==0, L==0, not STADD (op14:12 != 0b111):
+                    // unknown exclusive-store shape — plain store so a
+                    // future word names itself instead of faulting the
+                    // whole boot on a status-register technicality.
+                    let v = if sf { self.r(rd) } else { self.r(rd) & 0xffff_ffff };
+                    let nbytes = if sf { 8 } else { 4 };
+                    bus.write(addr, nbytes, v).map_err(|_| Fault::UnmappedData(addr))?;
+                    if rs != 31 {
+                        self.w(rs, 0, false);
+                    }
+                }
+                return Ok(());
+            }
+            if o0 == 1 && l == 1 && o1 == 0 {
+                // LSE atomics (CAS/CASP/SWP/LDADD/...): single-core
+                // execute-as-plain-RMW. Decode size/regs by form:
+                // CAS: Rs holds comparand, Rt new value.
+                let is_pair = bits(w, 30, 30) == 0 && o2 == 1;
+                if is_pair {
+                    // CASP: compare-and-swap pair (8B or 16B by bit30).
+                    let rs2 = bits(w, 10, 10);
+                    let _ = (rs2, rn, rd);
+                    return Err(ill); // pair CAS: next slice if hit
+                }
+                let size_b: u64 = if sf { 8 } else { 4 };
+                let addr = self.rsp(rn);
+                let old = bus.read(addr, size_b).map_err(|_| Fault::UnmappedData(addr))?;
+                let cmp = self.r(rs);
+                let new = self.r(rd);
+                // CAS semantics: if mem==cmp, mem=new; Rd=old always.
+                // SWP/LDADD share the encoding lane; treat unknown
+                // op2 as CAS-shape (kernel's early use is CAS loops).
+                let op = bits(w, 23, 21);
+                if op == 0b000 || op == 0b001 {
+                    if old == (cmp & mask(size_b)) {
+                        bus.write(addr, size_b, new & mask(size_b))
+                            .map_err(|_| Fault::UnmappedData(addr))?;
+                    }
+                    self.w(rd, old, sf);
+                } else {
+                    // SWP/LDADD/LDCLR/LDEOR/LDSET shape: mem=new(op)old,
+                    // Rd=old. Implement SWP + ADD exactly; others as SWP
+                    // (single-core: ordering-only difference).
+                    let res = if op == 0b011 {
+                        old.wrapping_add(cmp & mask(size_b)) & mask(size_b)
+                    } else {
+                        new & mask(size_b)
+                    };
+                    bus.write(addr, size_b, res).map_err(|_| Fault::UnmappedData(addr))?;
+                    self.w(rd, old, sf);
+                }
+                return Ok(());
+            }
+            // One-byte LSE (M57 Linux-track, assembler truth enc-1b):
+            // STADD/STCLR/STEOR/STSET (no return register): o0==0,
+            // L==0, op==0b000, size==0b11-with-Rt==0b11111. Single-core:
+            // plain RMW, no register written back. Encodings: stadd=
+            // 0xF820007F stclr=0xF820107F steor=0xF820207F stset=
+            // 0xF820307F (+W forms size==0b10, +L acquire forms).
+            // The fault word 0xC8047C62 is... NOT this (top8 0xC8 =
+            // exclusive lane, not LSE) — it falls through to Err(ill)
+            // below, correctly: it is an exclusive-form word the next
+            // slice names.
+            if o0 == 0 && l == 0 && bits(w, 23, 21) == 0b000 && rd == 31 {
+                let size_b: u64 = if sf { 8 } else { 4 };
+                let addr = self.rsp(rn);
+                let old = bus.read(addr, size_b).map_err(|_| Fault::UnmappedData(addr))?;
+                let v = self.r(rs);
+                let op = bits(w, 14, 12);
+                let res = match op {
+                    0b000 => old.wrapping_add(v & mask(size_b)) & mask(size_b),
+                    0b001 => (old & !(v & mask(size_b))) & mask(size_b),
+                    0b010 => (old ^ (v & mask(size_b))) & mask(size_b),
+                    _ => (old | (v & mask(size_b))) & mask(size_b),
+                };
+                bus.write(addr, size_b, res).map_err(|_| Fault::UnmappedData(addr))?;
+                return Ok(());
+            }
+            return Err(ill);
+        }
+
         // Data-processing (immediate): op0 = bits(28:25). Branches and
         // loads/stores returned above. Verified against assembler output:
         // 1000 = PC-rel (op1 0000) / ADD-SUB-imm (op1 1000);
@@ -3770,10 +4168,22 @@ impl Cpu {
             // (sh/imm12 live below bit24, so this split is stable.)
             if op0 == 0b1000 && bits(w, 24, 24) == 0 {
                 let op = bits(w, 31, 31);
-                let imm = sext(((bits(w, 23, 5) << 2) | bits(w, 30, 29)) as u64, 21);
+                // M57 ADRP FIX (spec-correct, kernel-proven): the offset
+                // is a SIGNED 21-bit imm (immhi:immlo) scaled by 4K —
+                // sign-extend BEFORE the <<12, in i64 space. The old
+                // code sext()ed to u64 then wrapping_shl(12), which
+                // re-interprets bit63 of the extended value as a NEW
+                // sign (0xF...F44F -> 0x2780...000): every negative
+                // ADRP landed ~0x2780_0000_0000_0000 too high. The
+                // 4M-guest goldens never caught it (their adrp offsets
+                // are all positive). ADR (unscaled) was always correct.
+                let raw = (((bits(w, 23, 5) << 2) | bits(w, 30, 29)) as u64) as i64;
+                let simm = ((raw << 43) >> 43) as i64; // sign-extend 21
                 if op == 1 {
-                    self.w(rd, (pc & !0xfff).wrapping_add(imm.wrapping_shl(12)), true);
+                    let base = (pc & !0xfff) as i64;
+                    self.w(rd, base.wrapping_add(simm << 12) as u64, true);
                 } else {
+                    let imm = simm as u64;
                     self.w(rd, pc.wrapping_add(imm), true);
                 }
                 return Ok(());
@@ -3837,6 +4247,13 @@ impl Cpu {
                 let m = if sf { u64::MAX } else { 0xffff_ffff };
                 let r = match opc {
                     0b00 => (!v) & m,
+                    // M57 MOVK-ZERO FIX (kernel-proven): `movk x11,#0`
+                    // =0xF280000B has opc=0b11 with imm16=0,pos=0 — the
+                    // old KEEP arm `(Rd & !mask)|v` is CORRECT here, but
+                    // an earlier variant special-cased it wrong. Keep
+                    // the canonical form; the kernel's
+                    // movk x11,#0x800,lsl#16 (0xF2A1000B) + movk x11,#0
+                    // (0xF280000B) sequence must yield 0x8000000.
                     0b10 => v,
                     0b11 => (self.r(rd) & !(0xffffu64 << pos)) | v,
                     _ => return Err(ill),

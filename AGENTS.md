@@ -1761,6 +1761,75 @@ correction: the `load.js` slice table and the `load_elf` entry story).
   the M20-era notes, oracle only).
 - Regression still green: smoke 23/23, fuzzer 882/882.
 
+### M57 — real-Linux track: 200M fault-null (DONE, uncommitted)
+
+The triage fault chain, closed slice by slice, every step verified by
+execution (`node test/linux-triage.mjs`, never by reading). Headline:
+**the real kernel8.img now runs 200,000,000 instructions on pi-cpu
+with fault=null** (n=200M, pc high-half text, x0 stable) — from the
+M56 first fault at n=47968. Console is still silent (no UART yet —
+that is the next slice); the kernel is in early boot (fixup/reloc +
+page-table + percpu setup, all high-half).
+
+Slices (all in `cpu/src/lib.rs`, all assembler-truth, all with
+regression proof smoke 23/23 + fuzzer 882/882):
+
+1. **TTBR1 high-half walk.** `mmu_ttbr1` field + TTBR1 MSR/MRS
+   (`0xD5182020/0xD5382020`) + T1SZ/TG1 decode. Load-bearing traps:
+   TG1 encoding is INVERTED vs TG0 (0b10=4K, not fault — the live
+   kernel's TCR `0x5000f0b5593519` carries TG1=2); bit55 (not bit63)
+   selects the half; high-half range check is sign-extended form.
+2. **Block-output mask.** `(d & !(block-1))` leaked attribute bits
+   (AF=bit10) into the PA (0xCDA1AA8 OOR instead of 0xDA1AA8):
+   mask to 48-bit `outmask` first. Same fix for L3 pages (`(d &
+   !0xfff)` leaked bit63..48: 0x68000001771F70 instead of
+   0x1771F70).
+3. **Load-literal** (`bits[29:25]==0b01100` — a bits[31:26] test
+   MISSES LDR-Xt 0x58=0b010110): LDR X/W + LDRSW + PRFM-literal NOP.
+   First cut broke 8 goldens (smp/fb/irq/mva/sd/rpi-kernel/
+   firmware/debug) via the wrong mask; fixed to the class test.
+4. **PRFM-register NOP** (`prfm pstl1keep,[x17]`=0xF9800071).
+5. **BR/BLR split** (`br`=0xD61F0100 vs `blr`=0xD63F0100 differ only
+   in bit21 — old opc=bits(22,21) match dropped LR... then REVERTED
+   the follow-up theory: `br x8` at the fault site was CORRECT
+   (x8=0x1880000 garbage came from the literal pool, not the
+   branch); the branch arm is unchanged, documented.
+6. **ADRP sign fix.** `sext(u64)<<12` re-signs bit63 (every negative
+   ADRP landed ~0x2780_0000_0000_0000 high). Sign-extend in i64
+   BEFORE `<<12`. Goldens never caught it (all-positive offsets).
+7. **LSL-register-amount fix.** `str x12,[x0,x10,lsl#3]` passed S
+   itself (0/1) as the shift instead of size (3): every L2 entry
+   aliased pairwise, walked idx stayed zero. Other arms already
+   correct (H:1, S/D:esz-shift).
+8. **Atomics lane** (14-word truth table + 20-word negative survey):
+   exclusive family `bits[29:24]==0b001000` (LDAXR/STLXR/LDAR/STLR/
+   CAS/CASP) always live; LSE lane post-0x1c-arm by ORDER (Rm==0
+   forms share bits with guest reg-off stores — three bit-gates
+   each broke goldens or collided; placement after the 0x1c arm is
+   the discriminator). Single-core RMW semantics; STLXR status=0.
+9. **SP_EL0/TPIDR_EL1 backing** (per-CPU current; kernel faults at
+   0x598 without them — TTBR0 L1[0] valid, L2[0] zero = genuinely
+   unmapped low VA, not a decoder bug).
+10. **STADD one-byte** (`0xC8047C62` o0==0 / `0xC803FE62` o0==1,
+    op14:12==0b111, hoisted BEFORE the o0==0/o1==0 family gate —
+    o0/o2 are Rs/opcode bits on the 0xC8 lane, not discriminators).
+11. **LDRH lesson (M54 carry):** triage-grade proof that bit26==1 is
+    SIMD, bit26==0/size==1 is integer halfword (0x7940110B).
+
+- Harness growth: `walk_dump()` (per-level base/idx/descriptor trace),
+  `translate()` made `pub` (direct PA probes), triage `PI3_TRACE=1`
+  replay + fault-VA walk + translate check.
+- Methodology (load-bearing): stale-target trap — `cargo build`
+  without fingerprint invalidation silently runs the OLD core
+  (`rm -rf target` before differential verdicts); triage prints
+  `n=` — a run that prints the OLD fault count is a stale binary,
+  not a failed fix. `one.rs` always runs at pc=0x100 (its x0 print
+  is the page, not the kernel target — verify with mem dumps, not
+  register prints).
+- Open (next): UART/PL011 first output (console silent at 200M —
+  kernel hasn't touched UART yet), then GIC/local-block IRQs,
+  full device bring-up toward the shell prompt.
+
 ## Key risks (M49: unicorn retired — the first two risks below are closed)
 
 - ~~Core patch (Phase 1) is the big unknown~~ CLOSED by the M49 removal:

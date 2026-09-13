@@ -1162,3 +1162,13 @@ dist/                 production bundle
   `0xffffffc0…` high-half VA pi-cpu cannot walk (TTBR0-only) —
   next slice is TTBR1. Regression green (smoke 23/23, fuzzer
   882/882). qemu-wasm stays the reference oracle only.
+- M57 — real-Linux track: 200M fault-null (UNCOMMITTED). The triage
+  fault chain closed slice by slice, all by execution: TTBR1
+  high-half walk (+TG1-inverted encoding, bit55 select), block/L3
+  output masking (AF/attr bits leaked into PAs), load-literal class
+  (`0b01100`), PRFM-register NOP, ADRP i64 sign fix, LSL-amount
+  fix, atomics lane (exclusive + LSE-by-placement), SP_EL0/TPIDR
+  backing, STADD one-byte. **The real kernel8.img runs 200M
+  instructions fault-null** (early boot: fixup/reloc, page tables,
+  percpu; console still silent — UART is next). Regression green
+  (smoke 23/23, fuzzer 882/882).

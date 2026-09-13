@@ -1,6 +1,9 @@
 // M56 triage runner: argv DTB_END KERN_END BUDGET SLICE. Slices the
 // committed .data in-process (no 26MB hex pipe), loads via load_linux(),
 // resets per ARM64 boot protocol, runs Runner chunks, prints first fault.
+// M57: PI3_TRACE=1 dumps the post-MMU instruction trace (pc + ESR/TCR/
+// TTBRs + faulting VA + page-walk), so the next gap is root-caused by
+// execution, never by reading.
 use pi_cpu::{load_linux, runner::Runner, Bus, Cpu, LINUX_DTB_PA};
 
 fn esc(s: &[u8]) -> String {
@@ -44,4 +47,50 @@ fn main() {
         runner.n, cpu.pc, cpu.x[0],
         runner.fault_string().unwrap_or_else(|| "null".into()),
         esc(&bus.console));
+    // M57 post-MMU trace: re-run step-by-step from reset and dump the
+    // last K insns before the fault (pc + raw word + ESR/TCR/TTBRs),
+    // plus a page-walk of the faulting VA. PI3_TRACE=1 enables.
+    if std::env::var("PI3_TRACE").is_ok() {
+        let n = runner.n;
+        let start = n.saturating_sub(40);
+        let mut bus2 = Bus::new();
+        let entry2 = load_linux(&mut bus2, kernel, dtb, initrd).expect("reload");
+        let mut cpu2 = Cpu::new(entry2);
+        cpu2.linux_reset(entry2, LINUX_DTB_PA, 0x1FFF_FFF0);
+        bus2.vt_ips = 262144;
+        let mut r2 = Runner::new();
+        r2.budget = start;
+        r2.slice = slice;
+        r2.run_to(&mut cpu2, &mut bus2, start);
+        println!("trace\treplay to n={} pc=0x{:x}", start, cpu2.pc);
+        // Decode the faulting VA from the runner fault string
+        // (UnmappedData(addr) / Translation(addr) carry the PA-or-VA).
+        let fstr = runner.fault_string().unwrap_or_default();
+        let fva: u64 = fstr
+            .trim_start_matches("UnmappedData(")
+            .trim_start_matches("Translation(")
+            .trim_end_matches(')')
+            .parse()
+            .unwrap_or(0xffffffc008ba1aa8);
+        for i in start..n {
+            let pc = cpu2.pc;
+            let word = bus2.fetch(pc).unwrap_or(0xdead_c0de);
+            let va_info = if (cpu2.pc >> 55) & 1 != 0 { "hi" } else { "lo" };
+            println!("trace\t+{} pc=0x{:x} w=0x{:08x} {} sctlr=0x{:x} tcr=0x{:x} ttbr0=0x{:x} ttbr1=0x{:x}",
+                i, pc, word, va_info, bus2.mmu_sctlr, bus2.mmu_tcr, bus2.mmu_ttbr0, bus2.mmu_ttbr1);
+            if cpu2.step(&mut bus2).is_err() {
+                println!("trace\tfault at step {} (expected {})", i, n);
+                break;
+            }
+        }
+        // Page-walk dump of the faulting VA at the fault point.
+        println!("trace\twalk va=0x{:x}: {}", fva, bus2.walk_dump(fva));
+        // Direct PA probe: is the walk's output PA actually in RAM?
+        // (Separates walk-math bugs from missing-window bugs.)
+        if let Ok(pa) = bus2.translate(fva) {
+            println!("trace\ttranslate(va)=0x{:x} in_ram={}", pa, bus2.in_ram(pa, 8));
+        } else {
+            println!("trace\ttranslate(va) FAULTS");
+        }
+    }
 }
