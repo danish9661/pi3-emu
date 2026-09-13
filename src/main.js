@@ -15,7 +15,6 @@ const DONE_SLICES = 30000; // safety cap for the explicit-done guests
 const FB_ADDR = 0x200000; // allocated framebuffer inside guest RAM
 
 const LINUX_MODE = 'linux';
-const LINUX_ST_MODE = 'linux-st';
 const SMP_MODE = 'smp';
 const CLOCK_MODE = 'clock';
 const GPIO_MODE = 'gpio';
@@ -72,7 +71,7 @@ try {
   }
 } catch (_) {}
 function syncLinuxSels() {
-  const show = (progSel.value === LINUX_MODE || progSel.value === LINUX_ST_MODE) ? 'inline-block' : 'none';
+  const show = progSel.value === LINUX_MODE ? 'inline-block' : 'none';
   if (linuxConfigSel) linuxConfigSel.style.display = show;
   if (linuxThreadsSel) linuxThreadsSel.style.display = show;
 }
@@ -589,9 +588,11 @@ function smpRunSync() {
 // /linux/index.html) instead of the pi-cpu core. We embed it in an iframe
 // rather than driving it from JS: the page wires xterm to the emulated
 // PL011 via xterm-pty and boots the raspi3ap machine (4x Cortex-A53, 512 MB)
-// with the prebuilt kernel8.img + DTB + busybox rootfs.
-function runLinux(base, forcedThreads) {
-  base = base || './linux/index.html';
+// with the prebuilt kernel8.img + DTB + busybox rootfs. Threads (auto/on/
+// off in the dropdown) are handled inside that page via SabToggle — the
+// single linux/ choice covers both engines, no second program entry.
+function runLinux() {
+  const base = './linux/index.html';
   cancelAnimationFrame(gpioFrame);
   cancelAnimationFrame(fbFrame);
   cancelAnimationFrame(irqFrame);
@@ -607,7 +608,7 @@ function runLinux(base, forcedThreads) {
   const linuxBoot = document.getElementById('linuxBoot');
   if (linuxBoot) { linuxBoot.hidden = false; linuxBoot.textContent = 'booting Linux…'; }
   const cfg = linuxConfigSel ? linuxConfigSel.value : 'minimal';
-  const threads = forcedThreads || (linuxThreadsSel ? linuxThreadsSel.value : 'auto');
+  const threads = linuxThreadsSel ? linuxThreadsSel.value : 'auto';
   window.__linuxConfig = cfg;
   window.__linuxThreads = threads;
   const linuxUrl = base + '#cfg=' + encodeURIComponent(cfg) +
@@ -627,11 +628,8 @@ function runLinux(base, forcedThreads) {
   term.parentNode.insertBefore(frame, term.nextSibling);
   frame.src = linuxUrl;
   frame.hidden = false;
-  const engineTag = base.indexOf('linux-st') !== -1
-    ? 'qemu-wasm raspi3ap single-thread engine (no SharedArrayBuffer needed)'
-    : 'qemu-wasm raspi3ap';
-  setStatus('booting Linux (' + cfg + ' / threads ' + threads + ') — ' + engineTag + ' — serial console in the frame below');
-  hint.textContent = 'Linux runs in the embedded frame (threads: auto = MTTCG when isolated, else single-thread fallback). Press Reboot to reload the VM.';
+  setStatus('booting Linux (' + cfg + ' / threads ' + threads + ') — qemu-wasm raspi3ap — serial console in the frame below');
+  hint.textContent = 'Linux runs in the embedded frame (threads: auto = MTTCG when isolated; use the dropdown for single-thread). Press Reboot to reload the VM.';
   runBtn.textContent = 'Reboot';
   runBtn.disabled = false;
 }
@@ -713,16 +711,6 @@ async function run() {
   // not by the pi-cpu core — bail out before initializing anything.
   if (progSel.value === LINUX_MODE) {
     runLinux();
-    return;
-  }
-  if (progSel.value === LINUX_ST_MODE) {
-    // Direct boot of the dedicated single-thread engine (public/linux-st/,
-    // initramfs boot, no SharedArrayBuffer needed). This bypasses the
-    // sentinel-gated auto-handoff in public/linux/index.html: an explicit
-    // user choice to try the ST engine. Deep ST execution is still the
-    // upstream-blocked path (see README/M32 + 49a56a7); this option makes
-    // the attempt observable in a real browser.
-    runLinux('./linux-st/index.html', 'off');
     return;
   }
   cancelAnimationFrame(gpioFrame);

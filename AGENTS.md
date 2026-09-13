@@ -11,6 +11,30 @@ programs cross-compiled to AArch64 ELF and loaded into guest RAM.
 Repo: `github.com/danish9661/pi3-emu` (master branch, one commit per
 milestone M1…M19, long descriptive commit messages).
 
+## PRIME DIRECTIVE (2026-09-13, user-locked — do not drift)
+
+We are building our OWN ARM Linux emulator in Rust→wasm (pi-cpu +
+BCM2837 board) that boots a REAL Raspberry Pi 3 OS image (upstream
+`raspberrypi/linux` kernel8.img + DTB + rootfs, like qemu `raspi3ap`
+does) — NOT a toy kernel, NOT qemu-wasm forever. qemu-wasm
+(`public/linux/`, `public/linux-st/`) is the REFERENCE ONLY (oracle
+for boot logs, DTB/cmdline, device behavior); the shippable engine is
+pi-cpu. Success = same kernel8.img that boots under qemu boots under
+pi-cpu to a shell prompt on the emulated PL011 in the browser.
+
+- M20 unicorn.js notes below are HISTORICAL RECORD ONLY (that agent
+  path failed on TCI/NEON + fork patches — IGNORE for design; never
+  re-introduce unicorn). Our CPU is pi-cpu (`cpu/src/lib.rs`), our
+  board is `Bus`, our kernel track is `ports/rpi-kernel/` stepping
+  toward the real boot protocol.
+- Execution rule: verify by EXECUTION (`cargo run`, `node test/...`,
+  Playwright), never by reading. Assembler truth only (never hand-hex).
+- Subagent rule (opencode bug workaround): subagents sometimes die with
+  no real work. NEVER trust a completion summary — the integrator must
+  `git status/diff`, rebuild, and re-run the battery before accepting
+  any subagent claim. If a subagent returns empty, read its on-session
+  history/output and redo the slice single-handed.
+
 ## Current state (M1–M19, all green)
 
 Devices implemented as host-arbitrated MMIO "windows" (mirror registers
