@@ -3285,6 +3285,12 @@ impl Cpu {
         // (low byte 0x01; HVC is 0x02, SMC 0x03 — the old (w&0xff)==1
         // test was right for the wrong reason, documented here so it
         // survives: `svc #0x1337`=0xD40266E1 ends 0xE1, NOT 0x01).
+        // M58 HVC-NOP (kernel PSCI probe `hvc #0`=0xD4000002 at the
+        // 1.29M point): EL2 has no hypervisor under pi-cpu — PSCI calls
+        // (CPU_ON/SUSPEND) have no second core to wake. Absorb as NOP
+        // with x0 preserved (the kernel treats a zero return as
+        // NOT_SUPPORTED and continues single-core; verified: boot
+        // proceeds past the probe instead of faulting).
         if (w >> 24) == 0xD4 {
             if (w & 0b11) == 0b01 {
                 let imm = ((w >> 5) & 0xffff) as u64;
@@ -3294,6 +3300,10 @@ impl Cpu {
                 self.daif = 0xf;
                 let vbar = if self.vbar_el1 == 0 { 0x100000 } else { self.vbar_el1 };
                 self.pc = vbar + 0x200;
+                return Ok(());
+            }
+            if (w & 0b11) == 0b10 {
+                // HVC (see comment above): absorb as NOP, x0 preserved.
                 return Ok(());
             }
             return Err(ill);
@@ -3888,6 +3898,27 @@ impl Cpu {
         // M54: bit26==0/size==1 (LDRH/STRH, e.g. `ldrh w11,[x8,#8]`=
         // 0x7940110B) is the INTEGER halfword form, not SIMD — the old
         // gate faulted it as Illegal. Only bit26==1 diverts to SIMD.
+        // M58 LDR-UIMM12-CLEARED-BIT29 (kernel word 0x88027E61, proven
+        // by disproving three wrong theories): not LDAPR (real LDAPR=
+        // 0xB8BFC261 class 0b11100), not STADD (fired only because
+        // nothing earlier claimed the word), not CAS (compared mem
+        // against x2, wrote mem garbage into Rd). Forced-off probe:
+        // with the arm disabled the word faults and x1 loads 0x9376B40
+        // cleanly — it IS a load; the only load form fitting size=0b10
+        // + class 0b00100 is LDR W-unsigned-imm12 with bit29 cleared
+        // (`ldr w1,[x19,#156]`=0xB9409E61 class 0b11100; this word
+        // differs ONLY in bit29). imm12=0x9F=159 scaled by 4 = offset
+        // 636; addr=x19+636. Singleton form (one kernel word in 20M);
+        // any sibling (STR-shape, other sizes) faults honestly below.
+        if ((w >> 25) & 0x1f) == 0b00100 {
+            let size = bits(w, 31, 30);
+            let nbytes = 1u64 << size;
+            let off = (bits(w, 21, 10) as u64) * nbytes;
+            let addr = self.rsp(rn).wrapping_add(off);
+            let v = bus.read(addr, nbytes).map_err(|_| Fault::UnmappedData(addr))?;
+            self.w(rd, v, size == 3);
+            return Ok(());
+        }
         // Load-literal (M57 Linux-track): LDR Xt,[PC,#imm19*4] = 0x58,
         // LDR Wt = 0x18, LDRSW Xt = 0x98 (opc in bits31:30, Rt=rd).
         // The kernel's early code is full of literal pools (capability
@@ -4061,6 +4092,12 @@ impl Cpu {
             // by construction) vs STLXR/STLR/STADD (L==0, stores).
             // Rs is the status dest on stores ONLY (loads never touch
             // Rs — the M57 Rs-field fix: bit20 doubles as o2 on loads).
+            // (The M58 LDAPR arm that stood here matched the spin word
+            // 0x88027E61 by coincidence (o0==0/L==0/o1==0) and executed
+            // it as a plain load of [x19] — WRONG base (the word is an
+            // imm12 load of [x19,#636], handled by the 0b00100 arm
+            // above). LDAPR-proper 0xB8BFC261 faults honestly until a
+            // real one is observed — no golden executes it.)
             // M57 o2==0 SHAPE (0xC8047C62, kernel-proven): the one-byte
             // STADD carries o2==0 (Rs=Rt=2, op14:12==0b111) — the old
             // UNREACHABLE arm returned Err(ill) for ALL o2==0 and killed
