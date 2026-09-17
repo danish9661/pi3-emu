@@ -33,6 +33,27 @@ pub struct Runner {
     pub n: u64,
     /// First fault (stops the run).
     pub fault: Option<Fault>,
+    /// IRQ deliveries taken (M61 triage: proves whether the line ever
+    /// delivered — a live line with zero deliveries = masked waiter).
+    pub irqs: u64,
+    /// PCs of the first 8 IRQ deliveries (M61 triage: proves WHICH line
+    /// delivered — timer vector vs mailbox vector land at different
+    /// handlers; elr shows the interrupted site).
+    pub irq_pcs: Vec<u64>,
+    /// M61 mailbox-IRQ drain log (MBOXTAG-gated): each entry is the `n`
+    /// at which a chunk boundary observed the mailbox completing line
+    /// de-asserted after having been live (mbox0=2 observed, then
+    /// mbox0=0 at a later chunk). Proves the chained handler drained
+    /// MAIL0_RD by execution. Grows only when `Bus::mbox_drain_log`
+    /// is set; zero-cost otherwise.
+    pub mbox_drains: Vec<u64>,
+    /// M61 send-side watch (MBOXTAG-gated): last MAIL1 word observed,
+    /// so the sender pc/DAIF at each MBOXWR is proven by execution.
+    /// Zero-cost unless MBOXTAG is set (checked once per chunk).
+    mbox_last_seen: u32,
+    /// M61 DAIF watch (MBOXTAG-gated): last DAIF observed, so mask
+    /// transitions while the mailbox line is live are proven.
+    mbox_daif_last: u8,
     saved_pc: Option<u64>,
     saved_daif: u8,
     resume_armed: bool,
@@ -53,6 +74,11 @@ impl Runner {
             keys: Vec::new(),
             n: 0,
             fault: None,
+            irqs: 0,
+            irq_pcs: Vec::new(),
+            mbox_drains: Vec::new(),
+            mbox_last_seen: 0,
+            mbox_daif_last: 0xf,
             saved_pc: None,
             saved_daif: 0,
             resume_armed: false,
@@ -119,6 +145,48 @@ impl Runner {
             if self.fault.is_some() {
                 break;
             }
+            // M61 mailbox-IRQ drain watch: the chained handler drains
+            // MAIL0_RD (clearing mbx_pending and dropping mbox0) while
+            // DAIF is clear; the weighing waiter then observes the
+            // completed reply inline. A 1->0 transition of the gated
+            // mailbox line across a chunk boundary proves a drain by
+            // execution (a stuck line never transitions). Gated on
+            // `mbox_drain_log` so the hot loop stays untouched otherwise.
+            // M61 send-side watch (MBOXTAG only): any NEW last_write word
+            // or DAIF edge while the line is live is traced with pc, so
+            // the sender/waiter identity is proven, not guessed.
+            if bus.mbox_drain_log {
+                let m0 = bus.mbox_pending0() != 0;
+                if bus.mbox_prev_live && !m0 {
+                    bus.mbox_prev_live = false;
+                    self.mbox_drains.push(self.n);
+                    if std::env::var("MBOXTAG").is_ok() {
+                        eprintln!("MBOXDRAIN n={}", self.n);
+                    }
+                } else if m0 {
+                    bus.mbox_prev_live = true;
+                }
+                if std::env::var("MBOXTAG").is_ok() {
+                    if bus.mbx_last_write != self.mbox_last_seen {
+                        self.mbox_last_seen = bus.mbx_last_write;
+                        eprintln!(
+                            "MBOXSEND n={} pc=0x{:x} daif=0x{:x} word=0x{:08x}",
+                            self.n, cpu.pc, cpu.daif, bus.mbx_last_write
+                        );
+                    }
+                    if cpu.daif != self.mbox_daif_last {
+                        eprintln!(
+                            "MBOXDAIF n={} pc=0x{:x} daif=0x{:x}->0x{:x} mbox0={}",
+                            self.n,
+                            cpu.pc,
+                            self.mbox_daif_last,
+                            cpu.daif,
+                            bus.mbox_pending0()
+                        );
+                        self.mbox_daif_last = cpu.daif;
+                    }
+                }
+            }
             if bus.irq_ret_pending {
                 bus.irq_ret_pending = false;
                 // Resume actuates next pre-chunk. saved_pc/saved_daif already
@@ -126,15 +194,33 @@ impl Runner {
                 self.resume_armed = true;
             }
             // Fresh decision at the CURRENT (end-of-chunk) pc — the facade's
-            // irqElr. Delivery sources mirror the hardware/facade split: the
-            // legacy GPU line (host line) plus the arch-timer gt condition
-            // (owned by the core internally on the facade). cntp is disabled
-            // for the legacy-IC guests, so they only see the GPU line. No
-            // in-flight flag: entry masks DAIF, which blocks re-entry while
-            // a handler runs (completion unmasks via magic or eret).
+            // irqElr. Delivery sources mirror the hardware/facade split:
+            // the legacy GPU line is reported through the local block's
+            // CORE_IRQ_SRC bit 8 (which the chained handler reads), while
+            // the per-core arch-timer lines surface as CORE_IRQ_SRC bits
+            // 0-3 gated by LOCAL_TIMER_INT_CONTROL0. The combined
+            // legacy_line() (GPU/timer/DMA mailbox mixture) plus the raw
+            // cntp gt condition over-delivers: with the timer enable bit
+            // clear, a live cntp compare would enter the vector with no
+            // source bit set (proven: LOCALRD legacy=0/cntp=1 reads while
+            // the tick was masked). Gate each source on its own enable:
+            // mailbox/timer/DMA/GPIO/UART via legacy_line() (their IC
+            // enables are already folded in), cntp ONLY when its local
+            // enable (bit 1) is set. No in-flight flag: entry masks DAIF,
+            // which blocks re-entry while a handler runs (completion
+            // unmasks via magic or eret).
+            // M61 BARE-METAL COMPAT: the enable gate applies in linux_mode
+            // only (see the +0x60 read arm); bare-metal guests (lirq
+            // Phase A, rpi-kernel ticks) never touch +0x40 and keep the
+            // legacy raw-compare delivery.
+            let cntp_gated = if bus.linux_mode {
+                (bus.local_timer_ctl0_pub() & (1 << 1)) != 0 && bus.cntp_line()
+            } else {
+                bus.cntp_line()
+            };
             if self.vector_pending.is_none()
                 && !cpu.irq_masked()
-                && (bus.legacy_line() || bus.cntp_line())
+                && (bus.legacy_line() || cntp_gated)
             {
                 // Real exception entry snapshot at the CURRENT end-of-chunk
                 // pc/PSTATE (= facade post-slice irqElr timing, which the
@@ -153,6 +239,10 @@ impl Runner {
                 self.saved_daif = cpu.daif;
                 cpu.daif = 0xf;
                 self.saved_pc = Some(cpu.pc);
+                self.irqs += 1;
+                if self.irq_pcs.len() < 8 {
+                    self.irq_pcs.push(cpu.pc);
+                }
                 let vbar = if cpu.vbar_el1 == 0 { 0x100000 } else { cpu.vbar_el1 };
                 self.vector_pending = Some(vbar + 0x280);
             }

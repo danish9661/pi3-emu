@@ -1834,6 +1834,72 @@ regression proof smoke 23/23 + fuzzer 882/882):
   kernel hasn't touched UART yet), then GIC/local-block IRQs,
   full device bring-up toward the shell prompt.
 
+
+### M61 -- real-Linux mailbox-IRQ bring-up batch (DONE, committed)
+
+Stall fixed point (by execution, zzconfprobe/zzspinprobe release,
+slice 4096, vt 262144): 2B fault-null at pc=0xffffffc0080c1804,
+daif=0x3, console 9322 B, tail stuck at `vgaarb: loaded` after
+`Firmware transaction timeout` @3.4s. Proved live: 3 mailbox requests
+parsed (tags 0x1, 0x3, 0x30046), bank-0 bit-1 enable (ICWR +0x18=0x2),
+MAIL0_CNF=1, mbox0=2 LIVE, 21089 timer IRQs, ZERO MBOXRD +0x00 drains,
+zero ICRD handler reads. 1.5B/2B/2.2B all freeze at irqs=21089 (timer
+IMASKed, handler dead) with the mailbox line still live -- same tail,
+no forward progress.
+
+Slices (all in cpu/src/lib.rs + cpu/src/runner.rs, all
+upstream-grounded, battery smoke 23/23 + fuzzer 882/882 after every
+edit):
+
+1. Mailbox multi-shot + real layout + bus->PA. Every channel-8
+   MAIL1_WRT re-processes (no changed-value gate -- kernel reuses one
+   buffer per probe); +0x20 real write word dual-decoded with legacy
+   +0x14 (fb/shell goldens pin the legacy path); MAIL1 word masked
+   & 0x3FFFFFFF (VC bus alias: 0xdc02/060008 -> PA 0x1c02/060000,
+   proven by MBOXWR+MBOXBUF trace); +0x00 drain-on-read clears
+   pending; +0x18/+0x38 STA busy-while-pending (0 while pending, else
+   1<<30); size<8 answers success so a malformed buffer retries.
+2. Completion is a MAIL0 IRQ (upstream raspberrypi.c +
+   bcm2835-mailbox.c, fetched live). mbx_cnf_irqen (+0x1C latch),
+   mbox_pending0() (pending&&cnf&&ic_en0-bit1), BASIC bit 1, bank-0
+   enable +0x18/+0x24 (upstream irq-bcm2835.c reg_enable
+   {0x18,0x10,0x14} -- old code had NO bank-0 enable, so the line
+   never raised). STATUS-bit polling theories all dead (2B-verified 3
+   ways -- driver never collects via STATUS).
+3. Local block: local_gpu_routing (+0x0C, kernel writes 0x0 -> legacy
+   path), +0x40/+0x50 timer/mailbox CTL latches, +0x60 bit1 = cntp
+   gated on +0x40 bit1 in linux_mode only (bare-metal lirq/rpi-kernel
+   keep raw-compare), bit8 = legacy gated on routing==0. Runner gates
+   cntp delivery the same way (bare-metal compat: gate applies in
+   linux_mode only).
+4. DTB routing verified by parsing the real DTB (FDTv17, NOP padding):
+   mailbox@7e00b880 `interrupts = <0 1>` (bank-0 bit 1),
+   interrupt-controller@7e00b200 brcm,bcm2836-armctrl-ic,
+   local_intc@40000000 brcm,bcm2836-l1-intc; both DTB walkers now
+   tolerate FDT_NOP (token 4) or the whole chosen/memory patch
+   silently no-ops. Bootargs blacklist now byte-exact oracle minimal.
+5. Tags: 0x1 fw rev, 0x10004 serial, 0x30001 ON, 0x30002 rate table
+   (+tsize==0 V3D-quirk absorb), 0x30003 measured, 0x30004 max,
+   0x30007 min 0, 0x30006 exists, 0x30046 notify, 0x30009/0x28001
+   turbo 0, 0x3000d/e/10 voltage nominal, unknown -> success+zeros
+   (never error bit). Live kernel tags @2B: 0x1/0x3/0x30046 only --
+   stall is before clocks.
+6. Triage harness: Runner.irqs + irq_pcs[8] + mbox_drains (drain-log
+   gated) + MBOXSEND/MBOXDAIF/LOCALRD/ICRD/ICVAL/MBOXRD/MBOXWR/
+   MBOXCNF/ICWR/LOCALWR MBOXTAG traces (stderr, split-stream hygiene)
+   + PI3_TIMERTRACE with cntpct at write time +
+   mem_u32_dbg/uart_pending2_pub/local_timer_ctl0_pub probe helpers.
+   zzconfprobe takes [budget] [slice] for the slice-sensitivity test.
+- Open (next, M62): the weighing waiter (0xffffffc0080c1804,
+  [sp_el0+8] counter vs x0=0x1, frame chain
+  b9cd08/c9868/137d84/1485c0/1486d8/92dda4(CNTP-IMASK-set)/102e9c/
+  fb2c4/100a8/167a8/191dc/b91084) sleeps with DAIF masked while
+  mbox0=2 is live -- the chained handler never walks (LOCAL+0x60
+  reads are all timer-side; zero ICRD/MBOXRD+0x00). Candidates in
+  order: IMASK-honor (CNTP_CTL bit1) to unstick the timer storm, then
+  synchronous completion vs dispatch-walk fix -- each needs MBOXTAG
+  counts + tail + battery as proof.
+
 ## Key risks (M49: unicorn retired — the first two risks below are closed)
 
 - ~~Core patch (Phase 1) is the big unknown~~ CLOSED by the M49 removal:

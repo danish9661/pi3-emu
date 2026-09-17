@@ -1172,3 +1172,16 @@ dist/                 production bundle
   instructions fault-null** (early boot: fixup/reloc, page tables,
   percpu; console still silent — UART is next). Regression green
   (smoke 23/23, fuzzer 882/882).
+- M61 -- real-Linux mailbox-IRQ bring-up batch: 2B fault-null stall at
+  pc=0xffffffc0080c1804 (daif=0x3, console 9322 B, tail `vgaarb: loaded`
+  after `Firmware transaction timeout` @3.4s). Mailbox multi-shot + real
+  layout (MAIL1_WRT +0x20 dual-decoded with legacy +0x14, VC bus alias
+  mask 0x3FFFFFFF, +0x00 drain-on-read, STA busy-while-pending); MAIL0
+  IRQ completion path (CNF +0x1C latch, mbox_pending0, BASIC bit 1,
+  bank-0 enable +0x18/+0x24 per upstream irq-bcm2835.c); local block
+  (+0x0C routing, +0x40/+0x50 CTLs, +0x60 cntp-gate linux_mode-only with
+  bare-metal compat); DTB routing verified (mailbox bank-0 bit 1) +
+  FDT_NOP-tolerant walkers + oracle-minimal blacklist; clock/voltage/
+  turbo tag nominals (live tags @2B: 0x1/0x3/0x30046); Runner.irqs/
+  irq_pcs/mbox_drains + MBOXTAG/PI3_TIMERTRACE triage harness.
+  Smoke 23/23, fuzzer 882/882.

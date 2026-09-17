@@ -77,8 +77,10 @@ pub struct Bus {
     /// M56 Linux track: once `load_linux()` runs, RAM expands to 512M
     /// and `ram_size()` (not the `RAM_SIZE` const) gates every range
     /// check. New code must use `in_ram()`; legacy `is_ram()` stays
-    /// for the 4M goldens.
-    linux_mode: bool,
+    /// for the 4M goldens. Public: the runner's M61 cntp gate needs it
+    /// (bare-metal guests keep raw-compare delivery; Linux needs the
+    /// local-enable gate).
+    pub linux_mode: bool,
     // System-timer model (BCM2837 0x3F003000), mirroring the host facade:
     // compares pulled from the window, match-pending latched with crossed
     // flags, CS writes absorbed as keep-masks (the model's inverted W1C —
@@ -116,8 +118,15 @@ pub struct Bus {
     // included as harmless cells, like window memory); pair p bank b
     // lives at [0,3,6,9,12,15][p]+b (REN/FEN/HEN/LEN/AREN/AFEN).
     gpio_en: [u32; 17],
-    // Legacy IC (0x3F00B200, bank 2 GPIO line only — mirrors ic.js):
+    // Legacy IC (0x3F00B200 — mirrors ic.js + upstream irq-bcm2835.c):
     // ENABLE accumulates, DISABLE clears, PENDING reads show line&enabled.
+    // Register layout (upstream reg_enable[] = {0x18, 0x10, 0x14},
+    // reg_disable[] = {0x24, 0x1C, 0x20}: bank-0 enable is at +0x18,
+    // NOT +0x10 — the old code had no bank-0 enable at all, so the
+    // mailbox driver's bank-0 bit-1 enable never latched and the MAIL0
+    // IRQ line never raised: every firmware transaction timed out at
+    // 3.4s, proven by ICWR-trace showing only +0x10/+0x14 writes).
+    ic_en0: u32,
     ic_en1: u32,
     ic_en2: u32,
     /// Set by a nonzero write to IC_IRQ_RET; the harness consumes it to
@@ -174,8 +183,8 @@ pub struct Bus {
     // stuck true from 145908736 with DAIF set, faulting the smp-
     // processor-id slow path at 149748056).
     pub cntpct: u64,
-    cntp_cval: u64,
-    cntp_ctl: u32,
+    pub cntp_cval: u64,
+    pub cntp_ctl: u32,
     cntv_cval: u64,
     cntv_ctl: u32,
     vt_us_f: f64,
@@ -242,14 +251,57 @@ pub struct Bus {
     /// absorbed like other unlisted cells, so the flag carries it.
     spi_done: bool,
     // VideoCore mailbox (0x3F00B880 — mirrors main.js mboxProcess +
-    // fbTag): single-shot property requests (the fb guest sends all six
-    // tags in one buffer) with the reply published at sync_out. Frame-
-    // buffer geometry exposed for the browser canvas blit.
-    mbx_pending: bool,
-    mbx_addr: u32,
-    mbx_last_write: u32,
-    mbx_pub_read: u32,
-    mbx_pub_status: u32,
+    // fbTag): multi-shot property requests (the fb guest sends all six
+    // tags in one buffer; the kernel sends one request per driver probe,
+    // M61: no changed-value gate — the kernel reuses one buffer address
+    // per probe — and mbx_pending (the publish flag) drives the STATUS
+    // snapshots. The kernel-path STATUS cells (+0x18 MAIL0_STA / +0x38
+    // MAIL1_STA) serve the live EMPTY bit; the legacy cells (+0x04 /
+    // always-clear +0x18-legacy) keep the fb/shell/debug goldens pinned.
+    // First-cut traps, all execution-proven: (1) the +0x14 MAIL0_SENDER
+    // latch never saw the kernel's +0x20 writes (mbox census ~1 while
+    // the driver timed out); (2) the MAIL1 word is a VC BUS address
+    // (mask 0x3FFFFFFF: 0xdc02/060008 -> PA 0x1c02/060000); (3) the
+    // hardwired +0x38=0 meant EMPTY-always so the driver's MAIL1_STA
+    // poll never saw its reply collected. Framebuffer geometry exposed
+    // for the browser canvas blit. mbx_* cells are pub for the M61
+    // triage probe (mailbox buffer dump).
+    pub mbx_pending: bool,
+    pub mbx_addr: u32,
+    pub mbx_last_write: u32,
+    pub mbx_pub_read: u32,
+    pub mbx_pub_status: u32,
+    // MAIL0_CNF interrupt-enable latch (M61 IRQ path): the mailbox
+    // driver writes IHAVEDATAIRQEN (bit 0) at probe (bcm2835_startup)
+    // and clears it at shutdown; while set, a pending reply raises the
+    // bank-0 bit-1 line so the IRQ handler drains MAIL0_RD (the real
+    // completion path — the driver never polls STATUS).
+    mbx_cnf_irqen: bool,
+    /// M61 drain-watch edge state (see Runner::mbox_drains): last gated
+    /// mailbox-line level observed at a chunk boundary. Only maintained
+    /// while `mbox_drain_log` is set; the runner owns the log itself.
+    pub mbox_prev_live: bool,
+    /// M61 drain-watch enable (zero-cost when off): set by triage probes
+    /// that need proof of MAIL0 drains by execution.
+    pub mbox_drain_log: bool,
+    // Local-block per-core timer/mailbox control cells (M61 IRQ path):
+    // LOCAL_TIMER_INT_CONTROL0 (+0x40, core 0): low 4 bits = per-core
+    // arch-timer IRQ enables (bit1 = CNTPNSIRQ — the timer the kernel's
+    // clocksource tick uses); LOCAL_MAILBOX_INT_CONTROL0 (+0x50, core 0):
+    // low 4 bits = per-mailbox IRQ enables (unused by the mailbox
+    // driver — its completion arrives via the legacy IC bank-0 GPU
+    // chain, not the local mailbox lines — so latched, never consulted).
+    // Upstream: irq-bcm2836.c. Unknown bits absorbed (FIQ halves, core
+    // 1..3 strides — single core 0 only).
+    local_timer_ctl0: u32,
+    local_mbox_ctl0: u32,
+    // Local-block GPU routing latch (M61 IRQ path): GPU_ROUTING at
+    // LOCAL+0x0C (upstream ARM_LOCAL_GPU_INT_ROUTING; the kernel writes
+    // 0x0 at boot — proven by LOCALWR trace — which routes GPU IRQs to
+    // the legacy IC's bank-0 path that the chained handler serves).
+    // Nonzero would steer them elsewhere (FIQ/local); only 0x0 is
+    // modeled, other values are latched and ignored.
+    local_gpu_routing: u32,
     fb_w: u32,
     fb_h: u32,
     fb_depth: u32,
@@ -312,6 +364,7 @@ impl Bus {
             gpio_eds: 0,
             gpio_fsel: [0; 6],
             gpio_en: [0; 17],
+            ic_en0: 0,
             ic_en1: 0,
             ic_en2: 0,
             irq_ret_pending: false,
@@ -386,6 +439,12 @@ impl Bus {
             mbx_last_write: 0,
             mbx_pub_read: 0,
             mbx_pub_status: 0x80000000,
+            mbx_cnf_irqen: false,
+            mbox_prev_live: false,
+            mbox_drain_log: false,
+            local_timer_ctl0: 0,
+            local_mbox_ctl0: 0,
+            local_gpu_routing: 0,
             fb_w: 0,
             fb_h: 0,
             fb_depth: 0,
@@ -882,22 +941,39 @@ impl Bus {
         (self.cntp_ctl & 1) != 0 && self.cntpct >= self.cntp_cval
     }
 
-    /// Legacy-IC gated line (bank-1 timer bits + DMA0, bank-2 GPIO
-    /// bit 17 + UART bit 25; AUX/SDHCI unmodeled). Mirrors ic.js
-    /// pending().
+    /// Legacy-IC gated line (bank-0 MAILBOX bit 1 + bank-1 timer bits +
+    /// DMA0, bank-2 GPIO bit 17 + UART bit 25; AUX/SDHCI unmodeled).
+    /// Mirrors ic.js pending().
     pub fn legacy_line(&self) -> bool {
-        self.timer_pending1() | self.dma_pending1() | self.gpio_pending2() | self.uart_pending2() != 0
+        self.timer_pending1() | self.dma_pending1() | self.gpio_pending2() | self.uart_pending2() | self.mbox_pending0() != 0
+    }
+
+    /// Gated bank-0 MAILBOX bit (M61 IRQ path): a processed reply waits
+    /// in MAIL0 (pending) AND the driver enabled the data IRQ (CNF bit
+    /// 0, written by bcm2835_startup at probe) AND the IC bank-0 bit-1
+    /// enable is set (upstream armctrl_unmask writes BIT(1) to +0x18).
+    /// The IRQ handler drains MAIL0_RD, which clears pending (see the
+    /// +0x00 read arm) and drops the line — exactly the upstream
+    /// completion handshake. Public for the M61 triage probe.
+    pub fn mbox_pending0(&self) -> u32 {
+        if self.mbx_pending && self.mbx_cnf_irqen && ((self.ic_en0 >> 1) & 1) != 0 {
+            1 << 1
+        } else {
+            0
+        }
     }
 
     /// Gated bank-1 bits: timer C0-C3 matches (facade icLines timer field).
-    fn timer_pending1(&self) -> u32 {
+    /// Public for the M61 triage probe (per-source line state).
+    pub fn timer_pending1(&self) -> u32 {
         (self.tmr_pending & 0xf) & self.ic_en1
     }
 
     /// Gated bank-1 DMA0 bit (facade icLines dma0: CS.INT latched while
     /// the channel is enabled; enable read live from the window backing
     /// — the decision runs post-chunk like the facade's line()).
-    fn dma_pending1(&self) -> u32 {
+    /// Public for the M61 triage probe (per-source line state).
+    pub fn dma_pending1(&self) -> u32 {
         let enable = self.dma_en_back.get(0x50 / 4).copied().unwrap_or(0);
         if self.dma_int && (enable & 1) != 0 {
             (1 << 16) & self.ic_en1
@@ -907,7 +983,8 @@ impl Bus {
     }
 
     /// Gated bank-2 bits (for PENDING2/BASIC reads).
-    fn gpio_pending2(&self) -> u32 {
+    /// Public for the M61 triage probe (per-source line state).
+    pub fn gpio_pending2(&self) -> u32 {
         if self.gpio0_raw() && ((self.ic_en2 >> 17) & 1) != 0 {
             1 << 17
         } else {
@@ -924,9 +1001,29 @@ impl Bus {
         self.uart0_cr
     }
 
+    /// M61 probe helpers: mailbox IRQ-enable latch + bank-0 enable cell.
+    pub fn mbx_cnf_irqen(&self) -> bool {
+        self.mbx_cnf_irqen
+    }
+    pub fn ic_en0_pub(&self) -> u32 {
+        self.ic_en0
+    }
+    /// M61 probe helper: local per-core timer enable cell (gates the
+    /// CORE_IRQ_SRC arch-timer bits and the runner's cntp delivery).
+    pub fn local_timer_ctl0_pub(&self) -> u32 {
+        self.local_timer_ctl0
+    }
+
     /// Raw UART IRQ bits (RIS): RXINTR iff FIFO non-empty, TXINTR always.
     fn uart_ris(&self) -> u32 {
         (if self.uart0_rx.is_empty() { 0 } else { 1 << 4 }) | (1 << 5)
+    }
+
+    /// Raw UART IRQ bits (RIS): RXINTR iff FIFO non-empty, TXINTR always.
+    /// Public for the M61 triage probe (per-source line state: the UART
+    /// bit needs the RIS&IMSC product, which no single cell exposes).
+    pub fn uart_pending2_pub(&self) -> u32 {
+        self.uart_pending2()
     }
 
     fn uart_pending2(&self) -> u32 {
@@ -1015,6 +1112,15 @@ impl Bus {
     }
 
     /// Guest-RAM u32 load for the mailbox walker (out-of-range reads 0).
+    /// Public for the M61 triage probe (mailbox buffer dump). Takes a
+    /// physical address (mailbox buffers are bus->PA masked before the
+    /// call — see mbox_process); no translate() routing (that detour
+    /// cost a full debug round: 0xdc02/060000 "size=0" reads were the
+    /// bus alias, not a walk gap).
+    pub fn mem_u32_dbg(&self, addr: u64) -> u32 {
+        self.mem_u32(addr)
+    }
+
     fn mem_u32(&self, addr: u64) -> u32 {
         if self.in_ram(addr, 4) {
             let a = addr as usize;
@@ -1037,6 +1143,10 @@ impl Bus {
     /// Write a tag response (mirrors mboxProcess: status word + exactly
     /// tsize value bytes, zero-padded past the payload).
     fn mbox_tag_bytes(&mut self, addr: u64, off: usize, tsize: usize, out: &[u8]) {
+        if std::env::var("MBOXTAG").is_ok() {
+            let id = self.mem_u32(addr + off as u64);
+            eprintln!("MBOXTAG 0x{:08x} tsize={}", id, tsize);
+        }
         self.mem_write_u32(addr + off as u64 + 8, 0x80000000);
         for i in 0..tsize {
             let a = addr + off as u64 + 12 + i as u64;
@@ -1088,14 +1198,38 @@ impl Bus {
     /// Mailbox request processing (mirrors main.js mboxProcess): walks
     /// the tag list, writes responses into guest RAM, arms the reply.
     /// Runs synchronously on a channel-8 MAIL1_WRITE; STATUS/READ
-    /// publish at sync_out.
+    /// publish at sync_out. Multi-shot (M61, see field comment): every
+    /// channel-8 write re-processes (no changed-value gate — the kernel
+    /// reuses one buffer address per probe), and mbx_pending clears on
+    /// the guest's MAIL0 (READ) collection so the next request publishes.
+    /// M61 SYNC COMPLETION (execution-proven): mbx_pending is set here
+    /// BEFORE the waiter sleeps — the firmware `wait_for_completion`
+    /// waiter (armctrl path, masked in the weighing window) never sees
+    /// an IRQ, so completion must already be pending when it runs (the
+    /// chained handler drains MAIL0 when unmasked; the tx-done path just
+    /// polls the queue slot back). This matches the single-word
+    /// synchronous processing the model already does (replies written
+    /// into guest RAM inline at MAIL1-write).
     fn mbox_process(&mut self, w: u32) {
-        if self.mbx_pending {
-            return;
-        }
-        let addr = (w & !0xf) as u64;
+        // M61 bus->PA: the MAIL1 word carries a VideoCore BUS address
+        // (low 4 bits = channel), not an ARM PA: SDRAM bus 0xC0000000..
+        // maps PA 0x00000000.. (mask 0x3FFFFFFF). Proven by execution:
+        // the kernel's 2B firmware requests arrive as 0xdc02/060008
+        // (bus) while the buffer lives at PA 0x1c02/060000 in RAM —
+        // raw indexing read size=0 and every request stalled. Masking
+        // fixes it; fb/shell low buffers (<4M) are unaffected by it.
+        let addr = ((w & !0xf) as u64) & 0x3fff_ffff;
+        // Buffer header: total-size word + request code. A zero/short
+        // header means a malformed buffer (never seen live — the 2B
+        // size=0 reads were the bus-alias artifact above, now fixed);
+        // answer success so the driver retries instead of wedging.
         let size = core::cmp::min(self.mem_u32(addr) & 0xffff, 1024) as usize;
+        if std::env::var("MBOXTAG").is_ok() {
+            eprintln!("MBOXBUF addr=0x{:x} size={}", addr, size);
+        }
         if size < 8 {
+            self.mem_write_u32(addr + 4, 0x80000000);
+            self.mbx_pending = true;
             return;
         }
         let mut off = 8usize;
@@ -1109,8 +1243,21 @@ impl Bus {
                 // handled by the framebuffer path
             } else {
                 match id {
+                    // Firmware revision 0x1 (req 0 words; resp: rev
+                    // u32): the firmware driver reads this at probe to
+                    // confirm the VC is alive (proven live: first tag of
+                    // the 2B boot's first request). 0x0 would read as
+                    // "no firmware" and abort the driver.
+                    0x00000001 => self.mbox_tag_bytes(addr, off, tsize, &16968947u32.to_le_bytes()),
                     0x00010001 => self.mbox_tag_bytes(addr, off, tsize, &16968947u32.to_le_bytes()),
                     0x00010002 => self.mbox_tag_bytes(addr, off, tsize, &0xa02082u32.to_le_bytes()),
+                    // Board serial 0x10004 (req 0; resp: 8-byte serial):
+                    // the firmware driver reads it at probe (proven live:
+                    // second tag of the 2B boot's second request, tsize
+                    // 20 = serial + MAC + ... packed by the driver).
+                    0x00010004 => {
+                        self.mbox_tag_bytes(addr, off, tsize, &0xdeadbeef00000000u64.to_le_bytes())
+                    }
                     0x00010003 => {
                         self.mbox_tag_bytes(addr, off, tsize, &0xdeadbeef00000000u64.to_le_bytes())
                     }
@@ -1122,16 +1269,134 @@ impl Bus {
                     0x00010009 => {
                         self.mbox_tag_bytes(addr, off, tsize, &[0xb8, 0x27, 0xeb, 0xde, 0xad, 0xbe])
                     }
+                    // Clock management (M61: the firmware-clocks driver
+                    // probes these during every boot; the old `_ =>`
+                    // error-bit reply made the driver time out at 3.4s
+                    // ("Firmware transaction timeout" cut-here at 2B).
+                    // Rates are the Pi 3 nominals the oracle reports.
+                    // GET_CLOCK_STATE 0x30001 (req: clock id; resp:
+                    // id + on/off): report ON (1), like firmware with
+                    // the stock clocks running. Kept ABOVE the clock
+                    // arms so the match stays disjoint (Rust rejects
+                    // two arms for the same value).
                     0x00030001 => {
                         let mut out = [0u8; 8];
                         out[0..4].copy_from_slice(&self.mem_u32(addr + off as u64 + 12).to_le_bytes());
                         out[4..8].copy_from_slice(&1u32.to_le_bytes());
                         self.mbox_tag_bytes(addr, off, tsize, &out);
                     }
+                    // GET_CLOCK_RATE 0x30002 (req: clock id u32; resp:
+                    // id + rate Hz). The firmware's V3D quirk reuses the
+                    // same tag id as a SET with an empty request
+                    // (tsize==0, no id word): echo zeros with success so
+                    // the quirk write is absorbed, like real firmware.
                     0x00030002 => {
-                        self.mbox_tag_bytes(addr, off, tsize, &700000000u32.to_le_bytes())
+                        if tsize == 0 {
+                            self.mbox_tag_bytes(addr, off, tsize, &[]);
+                        } else {
+                            let clk = self.mem_u32(addr + off as u64 + 12);
+                            let rate = match clk {
+                                1 => 700_000_000u32,   // ARM
+                                2 => 250_000_000u32,   // CORE
+                                4 => 400_000_000u32,   // V3D
+                                5 => 250_000_000u32,   // H264
+                                6 => 250_000_000u32,   // ISP
+                                7 => 250_000_000u32,   // SDRAM
+                                8 => 108_000_000u32,   // PIXEL
+                                9 => 216_000_000u32,   // PWM
+                                _ => 250_000_000u32,
+                            };
+                            let mut out = [0u8; 8];
+                            out[0..4].copy_from_slice(&clk.to_le_bytes());
+                            out[4..8].copy_from_slice(&rate.to_le_bytes());
+                            self.mbox_tag_bytes(addr, off, tsize, &out);
+                        }
                     }
-                    _ => self.mem_write_u32(addr + off as u64 + 8, 0x80000001),
+                    // GET_CLOCK_RATE_MEASURED 0x30003 (req: clock id;
+                    // resp: id + measured Hz): same nominals, no PLL to
+                    // measure against.
+                    0x00030003 => {
+                        let clk = self.mem_u32(addr + off as u64 + 12);
+                        let rate = match clk {
+                            1 => 700_000_000u32,
+                            2 => 250_000_000u32,
+                            4 => 400_000_000u32,
+                            _ => 250_000_000u32,
+                        };
+                        let mut out = [0u8; 8];
+                        out[0..4].copy_from_slice(&clk.to_le_bytes());
+                        out[4..8].copy_from_slice(&rate.to_le_bytes());
+                        self.mbox_tag_bytes(addr, off, tsize, &out);
+                    }
+                    // GET_MIN_CLOCK_RATE / GET_MAX_CLOCK_RATE 0x30007 /
+                    // 0x30004 (req: clock id; resp: id + Hz): floor 0
+                    // for min (firmware reports the floor), nominal for
+                    // max. The cpufreq driver reads MAX to build its
+                    // frequency table; zeros would collapse the table.
+                    0x00030004 => {
+                        let clk = self.mem_u32(addr + off as u64 + 12);
+                        let rate = match clk {
+                            1 => 700_000_000u32,
+                            2 => 250_000_000u32,
+                            4 => 400_000_000u32,
+                            _ => 250_000_000u32,
+                        };
+                        let mut out = [0u8; 8];
+                        out[0..4].copy_from_slice(&clk.to_le_bytes());
+                        out[4..8].copy_from_slice(&rate.to_le_bytes());
+                        self.mbox_tag_bytes(addr, off, tsize, &out);
+                    }
+                    0x00030007 => {
+                        let clk = self.mem_u32(addr + off as u64 + 12);
+                        let mut out = [0u8; 8];
+                        out[0..4].copy_from_slice(&clk.to_le_bytes());
+                        // out[4..8] stays 0 = floor unknown
+                        self.mbox_tag_bytes(addr, off, tsize, &out);
+                    }
+                    // HAS_CLOCK 0x30006 (req: clock id; resp: 1 exists):
+                    // the clocks driver skips ids that report absent.
+                    0x00030006 => {
+                        let clk = self.mem_u32(addr + off as u64 + 12);
+                        let mut out = [0u8; 8];
+                        out[0..4].copy_from_slice(&clk.to_le_bytes());
+                        out[4..8].copy_from_slice(&1u32.to_le_bytes());
+                        self.mbox_tag_bytes(addr, off, tsize, &out);
+                    }
+                    // Notify-firmware-ready 0x30046 (req: 0 words; resp:
+                    // none): the firmware-clocks driver sends this after
+                    // its clock table is up (proven live: sole tag of the
+                    // 2B boot's third request, tsize 4). Absorb with
+                    // success (no payload to echo).
+                    0x00030046 => {
+                        self.mbox_tag_bytes(addr, off, tsize, &[]);
+                    }
+                    // GET_TURBO 0x30009 (resp: level 0) / SET_TURBO
+                    // 0x28001 (req: level; absorbed, level ignored):
+                    // stock firmware boots at turbo 0.
+                    0x00030009 | 0x00028001 => {
+                        self.mbox_tag_bytes(addr, off, tsize, &0u32.to_le_bytes())
+                    }
+                    // GET_VOLTAGE / GET_MIN/MAX_VOLTAGE 0x30003-class
+                    // 0x3000D/0x30010/0x3000E (req: volt id; resp:
+                    // id + uV offset): report ~1.2V (1200000+0 offset
+                    // encoding the firmware uses: value = uV - 1200000
+                    // in 25mV steps is overkill; raw 0 = 1.2V nominal).
+                    0x0003000d | 0x0003000e | 0x00030010 => {
+                        let idv = self.mem_u32(addr + off as u64 + 12);
+                        let mut out = [0u8; 8];
+                        out[0..4].copy_from_slice(&idv.to_le_bytes());
+                        // out[4..8] stays 0 = 1.2V nominal
+                        self.mbox_tag_bytes(addr, off, tsize, &out);
+                    }
+                    // Unknown tags (M61 triage aid): MBOXTAG env in
+                    // mbox_tag_bytes already names every KNOWN tag too,
+                    // so this arm stays quiet. Still replies
+                    // success+zeros (never the error bit: the clocks
+                    // driver treats error as transaction failure and
+                    // times out the whole queue).
+                    _ => {
+                        self.mbox_tag_bytes(addr, off, tsize, &[]);
+                    }
                 }
             }
             off += 12 + tsize + ((4 - (tsize % 4)) % 4);
@@ -1518,22 +1783,115 @@ impl Bus {
         // is_ic: the IC window spans IC_BASE..MBOX_PAGE end, so it would
         // otherwise swallow MBOX reads into its `_ => 0` arm (fb guest
         // then spins past the polls and reports "mailbox failed"). Reads
-        // serve the sync_out snapshots.
-        if addr >= MBOX_BASE && addr + size <= MBOX_BASE + 0x20 {
+        // serve the sync_out snapshots. M61 multi-shot: every channel-8
+        // MAIL1 write re-processes (no changed-value gate — the kernel
+        // reuses one buffer address per probe); pending is the
+        // publish flag only (no read-side clear: the fb guest's
+        // collect-read at +0x00 must NOT consume state the STATUS poll
+        // still needs).
+        // Register layout (upstream bcm2835-mailbox.c + BCM2835-ARM-
+        // Peripherals 1.3: ARM_0_MAIL0=0x00, ARM_0_MAIL1=0x20):
+        // MAIL1_WRT=+0x20, MAIL0_RD=+0x00, MAIL0_STA=+0x18,
+        // MAIL1_STA=+0x38. DUAL-DECODE during migration (M61): the
+        // in-repo fb/shell guests were written against +0x14
+        // (MBOX_MAIL1_WRITE const) + +0x18 MAIL1_STATUS / +0x04 STATUS
+        // and their goldens pin that path — the kernel uses the real
+        // +0x20/+0x18/+0x38 layout. Serve BOTH: +0x00 READ and +0x18
+        // STATUS read the live snapshots; +0x04/+0x14 keep their legacy
+        // echoes so the goldens never see a behavior change; +0x20/0x38
+        // serve the kernel path. When fb/shell migrate to +0x20, drop
+        // the +0x04/+0x14 legacy cells.
+        if addr >= MBOX_BASE && addr + size <= MBOX_BASE + 0x40 {
+            if std::env::var("MBOXTAG").is_ok() && (addr - MBOX_BASE == 0x00 || addr - MBOX_BASE == 0x18 || addr - MBOX_BASE == 0x38) {
+                eprintln!("MBOXRD off=0x{:x} pending={}", addr - MBOX_BASE, self.mbx_pending as u8);
+            }
+            // M61 STATUS bits (proven by the 2B handshake trace: the
+            // kernel driver polls MAIL1_STA (+0x38) 3x and NEVER reads
+            // MAIL0 (+0x00) — the old hardwired +0x38=0 ("never full")
+            // meant EMPTY-always and the reply was never collected, so
+            // every transaction timed out at 3.4s. Real STA layout:
+            // bit31 FULL + bit30 EMPTY. MAIL1 (ARM->VC) is EMPTY when
+            // idle (nothing queued) and NOT EMPTY (FULL=1 if the FIFO
+            // depth is 1) while a request is in flight; MAIL0 (VC->ARM)
+            // is NOT EMPTY while the reply waits. The fb/shell/debug
+            // guests use the LEGACY cells (+0x04 STATUS echo +
+            // always-clear +0x18-legacy), which keep their exact old
+            // values — only the kernel-path +0x38/+0x18 cells change.
+            // +0x18 MAIL0_STA keeps the legacy always-clear read (the
+            // debug golden pins it at 0 and the kernel never reads it —
+            // proven: 0 MBOXRD +0x18 lines at 2B).
+            // M61b (proven: with FULL=1-while-pending the 2B run did 1
+            // txn then 5458 EMPTY=0 polls = driver waiting for its OWN
+            // queue slot back, never collecting): the driver treats the
+            // queue as depth-1 — it needs EMPTY=1 (slot back) once the
+            // reply is readable. So while pending: FULL=0, EMPTY=1
+            // (request absorbed, reply ready at MAIL0). Idle: EMPTY=1.
+            // M61c IRQ path (upstream bcm2835-mailbox.c, replaces the
+            // STATUS-poll theory above): the driver NEVER polls STA —
+            // txdone polls MAIL1 FULL (last_tx_done) and completion
+            // arrives via the MAIL0 IRQ. M61d correction (execution:
+            // EMPTY=1-always polled 3x then timed out — the driver was
+            // never going to collect via STATUS): while pending, MAIL1
+            // reads NOT-EMPTY (EMPTY bit SET would claim "slot back"
+            // while the reply is still unread — the txdone poll must see
+            // FULL until the IRQ handler drains MAIL0_RD). So pending:
+            // FULL=0, EMPTY=0 (busy, reply waits); idle: EMPTY=1. The
+            // +0x00 READ drains (clears pending) regardless of STA.
+            let mail1_sta: u64 = if self.mbx_pending { 0 } else { 1 << 30 };
+            // MAIL0_STA while pending must read NON-EMPTY (EMPTY bit
+            // clear) so the IRQ handler's while-loop enters and drains
+            // the reply (see the +0x00 arm, which clears pending).
+            // M61d: same busy-while-pending as MAIL1 (see above).
+            // NOTE: this changes the legacy always-clear +0x18 read —
+            // the debug golden pins +0x18 idle 0, which still holds
+            // (idle EMPTY=1<<30 has bit31 clear; the golden masks
+            // 0x80000000). fb/shell never touch +0x18.
+            let mail0_sta: u64 = if self.mbx_pending { 0 } else { 1 << 30 };
             let v: u64 = match addr - MBOX_BASE {
-                0x00 => self.mbx_pub_read as u64,
-                0x04 => self.mbx_pub_status as u64,
-                0x14 => self.mbx_last_write as u64,
-                0x18 => 0, // MAIL1_STATUS: always clear
+                // MAIL0_RD (+0x00): the IRQ handler's drain read (see
+                // bcm2835_mbox_irq: while MAIL0_STA !EMPTY, read MAIL0_RD
+                // + mbox_chan_received_data = complete()). Consumption is
+                // synchronous here (single-word reply): the read returns
+                // the reply word and clears pending, which drops the
+                // bank-0 line AND raises EMPTY on both STA cells. The
+                // fb/shell collect-reads hit the same arm (their reply
+                // word is the buffer PA | channel) — unchanged behavior.
+                // M61 drain trace (MBOXTAG=1): every drain names its
+                // source register read so the chained-handler walk is
+                // proven by execution (MAIL0_RD must follow an IC
+                // BASIC/PENDING read in the same unmasked window).
+                0x00 => {
+                    let w = self.mbx_pub_read as u64;
+                    if std::env::var("MBOXTAG").is_ok() && self.mbx_pending {
+                        eprintln!("MBOXDRAIN rd=0x{:08x}", self.mbx_pub_read);
+                    }
+                    self.mbx_pending = false;
+                    w
+                }
+                0x04 => self.mbx_pub_status as u64, // legacy STATUS echo (fb/shell poll FULL: never full here)
+                0x14 => self.mbx_last_write as u64, // legacy WRITE echo (fb/shell)
+                0x18 => mail0_sta, // MAIL0_STA: NON-EMPTY while a reply waits (IRQ drain path); EMPTY when idle
+                0x20 => self.mbx_last_write as u64, // MAIL1_WRT echoes (write-only on HW)
+                0x38 => mail1_sta, // MAIL1_STA: EMPTY when idle (kernel poll path)
                 _ => 0,
             };
             return Ok(v & mask(size));
         }
         if Self::is_ic(addr, size) {
             let off = addr - IC_BASE;
+            // M61 IRQ-chain trace (MBOXTAG=1): counts BASIC/PENDING reads
+            // so the chained-handler walk is proven by execution (LOCAL
+            // +0x60 -> IC BASIC -> PENDING1 -> MAIL0_RD).
+            if std::env::var("MBOXTAG").is_ok() && (off == 0x00 || off == 0x04 || off == 0x08) {
+                eprintln!("ICRD off=0x{:x} mbox0={} tmr1={}", off, self.mbox_pending0(), self.timer_pending1() | self.dma_pending1());
+            }
+            // M61 BASIC snapshot trace (MBOXTAG=1): the VALUE the guest
+            // saw, so a zero-BASIC read with a live line is proven (not
+            // inferred) and vice versa.
             let v: u64 = match off {
                 // PENDING2 (GPIO bit 17 + UART bit 25) + BASIC mirrors
-                // (bit 9 for GPIO, bit 19 shortcut for UART).
+                // (bit 9 for GPIO, bit 19 shortcut for UART) + bank-0
+                // bit 1 for MAILBOX (M61 IRQ path, DTB-proven).
                 0x08 => (self.gpio_pending2() | self.uart_pending2()) as u64,
                 0x04 => (self.timer_pending1() | self.dma_pending1()) as u64,
                 0x00 => {
@@ -1547,10 +1905,16 @@ impl Bus {
                     if self.uart_pending2() != 0 {
                         b |= 1 << 19;
                     }
+                    if self.mbox_pending0() != 0 {
+                        b |= 1 << 1; // ARM_MAILBOX (bank-0 bit 1, DTB-proven)
+                    }
                     b
                 }
                 _ => 0, // ENABLE/DISABLE/RET read back 0
             };
+            if std::env::var("MBOXTAG").is_ok() && (off == 0x00 || off == 0x04 || off == 0x08) {
+                eprintln!("ICVAL off=0x{:x} val=0x{:x}", off, v & mask(size));
+            }
             return Ok(v & mask(size));
         }
         if Self::is_sd(addr, size) && std::env::var("SDTRACE").is_ok() {
@@ -1732,17 +2096,56 @@ impl Bus {
             return Ok(w & mask(size));
         }
         if Self::is_page(addr, size, MBOX_PAGE) || Self::is_page(addr, size, LOCAL_BASE) {
-            // Local block CORE_IRQ_SRC (core 0, +0x60): bit 1 = CNTPNSIRQ,
-            // bit 8 = GPU (legacy line). Everything else reads zero.
+            // Local block CORE_IRQ_SRC (core 0, +0x60): bit 1 = CNTPNSIRQ
+            // (gated by the LOCAL_TIMER_INT_CONTROL0 bit1 enable — the
+            // kernel's clocksource tick unmasks ONLY its own timer; a raw
+            // counter-compare with the enable clear must NOT report the
+            // bit, or the chained handler dispatches a dead timer IRQ),
+            // bit 8 = GPU (legacy line, gated by GPU_ROUTING==0 — the
+            // kernel writes 0x0 at boot, proven by LOCALWR trace; nonzero
+            // would steer GPU IRQs to FIQ/local, unmodeled). GPU_ROUTING
+            // itself (+0x0C) reads back the latch. Timer/mailbox control
+            // cells (+0x40/+0x50) read back their latches. Everything else
+            // zero.
+            // M61 IRQ-chain trace (MBOXTAG=1): counts CORE_IRQ_SRC reads
+            // so the handler walk is proven by execution (the chained
+            // handler must read +0x60 to find the GPU bit, then the IC
+            // BASIC/PENDING1 to find bank-0 bit 1, then MAIL0_RD).
             if Self::is_page(addr, size, LOCAL_BASE) && addr - LOCAL_BASE == 0x60 {
+                if std::env::var("MBOXTAG").is_ok() {
+                    eprintln!("LOCALRD off=0x60 legacy={} cntp={}", self.legacy_line() as u8, self.cntp_line() as u8);
+                }
                 let mut v = 0u64;
-                if self.cntp_line() {
+                // M61 BARE-METAL COMPAT (lirq/rpi-kernel green): the
+                // bare-metal guests never program LOCAL_TIMER_INT_CONTROL0
+                // (no local-block driver — they use the raw timer), so a
+                // hard gate on the enable bit would starve them (proven:
+                // lirq Phase A + rpi-kernel timer ticks died with the
+                // gate). Gate by the LINUX condition only in linux_mode;
+                // bare-metal keeps the legacy raw-compare behavior.
+                // Upstream truth stands: Linux's tick unmasks bit 1 at
+                // +0x40 and the handler dispatches on the reported bit.
+                let cntp_ok = if self.linux_mode {
+                    (self.local_timer_ctl0 & (1 << 1)) != 0 && self.cntp_line()
+                } else {
+                    self.cntp_line()
+                };
+                if cntp_ok {
                     v |= 1 << 1;
                 }
-                if self.legacy_line() {
+                if self.local_gpu_routing == 0 && self.legacy_line() {
                     v |= 1 << 8;
                 }
                 return Ok(v & mask(size));
+            }
+            if Self::is_page(addr, size, LOCAL_BASE) && addr - LOCAL_BASE == 0x0c {
+                return Ok(self.local_gpu_routing as u64 & mask(size));
+            }
+            if Self::is_page(addr, size, LOCAL_BASE) && addr - LOCAL_BASE == 0x40 {
+                return Ok(self.local_timer_ctl0 as u64 & mask(size));
+            }
+            if Self::is_page(addr, size, LOCAL_BASE) && addr - LOCAL_BASE == 0x50 {
+                return Ok(self.local_mbox_ctl0 as u64 & mask(size));
             }
             return Ok(0); // unmodeled cells read zero, like the facade
         }
@@ -1780,8 +2183,9 @@ impl Bus {
         // bucket. Zero-cost when mmio_census is off (triage sets it).
         if self.mmio_census {
             // NOTE: mailbox must bucket BEFORE is_ic (same overlap rule
-            // as dispatch: MBOX 0x3F00B880 sits inside IC range).
-            if addr >= MBOX_BASE && addr + size <= MBOX_BASE + 0x20 {
+            // as dispatch: MBOX 0x3F00B880 sits inside IC range; the
+            // mailbox window is +0x40 wide: +0x00..+0x3C regs).
+            if addr >= MBOX_BASE && addr + size <= MBOX_BASE + 0x40 {
                 self.census_mbox += 1;
             } else if Self::is_uart(addr, size) {
                 self.census_uart += 1;
@@ -1795,6 +2199,9 @@ impl Bus {
                 self.census_sd += 1;
             } else if Self::is_page(addr, size, LOCAL_BASE) {
                 self.census_local += 1;
+                if std::env::var("MBOXTAG").is_ok() {
+                    eprintln!("LOCALWR off=0x{:x} val=0x{:x}", addr - LOCAL_BASE, val & mask(size));
+                }
             } else if Self::is_miniuart(addr, size) {
                 self.census_miniuart += 1;
             } else if Self::is_i2c(addr, size) {
@@ -1875,19 +2282,39 @@ impl Bus {
             }
             return Ok(());
         }
-        // VideoCore mailbox: MAIL1_WRITE latches + processes channel-8
-        // requests (mirrors syncMailboxIn, including the changed-value
-        // gate); other cells absorb. MUST precede is_ic (same overlap
-        // as the read path — MAIL1_WRITE would be absorbed as IC enable).
-        if addr >= MBOX_BASE && addr + size <= MBOX_BASE + 0x20 {
-            if addr - MBOX_BASE == 0x14 {
+        // VideoCore mailbox: MAIL1_WRT (+0x20, kernel path) latches +
+        // processes channel-8 requests (mirrors syncMailboxIn). M61
+        // multi-shot: NO changed-value gate (the old gate dropped the
+        // kernel's repeated same-buffer writes — every firmware/clock
+        // probe reuses one buffer address) and mbox_process itself
+        // re-arms per write (pending is the READ-collection flag, not a
+        // process latch). DUAL-DECODE during migration: +0x14 (the
+        // in-repo fb/shell MBOX_MAIL1_WRITE const) processes identically
+        // so their goldens pin the migration — when they move to +0x20,
+        // drop the +0x14 arm. Layout per upstream bcm2835-mailbox.c (see
+        // read path). Other cells absorb. MUST precede is_ic (same
+        // overlap as the read path — the mailbox words would be absorbed
+        // as IC enable).
+        if addr >= MBOX_BASE && addr + size <= MBOX_BASE + 0x40 {
+            if addr - MBOX_BASE == 0x20 || addr - MBOX_BASE == 0x14 {
                 let v = (val & mask(size)) as u32;
-                if v != self.mbx_last_write {
-                    self.mbx_last_write = v;
-                    self.mbx_addr = v;
-                    if (v & 0xf) == 8 {
-                        self.mbox_process(v);
-                    }
+                self.mbx_last_write = v;
+                self.mbx_addr = v;
+                if std::env::var("MBOXTAG").is_ok() {
+                    eprintln!("MBOXWR off=0x{:x} val=0x{:08x} ch={}", addr - MBOX_BASE, v, v & 0xf);
+                }
+                if (v & 0xf) == 8 {
+                    self.mbox_process(v);
+                }
+            } else if addr - MBOX_BASE == 0x1c {
+                // MAIL0_CNF (+0x1C): interrupt-enable latch (upstream
+                // bcm2835_startup writes IHAVEDATAIRQEN=1 at probe,
+                // shutdown writes 0). While set, a pending reply raises
+                // bank-0 bit 1 (see mbox_pending0) — the driver's real
+                // completion path. Other bits absorbed.
+                self.mbx_cnf_irqen = (val & 1) != 0;
+                if std::env::var("MBOXTAG").is_ok() {
+                    eprintln!("MBOXCNF val=0x{:x} irqen={}", val & mask(size), self.mbx_cnf_irqen as u8);
                 }
             }
             return Ok(());
@@ -1895,9 +2322,19 @@ impl Bus {
         if Self::is_ic(addr, size) {
             let off = addr - IC_BASE;
             let v = (val & mask(size)) as u32;
+            if std::env::var("MBOXTAG").is_ok() && (off == 0x18 || off == 0x10 || off == 0x14 || off == 0x24 || off == 0x1c || off == 0x20 || off == 0x00) {
+                eprintln!("ICWR off=0x{:x} val=0x{:08x}", off, v);
+            }
             match off {
+                // Upstream layout (reg_enable[] = {0x18, 0x10, 0x14},
+                // reg_disable[] = {0x24, 0x1C, 0x20}): bank-0 enable at
+                // +0x18 / disable at +0x24 (the old code mapped +0x10 to
+                // bank 1 and never served bank 0 — the mailbox enable
+                // vanished into the void).
+                0x18 => self.ic_en0 |= v,
                 0x10 => self.ic_en1 |= v,
                 0x14 => self.ic_en2 |= v,
+                0x24 => self.ic_en0 &= !v,
                 0x1c => self.ic_en1 &= !v,
                 0x20 => self.ic_en2 &= !v,
                 0x2c => {
@@ -2164,6 +2601,19 @@ impl Bus {
             return Ok(());
         }
         if Self::is_page(addr, size, MBOX_PAGE) || Self::is_page(addr, size, LOCAL_BASE) {
+            // GPU_ROUTING latch (LOCAL+0x0C): gates CORE_IRQ_SRC bit 8
+            // (see the read arm). Timer/mailbox control cells (+0x40/
+            // +0x50) latch (see the read arm). All other local cells
+            // absorb.
+            if Self::is_page(addr, size, LOCAL_BASE) && addr - LOCAL_BASE == 0x0c {
+                self.local_gpu_routing = (val & mask(size)) as u32;
+            }
+            if Self::is_page(addr, size, LOCAL_BASE) && addr - LOCAL_BASE == 0x40 {
+                self.local_timer_ctl0 = (val & mask(size)) as u32;
+            }
+            if Self::is_page(addr, size, LOCAL_BASE) && addr - LOCAL_BASE == 0x50 {
+                self.local_mbox_ctl0 = (val & mask(size)) as u32;
+            }
             return Ok(()); // unmodeled cells absorb writes, like the facade
         }
         Err(Fault::UnmappedData(addr))
@@ -2243,7 +2693,10 @@ impl Bus {
         }
         self.spi_cs_dirty = None;
         // Mailbox publish (mirrors syncMailboxOut): reply visible iff
-        // a request was processed.
+        // a request was processed (idle STATUS bit31 FULL set, like the
+        // old facade — the fb/shell guests poll bit31 at +0x04 and the
+        // debug guest pins +0x18 idle 0 via the separate always-clear
+        // read cell; do NOT fold the bits here).
         if self.mbx_pending {
             self.mbx_pub_status = 0;
             self.mbx_pub_read = self.mbx_addr;
@@ -3420,10 +3873,15 @@ impl Cpu {
         // pi-cpu stores raw pointers (no auth codes). BTI (branch
         // target identification, e.g. 0xD503245F BTI C at every
         // indirect-call landing pad) is likewise a NOP: pi-cpu does
-        // not enforce branch-target guards. Assembler truth:
+        // not enforce branch-target guards. WFI/WFE (0xD503207F /
+        // 0xD503205F, assembler truth below) are NOPs that a
+        // uniprocessor guest uses to idle: the kernel's completion
+        // weighing loops spin on WFE with IRQs masked, and the reply is
+        // already synchronous in this model — stalling the vCPU until
+        // an (always-masked) IRQ would wedge the boot. Assembler truth:
         // autiasp=D50323BF autibsp=D50323FF paciasp=D503233F bti c=
-        // D503245F (all (w>>12)==0xD5032, already covered — comment
-        // documents why).
+        // D503245F wfi=D503207F wfe=D503205F (all (w>>12)==0xD5032,
+        // already covered — comment documents why).
         if (w >> 12) == 0xD5032 || (w >> 12) == 0xD5033 {
             return Ok(());
         }
@@ -3621,15 +4079,26 @@ impl Cpu {
                 }
             } else if op0 == 3 && op1 == 3 && crn == 14 && crm == 2 {
                 // CNTP_TVAL {..,2,0} / CTL {..,2,1} / CVAL {..,2,2}.
+                // Assembler truth: cntp_ctl=0xD53BE220/D51BE220,
+                // tval=0xD53BE200/D51BE200, cval=0xD53BE240/D51BE240.
                 if l == 0 {
                     let v = self.r(rd);
                     if op2 == 0 {
                         // TVAL: CVAL = counter + value (32-bit offset).
                         bus.cntp_cval = bus.cntpct.wrapping_add(v & 0xffff_ffff);
+                        if std::env::var("PI3_TIMERTRACE").is_ok() {
+                            eprintln!("TMRMSR CNTP_TVAL=0x{:x} cval=0x{:x} cntpct=0x{:x}", v & 0xffff_ffff, bus.cntp_cval, bus.cntpct);
+                        }
                     } else if op2 == 1 {
                         bus.cntp_ctl = (v & 1) as u32;
+                        if std::env::var("PI3_TIMERTRACE").is_ok() {
+                            eprintln!("TMRMSR CNTP_CTL=0x{:x}", v & 1);
+                        }
                     } else if op2 == 2 {
                         bus.cntp_cval = v;
+                        if std::env::var("PI3_TIMERTRACE").is_ok() {
+                            eprintln!("TMRMSR CNTP_CVAL=0x{:x} cntpct=0x{:x}", v, bus.cntpct);
+                        }
                     }
                 } else if op2 == 1 {
                     // CTL read: ENABLE bit + ISTATUS (counter >= cval).
@@ -3653,10 +4122,19 @@ impl Cpu {
                     let v = self.r(rd);
                     if op2 == 0 {
                         bus.cntv_cval = bus.cntpct.wrapping_add(v & 0xffff_ffff);
+                        if std::env::var("PI3_TIMERTRACE").is_ok() {
+                            eprintln!("TMRMSR CNTV_TVAL=0x{:x} cval=0x{:x}", v & 0xffff_ffff, bus.cntv_cval);
+                        }
                     } else if op2 == 1 {
                         bus.cntv_ctl = (v & 1) as u32;
+                        if std::env::var("PI3_TIMERTRACE").is_ok() {
+                            eprintln!("TMRMSR CNTV_CTL=0x{:x}", v & 1);
+                        }
                     } else if op2 == 2 {
                         bus.cntv_cval = v;
+                        if std::env::var("PI3_TIMERTRACE").is_ok() {
+                            eprintln!("TMRMSR CNTV_CVAL=0x{:x}", v);
+                        }
                     }
                 } else if op2 == 1 {
                     let mut c = bus.cntv_ctl & 1;
@@ -6302,12 +6780,19 @@ fn patch_dtb_chosen(bus: &mut Bus, initrd_len: u64) {
     if off_struct + size_struct > off_strings || off_strings + size_strings > totalsize {
         return;
     }
-    // Find the END_NODE token closing /chosen (stack walk). Token 9
-    // (FDT_END) terminates the block — handle it, don't break: the
-    // struct walker must consume it (memcheck2-proven: token 9 right
-    // after memory@0's props; break skips the node-END + chosen node
-    // and chosen_end stays None... in practice chosen precedes memory
-    // here so it worked, but correctness first).
+    // Find the END_NODE token closing /chosen (stack walk). FDTv17
+    // layout (this DTB: version 17, NO FDT_NOP tokens — the first-cut
+    // walker expected NOPs at 0x88 and died with token 24, so chosen_end
+    // stayed None and the patch silently no-op'd): tokens are only
+    // BEGIN_NODE=1 / END_NODE=2 / PROP=3 / END=9. Token 9 (FDT_END)
+    // terminates the block — handle it, don't break: the struct walker
+    // must consume it (memcheck2-proven: token 9 right after memory@0's
+    // props; break skips the node-END + chosen node and chosen_end
+    // stays None... in practice chosen precedes memory here so it
+    // worked, but correctness first). Node-name alignment: pad to 4
+    // RELATIVE to the struct-block start (spec: "aligned to a 32-bit
+    // boundary"), NOT to the DTB base — the first cut used (o - sb)
+    // which is the same thing (o starts at sb), kept.
     let sb = base + off_struct;
     let se = sb + size_struct;
     let mut o = sb;
@@ -6332,6 +6817,13 @@ fn patch_dtb_chosen(bus: &mut Bus, initrd_len: u64) {
         } else if t == 3 {
             let len = be32(&bus.mem, o + 4) as usize;
             o += 12 + len + ((4 - (len % 4)) % 4);
+        } else if t == 4 {
+            // FDT_NOP (FDTv17, this DTB uses them as padding): skip.
+            // The first-cut walker broke on any other token, which made
+            // chosen_end stay None on NOP-padded DTBs and the whole
+            // patch silently no-op (bootargs/initrd/memory never
+            // applied — DTB-proven by the raw-struct parse).
+            o += 4;
         } else if t == 9 {
             o += 4;
             break;
@@ -6353,6 +6845,13 @@ fn patch_dtb_chosen(bus: &mut Bus, initrd_len: u64) {
     // M60 bootargs (oracle-matched: public/linux/module.js KERNEL_COMMON
     // + minimal blacklist; the M59 earlycon/maxcpus/mem= line starved
     // the CMA allocator and panicked at __unflatten_device_tree).
+    // M61: the blacklist is byte-exact public/linux/module.js `minimal`
+    // (dwc2/xhci/usb-storage/sdhci-iproc/i2c/spi/rng/sound/... skipped):
+    // the single-entry M60 line let the kernel probe stub hardware whose
+    // models return zeros/timeout (firmware-clock WARN at 3.4s, then the
+    // mmc/usb/sdhci probes stall the boot at vgaarb with sd census 0).
+    // Skipping them is what the WORKING oracle boots with — the drivers
+    // re-enable one model at a time as their pi-cpu models land.
     // Root (oracle module.js MT variant): the .data initrd region is an
     // ext2 SD image (magic-proven), booted via -drive if=sd, so the
     // cmdline MUST carry root=/dev/mmcblk0 rootwait (verified: without
@@ -6363,7 +6862,7 @@ fn patch_dtb_chosen(bus: &mut Bus, initrd_len: u64) {
     // output; M24 "no earlycon" applies to the qemu-wasm TCG slow path
     // only. pi-cpu UART writes are a RAM tap (free), so earlycon can
     // only help visibility, never slow execution.
-    let bootargs = b"earlycon=pl011,0x3f201000 console=ttyAMA0,115200 lpj=7000000 nokaslr mitigations=off nowatchdog nosoftlockup audit=0 cgroup_disable=memory ipv6.disable=1 cryptomgr.notests loglevel=8 root=/dev/mmcblk0 rootfstype=ext4 rootwait initcall_blacklist=bcm2835_pm_driver_init\0";
+    let bootargs = b"earlycon=pl011,0x3f201000 console=ttyAMA0,115200 lpj=7000000 nokaslr mitigations=off nowatchdog nosoftlockup audit=0 cgroup_disable=memory ipv6.disable=1 cryptomgr.notests loglevel=8 root=/dev/mmcblk0 rootfstype=ext4 rootwait initcall_blacklist=bcm2835_pm_driver_init,bcm2835_cpufreq_init,bcm2835_wdt_init,leds-gpio,thermal,gpio-fan,pwm-fan,dwc2,xhci-hcd,smsc95xx,usb_ernet,rndis_host,cdc_ether,usb-storage,sdhci-iproc,i2c-bcm2835,spi-bcm2835,bcm2835-rng,brcmstb_thermal,snd_bcm2835,vchiq,snd_pcm,snd_timer,snd,soundcore,joydev,rfkill,bcm2835_v4l2,cfg80211,rfkill_gpio\0";
     // M60 memory@0 FIX (console-proven: the stock DTB's memory@0 reg is
     // all-ZERO — qemu fills real RAM size via -m 512M; without it the
     // kernel sees 0 bytes, CMA fails, panic at
@@ -6447,6 +6946,9 @@ fn patch_dtb_chosen(bus: &mut Bus, initrd_len: u64) {
                     break;
                 }
                 p += 12 + len + ((4 - (len % 4)) % 4);
+            } else if t == 4 {
+                // FDT_NOP: skip (see the chosen_end walker above).
+                p += 4;
             } else if t == 9 {
                 break;
             } else {
