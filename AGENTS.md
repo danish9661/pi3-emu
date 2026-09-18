@@ -1890,15 +1890,48 @@ edit):
    + PI3_TIMERTRACE with cntpct at write time +
    mem_u32_dbg/uart_pending2_pub/local_timer_ctl0_pub probe helpers.
    zzconfprobe takes [budget] [slice] for the slice-sensitivity test.
-- Open (next, M62): the weighing waiter (0xffffffc0080c1804,
-  [sp_el0+8] counter vs x0=0x1, frame chain
-  b9cd08/c9868/137d84/1485c0/1486d8/92dda4(CNTP-IMASK-set)/102e9c/
-  fb2c4/100a8/167a8/191dc/b91084) sleeps with DAIF masked while
-  mbox0=2 is live -- the chained handler never walks (LOCAL+0x60
-  reads are all timer-side; zero ICRD/MBOXRD+0x00). Candidates in
-  order: IMASK-honor (CNTP_CTL bit1) to unstick the timer storm, then
-  synchronous completion vs dispatch-walk fix -- each needs MBOXTAG
-  counts + tail + battery as proof.
+- Open (next, M62): IMASK-honor (CNTP_CTL bit1, PROVEN the guest sets it
+  at the frame5 92dd90 site — the old `(v & 1)` mask dropped it) to unstick
+  the timer storm, then synchronous completion vs dispatch-walk fix — each
+  needs MBOXTAG counts + tail + battery as proof.
+
+### M62 -- CNTP IMASK-honor + dispatch-walk diagnosis (DONE, committed)
+
+Stall UNCHANGED at 2B/4096 (`...0c1804`, daif=0x3, console 9322, tail
+`vgaarb: loaded`, `mbox0=2` live, `irqs=21089`, zero ICRD/drains) — but the
+mechanism is now fully mapped by execution:
+
+1. IMASK-honor (real guest-intent bug, fixed): CNTP_CTL MSR stores `v &
+   0x7` (was `v & 1`, dropping the guest's IMASK=1 set at frame5 92dd90
+   `orr #2`); MRS reads back `ctl & 0x3` + live ISTATUS; `cntp_line()`
+   requires ENABLE && !IMASK && compare. Stall now reads `cntp_ctl=7
+   cntp_line=0` — line quiet, yet stall byte-identical (21k deliveries all
+   pre-mask). Timer-storm theory DEAD as the stall cause; fix stays (zero
+   regression).
+2. Slice-sensitivity (triage knob, not cure): 512 parks EARLIER
+   (`...b92d3c`/8612, 296458 IRQs) vs 4096 at the canonical stall; same 3
+   MBOXWRs, zero ICRD/drains at both.
+3. Full dispatch disassembly (`.inst` assembler-truth): EL1h prologue →
+   +0x800 dispatch → irqentry `...b91210` → genhandle `...b92e40` →
+   armctrl chained `...021b80` (SHORTCUT masks, `lsr#26`/`ubfx`, bank-read
+   `ldr x0,[x1]`) → genhandle slow-path waiter `...0c7214` → stall loop
+   `...0c1804` (weigh `[sp_el0+8]=0x00010001` vs x0=0x1, fast-path parked
+   with `[sp_el0+1856]=0` early-ret).
+4. Value-trace + irqwin (the verdict): guest SEES `LOCALRD val=0x102`
+   (bit8=1, mailbox visible) x11358 yet ICRD=0 of ANY offset/size (wide
+   ICRDW log: only 4 boot-time ENABLE-mirror reads); zzirqwin finds ZERO
+   live+unmasked chunk windows in 2B (mailbox born masked, waiter masked
+   — delivery needs the conjunction at ONE boundary). DTB oracle: /timer
+   is local_intc PPIs, armctrl is the local-child GPU chain — report and
+   delivery share one `cntp_ok` condition (no skew; comment-only probe
+   verified identical).
+5. Next (M63): SYNCHRONOUS completion at MAIL1-write vs CHAINED-DISPATCH
+   parity — logging-first ((b) came back EMPTY, so (a) leads): complete
+   what the fast/slow path consumes inline. Each needs counts + tail +
+   battery.
+- Battery: smoke 23/23 + fuzzer 882/882. Logs (HOME-surviving):
+  `~/pi62-logs/` (slice/t/timer/imask/stepb/pend/vec/frame/weigh/irqwin).
+
 
 ## Key risks (M49: unicorn retired — the first two risks below are closed)
 

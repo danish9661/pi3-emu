@@ -1185,3 +1185,11 @@ dist/                 production bundle
   turbo tag nominals (live tags @2B: 0x1/0x3/0x30046); Runner.irqs/
   irq_pcs/mbox_drains + MBOXTAG/PI3_TIMERTRACE triage harness.
   Smoke 23/23, fuzzer 882/882.
+- M62 -- CNTP IMASK-honor + dispatch-walk diagnosis: IMASK stored/honored
+  (`cntp_ctl=7 cntp_line=0` at stall, storm theory dead but fix stays);
+  slice 512 parks earlier (triage knob, not cure); full chain disassembled
+  (EL1h -> dispatch -> irqentry -> genhandle -> armctrl -> waiter
+  `...0c1804` weighing `[sp_el0+8]=0x00010001`); value-trace proves guest
+  sees LOCALRD 0x102 x11358 yet ICRD=0 any-offset; irqwin=0 live+unmasked
+  windows in 2B; DTB oracle (timer=local PPIs). Next: sync-completion vs
+  dispatch parity. Smoke 23/23, fuzzer 882/882.

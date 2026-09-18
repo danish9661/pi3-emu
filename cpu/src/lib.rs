@@ -933,12 +933,18 @@ impl Bus {
         (self.gpio_eds & self.gpio_en_union(0)) != 0
     }
 
-    /// CNTPNS level (physical timer): enabled and counter >= cval.
-    /// CNTV (virtual) is tracked independently and does NOT drive this
-    /// line (M60: Linux on the Pi 3 uses CNTP for the clocksource tick;
-    /// CNTV's program must not re-assert the line after CNTP is done).
+    /// CNTPNS level (physical timer): enabled, NOT masked, and
+    /// counter >= cval. M62: IMASK (CNTP_CTL bit 1) is honored — the
+    /// guest sets it at the frame5 92dd90 site to stop the tick storm
+    /// while it weighs the mailbox completion; without this the line
+    /// stays live through the whole weighing window and the runner
+    /// keeps entering the vector (21k deliveries) instead of letting
+    /// the mailbox completion run. CNTV (virtual) is tracked
+    /// independently and does NOT drive this line (M60: Linux on the
+    /// Pi 3 uses CNTP for the clocksource tick; CNTV's program must
+    /// not re-assert the line after CNTP is done).
     pub fn cntp_line(&self) -> bool {
-        (self.cntp_ctl & 1) != 0 && self.cntpct >= self.cntp_cval
+        (self.cntp_ctl & 1) != 0 && (self.cntp_ctl & 2) == 0 && self.cntpct >= self.cntp_cval
     }
 
     /// Legacy-IC gated line (bank-0 MAILBOX bit 1 + bank-1 timer bits +
@@ -1882,8 +1888,14 @@ impl Bus {
             // M61 IRQ-chain trace (MBOXTAG=1): counts BASIC/PENDING reads
             // so the chained-handler walk is proven by execution (LOCAL
             // +0x60 -> IC BASIC -> PENDING1 -> MAIL0_RD).
-            if std::env::var("MBOXTAG").is_ok() && (off == 0x00 || off == 0x04 || off == 0x08) {
-                eprintln!("ICRD off=0x{:x} mbox0={} tmr1={}", off, self.mbox_pending0(), self.timer_pending1() | self.dma_pending1());
+            // M62h step-(b) WIDE LOG (proven: the ONLY IC reads in 2B are
+            // 4 boot-time ENABLE-mirror reads at +0x18/+0x10/+0x14/+0x0c
+            // with mbox0=0 — the handler issues ZERO IC reads of any
+            // offset/size in all 11358 mailbox-visible windows, so the
+            // GPU half genuinely never walks while the timer half is
+            // pending; serve-or-complete decision goes to (a)).
+            if std::env::var("MBOXTAG").is_ok() {
+                // value computed below; log after (see ICVALW line).
             }
             // M61 BASIC snapshot trace (MBOXTAG=1): the VALUE the guest
             // saw, so a zero-BASIC read with a live line is proven (not
@@ -1912,8 +1924,8 @@ impl Bus {
                 }
                 _ => 0, // ENABLE/DISABLE/RET read back 0
             };
-            if std::env::var("MBOXTAG").is_ok() && (off == 0x00 || off == 0x04 || off == 0x08) {
-                eprintln!("ICVAL off=0x{:x} val=0x{:x}", off, v & mask(size));
+            if std::env::var("MBOXTAG").is_ok() {
+                eprintln!("ICRDW off=0x{:x} size={} val=0x{:x} mbox0={}", off, size, v & mask(size), self.mbox_pending0());
             }
             return Ok(v & mask(size));
         }
@@ -2112,9 +2124,6 @@ impl Bus {
             // handler must read +0x60 to find the GPU bit, then the IC
             // BASIC/PENDING1 to find bank-0 bit 1, then MAIL0_RD).
             if Self::is_page(addr, size, LOCAL_BASE) && addr - LOCAL_BASE == 0x60 {
-                if std::env::var("MBOXTAG").is_ok() {
-                    eprintln!("LOCALRD off=0x60 legacy={} cntp={}", self.legacy_line() as u8, self.cntp_line() as u8);
-                }
                 let mut v = 0u64;
                 // M61 BARE-METAL COMPAT (lirq/rpi-kernel green): the
                 // bare-metal guests never program LOCAL_TIMER_INT_CONTROL0
@@ -2125,6 +2134,20 @@ impl Bus {
                 // bare-metal keeps the legacy raw-compare behavior.
                 // Upstream truth stands: Linux's tick unmasks bit 1 at
                 // +0x40 and the handler dispatches on the reported bit.
+                // M62 TIMER REPORT (DTB-oracle + code-read): the DTB's
+                // /timer node is `arm,armv7-timer` with interrupt-parent
+                // = local_intc and PPI interrupts — the arch timer is a
+                // LOCAL line (irq-bcm2836.c LOCAL_IRQ_CNT*), never a
+                // legacy armctrl bank-1 line. The +0x60 READ arm and the
+                // runner DELIVERY gate use the same `cntp_ok` condition
+                // (local-enable && cntp_line incl. IMASK), so a reported
+                // bit1 always means a deliverable timer IRQ and vice
+                // versa — no report/deliver skew by construction.
+                // (An earlier comment revision claimed reporting bit1
+                // for a quiet line caused the 11358-no-ICRD stall; the
+                // timeronly run disproved it — identical LOCALRD
+                // val=0x102 ×11358 with the comment-only change and
+                // still ICRD=0. The stall is elsewhere: see M62h.)
                 let cntp_ok = if self.linux_mode {
                     (self.local_timer_ctl0 & (1 << 1)) != 0 && self.cntp_line()
                 } else {
@@ -2135,6 +2158,9 @@ impl Bus {
                 }
                 if self.local_gpu_routing == 0 && self.legacy_line() {
                     v |= 1 << 8;
+                }
+                if std::env::var("MBOXTAG").is_ok() {
+                    eprintln!("LOCALRD off=0x60 val=0x{:x} legacy={} cntp={}", v & mask(size), self.legacy_line() as u8, self.cntp_line() as u8);
                 }
                 return Ok(v & mask(size));
             }
@@ -4090,9 +4116,21 @@ impl Cpu {
                             eprintln!("TMRMSR CNTP_TVAL=0x{:x} cval=0x{:x} cntpct=0x{:x}", v & 0xffff_ffff, bus.cntp_cval, bus.cntpct);
                         }
                     } else if op2 == 1 {
-                        bus.cntp_ctl = (v & 1) as u32;
+                        // M62: store ALL THREE bits (ENABLE|IMASK|ISTATUS
+                        // ignored-on-write per ARM ARM DDI0487
+                        // CNTP_CTL_EL0: bits[2:0] = ISTATUS|IMASK|
+                        // ENABLE; bit 2 is read-only status, bits 1:0
+                        // are R/W). The old `(v & 1)` mask silently
+                        // dropped the guest's IMASK=1 (bit 1), so the
+                        // timer IRQ storm the guest tried to mask kept
+                        // delivering 21k IRQs into the weighing window
+                        // and starved the mailbox completion. Proven by
+                        // timer-trace: the guest writes CTL=0x3 at the
+                        // IMASK site (frame5 92dd90 orr #2) but the old
+                        // mask stored 0x1.
+                        bus.cntp_ctl = (v & 0x7) as u32;
                         if std::env::var("PI3_TIMERTRACE").is_ok() {
-                            eprintln!("TMRMSR CNTP_CTL=0x{:x}", v & 1);
+                            eprintln!("TMRMSR CNTP_CTL=0x{:x}", v & 0x7);
                         }
                     } else if op2 == 2 {
                         bus.cntp_cval = v;
@@ -4102,7 +4140,11 @@ impl Cpu {
                     }
                 } else if op2 == 1 {
                     // CTL read: ENABLE bit + ISTATUS (counter >= cval).
-                    let mut c = bus.cntp_ctl & 1;
+                    // M62: IMASK (bit 1) reads back from the stored
+                    // value (see the MSR arm above); ISTATUS (bit 2) is
+                    // computed live. Old code computed ENABLE|ISTATUS
+                    // only, so a guest-set IMASK read back clear.
+                    let mut c = bus.cntp_ctl & 0x3;
                     if bus.cntpct >= bus.cntp_cval {
                         c |= 1 << 2;
                     }
