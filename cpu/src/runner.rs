@@ -193,6 +193,20 @@ impl Runner {
                 // hold the entry snapshot.
                 self.resume_armed = true;
             }
+            // M65 IRQ-DELIVERY DIAGNOSIS (execution-proven 2026-09-19):
+            // the runner delivers into the vector ONLY at chunk edges
+            // when the guest is unmasked there. The mailbox waiter runs
+            // its weigh loop with DAIF masked (stall daif=0x3), so a
+            // level line that is live the whole time is seen by the
+            // guest ONLY as +0x60 bit8 inside handlers entered for OTHER
+            // sources (timer). The chained handler then serves the
+            // timer half and returns without ever reading the IC
+            // (ICRD=0 of any offset/size over 11358 chances) — the GPU
+            // half starves not because bit8 is missing (value-trace
+            // proves val=0x102) but because the dispatch never walks
+            // it. MBOXDAIF interleave proves each unmask IS a delivery
+            // (3->0x0 at chunk edge, LOCALRD+timer service, 0->0x3 at
+            // eret), 11358 of them while mbox0=2.
             // Fresh decision at the CURRENT (end-of-chunk) pc — the facade's
             // irqElr. Delivery sources mirror the hardware/facade split:
             // the legacy GPU line is reported through the local block's

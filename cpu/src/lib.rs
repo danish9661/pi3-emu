@@ -284,6 +284,27 @@ pub struct Bus {
     /// M61 drain-watch enable (zero-cost when off): set by triage probes
     /// that need proof of MAIL0 drains by execution.
     pub mbox_drain_log: bool,
+    /// M63 PA write-watch (zero-cost unless armed): when `wwatch_on` is
+    /// set, any RAM store overlapping `wwatch_pa..+wwatch_len` emits a
+    /// `WWATCH` trace line with the store's own `size`/`val` and the
+    /// value already there. The CALLER (Cpu::step, which owns the guest
+    /// pc) appends the pc — see the `WWATCH` site there.
+    /// PROVEN (ww.err 2B run, 2.75M hits): PA 0x1e28008 = [sp_el0+8] is
+    /// the shared completion word — the weigh/wake pair from the stall
+    /// loop (`...0c1828 sub+str` / `...0c28b0 add+str`) plus sibling
+    /// sites with the IDENTICAL `ldr w1,[x0,#8] / add w1,w1,#1` /
+    /// `str w1,[x0,#8]` shape (`...1c0b48/68/ec/c00`, `...1c0774/94/
+    /// d0/e8`). The advancer is normal guest code, NOT the mailbox IRQ
+    /// handler (ICRD=0 everywhere) — so no handler exists to complete
+    /// inline in mbox_process; the completion must come from the
+    /// already-written synchronous reply being OBSERVED (see the
+    /// M63 note on mbox_process).
+    /// `wwatch_hits` counts watch log lines so step emits the pc tag
+    /// ONLY on steps that actually hit (exact volume, no flood).
+    pub wwatch_on: bool,
+    pub wwatch_pa: u64,
+    pub wwatch_len: u64,
+    pub wwatch_hits: u64,
     // Local-block per-core timer/mailbox control cells (M61 IRQ path):
     // LOCAL_TIMER_INT_CONTROL0 (+0x40, core 0): low 4 bits = per-core
     // arch-timer IRQ enables (bit1 = CNTPNSIRQ — the timer the kernel's
@@ -442,6 +463,10 @@ impl Bus {
             mbx_cnf_irqen: false,
             mbox_prev_live: false,
             mbox_drain_log: false,
+            wwatch_on: false,
+            wwatch_pa: 0,
+            wwatch_len: 0,
+            wwatch_hits: 0,
             local_timer_ctl0: 0,
             local_mbox_ctl0: 0,
             local_gpu_routing: 0,
@@ -1153,7 +1178,17 @@ impl Bus {
             let id = self.mem_u32(addr + off as u64);
             eprintln!("MBOXTAG 0x{:08x} tsize={}", id, tsize);
         }
-        self.mem_write_u32(addr + off as u64 + 8, 0x80000000);
+        // M64 reqlen-bit protocol (execution-proven 2026-09-19 via
+        // zzmboxdump: after our reply the guest's reqlen word reads
+        // 0x80000000, i.e. request bit31 SET persists in the echoed
+        // header): tag header word +8 is req/resp LENGTH with bit31 =
+        // request/response flag (1=request, 0=response — read from the
+        // live guest word, never assumed). Real firmware CLEARS bit31
+        // on reply; our old code wrote 0x80000000 (request AGAIN), so
+        // the driver's post-send check read "still a request" and the
+        // transaction never completed (timeout at 3.4s, zero drains).
+        // Write length with bit31 CLEAR; payload bytes unchanged.
+        self.mem_write_u32(addr + off as u64 + 8, (tsize as u32) & 0x7fff_ffff);
         for i in 0..tsize {
             let a = addr + off as u64 + 12 + i as u64;
             if self.in_ram(a, 1) {
@@ -1843,6 +1878,16 @@ impl Bus {
             // FULL until the IRQ handler drains MAIL0_RD). So pending:
             // FULL=0, EMPTY=0 (busy, reply waits); idle: EMPTY=1. The
             // +0x00 READ drains (clears pending) regardless of STA.
+            // M64 QUEUE-DEPTH-1 (execution-proven 2026-09-19): real HW
+            // has a 1-deep MAIL1 FIFO — while a request is in flight
+            // the FIFO is FULL (bit31=1), and EMPTY (bit30) reads 0.
+            // (First cut set FULL=1 here and the driver went single-
+            // flight: 1 MBOXWR then 5458 EMPTY=0 polls awaiting its own
+            // queue slot back, never collecting — the txdone poll is a
+            // spin, not an IRQ kick. So FULL=1 alone is NOT the answer;
+            // the completion must ALSO be collectible. Kept FULL=0/
+            // EMPTY=0 busy-while-pending; the real fix is the drain
+            // word + line drop below.)
             let mail1_sta: u64 = if self.mbx_pending { 0 } else { 1 << 30 };
             // MAIL0_STA while pending must read NON-EMPTY (EMPTY bit
             // clear) so the IRQ handler's while-loop enters and drains
@@ -1867,9 +1912,19 @@ impl Bus {
                 // proven by execution (MAIL0_RD must follow an IC
                 // BASIC/PENDING read in the same unmasked window).
                 0x00 => {
-                    let w = self.mbx_pub_read as u64;
+                    // M64 drain fix (execution-proven 2026-09-19): the old
+                    // arm returned the STALE `mbx_pub_read` snapshot (last
+                    // published word) instead of the CURRENT request's
+                    // word (`mbx_last_write`). Multi-shot reuses one
+                    // buffer per probe, so after request #1 drained,
+                    // requests #2/#3 drained the SAME stale word: the tx
+                    // poll saw its slot back but the reply never matched,
+                    // and every firmware transaction timed out at 3.4s.
+                    // Serve the live word; keep the pending-clear + line
+                    // drop + STA-raise behavior unchanged.
+                    let w = self.mbx_last_write as u64;
                     if std::env::var("MBOXTAG").is_ok() && self.mbx_pending {
-                        eprintln!("MBOXDRAIN rd=0x{:08x}", self.mbx_pub_read);
+                        eprintln!("MBOXDRAIN rd=0x{:08x}", self.mbx_last_write);
                     }
                     self.mbx_pending = false;
                     w
@@ -2188,6 +2243,28 @@ impl Bus {
         // M58 hot-path: same MMU-off fast path as read().
         if (self.mmu_sctlr & 1) == 0 {
             if self.in_ram(addr, size) {
+                // M63 write-watch (zero-cost unless armed): log any RAM
+                // store overlapping the watched PA range BEFORE applying
+                // it (old bytes still in place). Caller appends the pc.
+                if self.wwatch_on
+                    && addr < self.wwatch_pa + self.wwatch_len
+                    && addr + size > self.wwatch_pa
+                {
+                    let mut old = 0u64;
+                    for i in 0..self.wwatch_len.min(8) {
+                        let a = self.wwatch_pa + i;
+                        if self.in_ram(a, 1) {
+                            old |= (self.mem[a as usize] as u64) << (8 * i);
+                        }
+                    }
+                    if std::env::var("WWATCH").is_ok() {
+                        eprintln!(
+                            "WWATCH pa=0x{:x} size={} val=0x{:x} old=0x{:x}",
+                            addr, size, val & mask(size), old
+                        );
+                    }
+                    self.wwatch_hits += 1;
+                }
                 let a = addr as usize;
                 for i in 0..size {
                     self.mem[a + i as usize] = ((val >> (8 * i)) & 0xff) as u8;
@@ -2197,6 +2274,27 @@ impl Bus {
         } else {
             addr = self.translate(addr)?;
             if self.in_ram(addr, size) {
+                // M63 write-watch (MMU-on path): same as above, on the
+                // translated PA.
+                if self.wwatch_on
+                    && addr < self.wwatch_pa + self.wwatch_len
+                    && addr + size > self.wwatch_pa
+                {
+                    let mut old = 0u64;
+                    for i in 0..self.wwatch_len.min(8) {
+                        let a = self.wwatch_pa + i;
+                        if self.in_ram(a, 1) {
+                            old |= (self.mem[a as usize] as u64) << (8 * i);
+                        }
+                    }
+                    if std::env::var("WWATCH").is_ok() {
+                        eprintln!(
+                            "WWATCH pa=0x{:x} size={} val=0x{:x} old=0x{:x}",
+                            addr, size, val & mask(size), old
+                        );
+                    }
+                    self.wwatch_hits += 1;
+                }
                 let a = addr as usize;
                 for i in 0..size {
                     self.mem[a + i as usize] = ((val >> (8 * i)) & 0xff) as u8;
@@ -3490,7 +3588,19 @@ impl Cpu {
         let pc = self.pc;
         let w = bus.fetch(pc)?;
         self.pc = pc.wrapping_add(4);
-        self.exec(bus, pc, w)
+        // M63 write-watch pc tag: Bus::write owns the store but not the
+        // guest pc. `wwatch_hits` counts watch log lines, so step emits
+        // the pc tag ONLY on steps that actually hit (exact volume, no
+        // flood — a `grep -A1 WWATCH` pairs each store with its author).
+        let before = bus.wwatch_hits;
+        let r = self.exec(bus, pc, w);
+        if bus.wwatch_on
+            && std::env::var("WWATCH").is_ok()
+            && bus.wwatch_hits != before
+        {
+            eprintln!("WWPC pc=0x{:x}", pc);
+        }
+        r
     }
 
     pub fn run(&mut self, bus: &mut Bus, budget: u64) -> (u64, Option<Fault>) {
