@@ -1193,3 +1193,10 @@ dist/                 production bundle
   sees LOCALRD 0x102 x11358 yet ICRD=0 any-offset; irqwin=0 live+unmasked
   windows in 2B; DTB oracle (timer=local PPIs). Next: sync-completion vs
   dispatch parity. Smoke 23/23, fuzzer 882/882.
+- M63-M65 -- write-watch kills inline completion; scheduler wait found:
+  PA 0x1e28008 is a task refcount (not a completion word), so no mbox
+  handler can complete it inline (ICRD=0 corroborates); kept fixes are
+  live-word drain + reqlen-bit-clear (FULL=1 reverted: single-flight).
+  The real waiter is the scheduler loop at 0x120f78 (console done by
+  1.5B, runqueue never schedules holder; IMASK tick starvation leads).
+  Smoke 23/23, fuzzer 882/882.

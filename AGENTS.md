@@ -1932,6 +1932,35 @@ mechanism is now fully mapped by execution:
 - Battery: smoke 23/23 + fuzzer 882/882. Logs (HOME-surviving):
   `~/pi62-logs/` (slice/t/timer/imask/stepb/pend/vec/frame/weigh/irqwin).
 
+### M63–M65 — write-watch kills inline completion; scheduler wait found (DONE, committed)
+
+Write-watch on PA 0x1e28008 (`[sp_el0+8]`, 2.75M hits/2B) proves the
+waiter word is a task-struct refcount (0x10001 49%, 0x10000 39%,
+0x10002 10%), advanced by normal guest get/put code (stall pair
+`...0c1828`/`...0c28b0` + siblings `...1c0b48/68/ec/c00`,
+`...1c0774/94/d0/e8` — all `ldr/add|sub/str`, disasm-verified), NOT by
+any mailbox IRQ handler (ICRD=0 everywhere). Inline completion in
+`mbox_process` is NOT viable; zero-cost wwatch infra kept
+(`WWATCH`-gated, battery green).
+
+Mailbox fixes kept (all battery-green, protocol-correct): `MBOXRD
++0x00` serves live `mbx_last_write` (was stale snapshot — multi-shot
+reuses one buffer); reqlen bit31 CLEAR on reply (`zzmboxdump` proves
+guest sees response headers now); FULL=1 tried and REVERTED by
+execution (single-flight: 1 MBOXWR + 5458 EMPTY=0 polls — txdone spin
+is not an IRQ kick).
+
+The REAL waiter is the scheduler loop at `0x120f78` (modal post-entry
+resume pc ×5362; runqueue-wait on per-CPU words), NOT the mailbox
+consumer: MBOXDAIF audit shows all 11358 mbox0=2 unmasks pair 1:1 with
+`LOCALRD val=0x102` timer-half services that return without an IC
+read; `zzsched` time-series shows the console complete by 1.5B with
+irqs frozen at 21089 while the runqueue never schedules the holder
+(IMASK-gated tick starvation is the lead). Next (M66): unstick the
+scheduler; do not re-try mbox dispatch (11358 chances exhausted).
+- Battery: smoke 23/23 + fuzzer 882/882. Logs: `~/pi62-logs/`
+  (ww/gate/watcharg/waiter/sched) + `/tmp/opencode/m64* m65*`.
+
 
 ## Key risks (M49: unicorn retired — the first two risks below are closed)
 
