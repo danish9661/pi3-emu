@@ -1199,6 +1199,21 @@ impl Bus {
 
     /// Framebuffer tags (mirrors fbTag). Returns true when handled.
     /// FB_ADDR carves the buffer out of guest RAM like the facade.
+    /// M66 firmware-idc init — PROVEN WRONG by execution (removed;
+    /// kept here as documentation so nobody re-tries it): the idc
+    /// tables hold function POINTERS (zzidctable: entry words are VAs
+    /// like ...0834ab10 / ...08bc0978 with flag 0x403, NOT kind
+    /// words), so seeding kinds 0x0802d14c/0x080355f0 (which are the
+    /// idc-a/b entry-POINT *addresses*, not kinds) changed nothing —
+    /// stall byte-identical at 2B (same pc/tail/3xMBOXWR/zero drains,
+    /// /tmp/opencode/m66idc.*). The pre-send scan compares the
+    /// weigh-loop kind word against per-entry +40 kind fields of a
+    /// table the KERNEL fills at runtime (table-base was 0x0 at the
+    /// 2nd send — idc-miss by construction this early in boot). Do NOT
+    /// re-seed without observing a real table write first (watch the
+    /// table-base PA for the store that publishes it).
+    /// (Former `mbox_fw_idc_init` deleted: dead code warns and the
+    /// seed was wrong. This comment is the record.)
     fn mbox_fb_tag(&mut self, addr: u64, off: usize, id: u32, tsize: usize) -> bool {
         const FB_ADDR: u64 = 0x200000;
         let v = addr + off as u64 + 12;
@@ -1888,7 +1903,23 @@ impl Bus {
             // the completion must ALSO be collectible. Kept FULL=0/
             // EMPTY=0 busy-while-pending; the real fix is the drain
             // word + line drop below.)
-            let mail1_sta: u64 = if self.mbx_pending { 0 } else { 1 << 30 };
+            // M66 TX-DONE SPIN (execution-proven 2026-09-19, current-2B
+            // trace): the firmware xact waiter does NOT sleep on an IRQ
+            // at all -- it spins on the tx-done poll
+            // (`...0207b0/020704` MBOXSEND sites are INSIDE the
+            // `...0206c4` loop whose only exits are the `...0207dc`
+            // drain-collect path and the `...0207f4` idc-match path).
+            // HYPOTHESIS (txdone reads MAIL1_STA, needs EMPTY=1 to stop
+            // spinning): pending should read EMPTY=1 (FULL=0). TRIED
+            // (`mail1_sta = 1<<30` unconditionally) → stall IDENTICAL
+            // (same pc/tail/3 polls, /tmp/opencode/m66spin.*) — so the
+            // poll is NOT gated on our STA bits, or the loop never
+            // reaches the poll (pre-send idc-miss spins first — see
+            // M66 idc verdict below). Kept as unconditional EMPTY=1:
+            // matches the "slot back once reply readable" model and is
+            // battery-green; revisit only with a trace showing the poll
+            // consuming it.
+            let mail1_sta: u64 = 1 << 30;
             // MAIL0_STA while pending must read NON-EMPTY (EMPTY bit
             // clear) so the IRQ handler's while-loop enters and drains
             // the reply (see the +0x00 arm, which clears pending).

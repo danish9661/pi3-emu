@@ -1200,3 +1200,9 @@ dist/                 production bundle
   The real waiter is the scheduler loop at 0x120f78 (console done by
   1.5B, runqueue never schedules holder; IMASK tick starvation leads).
   Smoke 23/23, fuzzer 882/882.
+- M66 -- tx-spin + idc-table + EMPTY=1 verdicts: the stall is the
+  `...0206c4` tx-loop spinning 166460x on the pre-send idc-miss (never
+  reaching MBOXWR #4); the idc table is kernel-filled at runtime
+  (table-base 0x0 at 2nd send) and holds fn-pointers, not kinds (seed
+  removed); EMPTY=1-always changes nothing. Next: post-send idc-match
+  inputs. Smoke 23/23, fuzzer 882/882.

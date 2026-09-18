@@ -1950,16 +1950,43 @@ guest sees response headers now); FULL=1 tried and REVERTED by
 execution (single-flight: 1 MBOXWR + 5458 EMPTY=0 polls — txdone spin
 is not an IRQ kick).
 
-The REAL waiter is the scheduler loop at `0x120f78` (modal post-entry
-resume pc ×5362; runqueue-wait on per-CPU words), NOT the mailbox
-consumer: MBOXDAIF audit shows all 11358 mbox0=2 unmasks pair 1:1 with
-`LOCALRD val=0x102` timer-half services that return without an IC
-read; `zzsched` time-series shows the console complete by 1.5B with
-irqs frozen at 21089 while the runqueue never schedules the holder
-(IMASK-gated tick starvation is the lead). Next (M66): unstick the
-scheduler; do not re-try mbox dispatch (11358 chances exhausted).
+The REAL waiter is the firmware-xact waiter spinning INSIDE the
+`...0206c4` tx-loop (both MBOXSEND pcs sit inside it; exits are the
+`...0207dc` drain-collect and `...0207f4` idc-match paths, NEITHER
+taken in 2B). CORRECTION: the modal `...120f78` resume-pc histogram
+was a RED HERRING (chunk-boundary samples, not waiter identity).
+`zzsched` time-series shows the console complete by 1.5B with irqs
+frozen at 21089. Next (M66): the pre-send idc scan misses on a table
+the kernel fills at runtime (table-base 0x0 at 2nd send) — find the
+REAL collect trigger (post-send idc-match inputs), not STA bits.
 - Battery: smoke 23/23 + fuzzer 882/882. Logs: `~/pi62-logs/`
   (ww/gate/watcharg/waiter/sched) + `/tmp/opencode/m64* m65*`.
+
+### M66 — tx-spin + idc-table + EMPTY=1 verdicts (DONE, committed)
+
+Waiter CORRECTED by execution: the stall is the `...0206c4` tx-loop
+spinning 166460× on the pre-send idc-miss (`zzloop`: 166460 visits
+each to `...020704`/`...0207b0`, zero to either collect arm), never
+reaching MBOXWR #4. The idc table the scan walks (`...1ca624`:
+48B-stride walk at `[x1,#6576]` entry+40 vs kind) is filled by the
+KERNEL at runtime — at the 2nd send `[x20,#6568]=0xffffffff` /
+table-base=0x0 (zzidc), so no entry can match by construction; the
+REAL table (observed live at n=150M, VA `...09077b80`, count=0x10)
+holds FUNCTION POINTERS (`...0834ab10`/`...08bc0978` + flag 0x403),
+not kind words — so the kind-seed (`mbox_fw_idc_init`, REMOVED, doc
+comment is the record) changed nothing (`/tmp/opencode/m66idc.*`
+byte-identical). EMPTY=1-always (`mail1_sta = 1<<30`
+unconditionally) tried → stall IDENTICAL (same pc/tail/3 polls,
+`/tmp/opencode/m66spin.*`) — the tx-done poll is NOT the exit gate;
+the loop never reaches any STA poll. Reply headers verified
+responses (`zzmboxdump`: `reqlen=0x4/0x14`, bit31 clear) yet the run
+never reaches either collect arm. NEXT (M67): the post-send
+idc-match inputs (`bl ...1ca624` return vs cached `[x19,#8]`) — watch
+the table-base PA for the store that publishes it; do NOT re-try
+EMPTY=1, kind-seed, FULL=1, STATUS polling, dispatch, or inline
+completion (all ruled out by execution above).
+- Battery: smoke 23/23 + fuzzer 882/882. Logs: `/tmp/opencode/`
+  (m66/m66spin/m66idc/mboxdump2/idc*/loop/sched) + `~/pi62-logs/`.
 
 
 ## Key risks (M49: unicorn retired — the first two risks below are closed)
