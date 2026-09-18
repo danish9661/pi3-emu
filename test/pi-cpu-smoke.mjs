@@ -73,6 +73,17 @@ const CASES = [
     console: ['debug/diagnostic', 'ALL PASS', 'Pass: 22'],
     fault: 'null',
   }],
+  ['usb', 'usb', ['2000000'], {}, {
+    console: ['GSNPSID OK', 'GHWCFG2', 'HPRT reset+enable OK', 'HFNUM ticking OK',
+      'HCINT XFERCOMPL OK', 'device descriptor OK (0424:7800 LAN7800)', 'HCINT W1C OK',
+      'CURMODE_HOST OK', 'ALL PASS'],
+    fault: 'null',
+  }],
+  ['eth', 'eth', ['2000000'], {}, {
+    console: ['port up OK', 'TX XFERCOMPL OK', 'GINTSTS HCHINT OK', 'HAINT[0] OK',
+      'PENDING1 bit9 (USB IRQ) OK', 'RX XFERCOMPL OK', 'loopback frame OK', 'ALL PASS'],
+    fault: 'null',
+  }],
 ];
 
 let pass = 0, fail = 0, skip = 0;

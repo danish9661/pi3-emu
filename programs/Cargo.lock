@@ -31,6 +31,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "eth"
+version = "0.1.0"
+dependencies = [
+ "pi-runtime",
+]
+
+[[package]]
 name = "fb"
 version = "0.1.0"
 dependencies = [
@@ -152,6 +159,13 @@ dependencies = [
 
 [[package]]
 name = "uart1"
+version = "0.1.0"
+dependencies = [
+ "pi-runtime",
+]
+
+[[package]]
+name = "usb"
 version = "0.1.0"
 dependencies = [
  "pi-runtime",

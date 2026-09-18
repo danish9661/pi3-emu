@@ -1206,3 +1206,13 @@ dist/                 production bundle
   (table-base 0x0 at 2nd send) and holds fn-pointers, not kinds (seed
   removed); EMPTY=1-always changes nothing. Next: post-send idc-match
   inputs. Smoke 23/23, fuzzer 882/882.
+- M67 -- DWC2 OTG + LAN7800 ethernet path (UNCOMMITTED): complete USB/
+  ethernet device protocol in pi-cpu (DWC2 core at 0x3F980000 with QEMU
+  reset values + verbatim write arms, sync transfer completion with EP0
+  setup-latch + GET_DESCRIPTOR 0424:7800, bulk TX/RX + loopback, IRQ as
+  GPU IRQ 9 bank-1 bit 9) + LAN7800 (MAC b8:27:eb:de:ad:be, link up,
+  RX/TX harness hooks) + `usb`/`eth` demo guests (14 + 7 checks ALL
+  PASS) + smoke/UI wiring. DTB-surveyed (usb424:7800 on usb-port@1),
+  upstream-grounded (qemu-wasm tree in-repo). Linux 2B stall unchanged
+  (still blacklists dwc2 — un-blacklisting is next). Smoke 25/25,
+  fuzzer 882/882.

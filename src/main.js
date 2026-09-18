@@ -26,10 +26,10 @@ const UPY_MODE = 'upython';
 
 // Explicit-done selector for PiEmu.done(): 0 = clock/gpio (TMR+0x20),
 // 1 = mmu, 2 = dma, 3 = pwm, 4 = i2c, 5 = spi, 6 = sd (all +0x54),
-// 7 = periphs/debug (USB DONE: +0xFF0 or +0x54).
+// 7 = periphs/debug/usb/eth (USB DONE: +0xFF0 or +0x54).
 const DONE_SEL = {
   clock: 0, gpio: 0, mmu: 1, dma: 2, pwm: 3, i2c: 4, spi: 5, sd: 6,
-  periphs: 7, debug: 7,
+  periphs: 7, debug: 7, usb: 7, eth: 7,
 };
 
 const GPIO_LEDS = [21, 22, 23, 24, 25, 26, 27, 28];
@@ -58,6 +58,8 @@ export const PROGRAMS = {
   periphs: 'periphs.elf',
   debug: 'debug.elf',
   bench: 'bench.elf',
+  usb: 'usb.elf',
+  eth: 'eth.elf',
 };
 
 const term = document.getElementById('term');
@@ -928,6 +930,20 @@ async function run() {
       draw(runUntilDone('debug')); // diagnostic sweep: parks on USB DONE
       setStatus(
         `booted — running debug — diagnostic report across all windows — press Reboot to re-run`
+      );
+    } else if (sel === 'usb') {
+      mode = 'usb';
+      await bootProg(PROGRAMS.usb);
+      draw(runUntilDone('usb')); // DWC2 OTG: ID/config/reset/HPRT/channel-0 descriptor
+      setStatus(
+        `booted — running usb — DWC2 OTG @ 0x3F980000 — GET_DESCRIPTOR 0424:7800 — press Reboot to re-run`
+      );
+    } else if (sel === 'eth') {
+      mode = 'eth';
+      await bootProg(PROGRAMS.eth);
+      draw(runUntilDone('eth')); // LAN7800: bulk TX + IRQ + loopback RX
+      setStatus(
+        `booted — running eth — LAN7800 ethernet @ DWC2 — TX/RX loopback + USB IRQ — press Reboot to re-run`
       );
     } else if (sel === PI_LINUX_MODE) {
       // M58 pi-linux: the REAL kernel8.img + DTB + initrd on OUR OWN

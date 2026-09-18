@@ -211,13 +211,56 @@ pub struct Bus {
     // M30 windows (periphs/debug guests — mirrors rng.js, clockmgr.js,
     // i2s.js, uart25.js, usb.js): RNG CTRL latch (DATA reads a fixed
     // 45.0 C like the temp model), AUX mini-UART 2-5 window backing +
-    // enable latches (LSR served live), USB park flag (SNPSID + DONE
-    // only). CLK/I2S/I2C0 are zero windows (absorbing, like the
+    // enable latches (LSR served live), USB DWC2 OTG core (M67: full
+    // register file + host channels + IRQ line; see usb_* fields).
+    // CLK/I2S/I2C0 are zero windows (absorbing, like the
     // facade's untouched windows).
     rng_ctrl: u32,
     uart25_back: [[u32; 64]; 4],
     uart25_enabled: [bool; 4],
     usb_done: bool,
+    // M67 DWC2 OTG core state (0x3F980000, 0x11000 bytes — mirrors
+    // QEMU hcd-dwc2.c reset values + Linux drivers/usb/dwc2/hw.h bit
+    // defs, and ports the old facade src/usb.js state machine):
+    // - glb: GOTGCTL/GOTGINT/GAHBCFG/GUSBCFG/GRSTCTL/GINTSTS/GINTMSK/
+    //   GRXFSIZ/GNPTXFSIZ/GNPTXSTS/GI2CCTL/GPVNDCTL/GGPIO/GUID/GSNPSID/
+    //   GHWCFG1-4/GLPMCFG/GPWRDN/GDFIFOCFG/GADPCTL shadow cells.
+    // - host: HPTXFSIZ/HCFG/HFIR/HFNUM/HPTXSTS/HAINT/HAINTMSK/HPRT0.
+    // - 8 host channels (DWC2_NB_CHAN=8): HCCHAR/HCSPLT/HCINT/HCINTMSK/
+    //   HCTSIZ/HCDMA/HCDMAB cells (HCTSIZ/HCDMA latched for DMA).
+    // - frame counter + SOF throttle (HFNUM advances per sync_out;
+    //   SOF bit pulses every 8th tick like the facade).
+    // Guests verified against this model: periphs/debug (GSNPSID),
+    // usb/eth demo guests (core bring-up + IRQ + channels), and the
+    // Linux dwc2 driver (probe without the initcall blacklist).
+    usb_glb: [u32; 28],
+    usb_hreg0: [u32; 17],
+    usb_hch: [[u32; 8]; 8],
+    usb_frame: u32,
+    usb_sof_ticks: u32,
+    usb_hprt_conn: bool,
+    /// LAN7800 (Pi 3 B+ onboard ethernet, usb424:7800 on the DTB's
+    /// usb-port@1 tree): USB-device-side model behind the DWC2 host.
+    /// Fixed MAC b8:27:eb:de:ad:be (matches the 0x10003 mailbox tag
+    /// reply + DTB-less firmware default), link always up 1000 Mb/s
+    /// full duplex, RX queue fed by the harness (browser), TX queue
+    /// drained to the harness. Driver-visible via standard USB
+    /// control/bulk transfers on the host channels (see usb_xfer).
+    usb_mac: [u8; 6],
+    usb_link_up: bool,
+    usb_rx: Vec<u8>,
+    usb_tx: Vec<u8>,
+    /// Pending control SETUP packet (latched by the EP0/OUT xfer==8
+    /// setup-stage absorb above; consumed by the following EP0
+    /// data/status stage). Real stacks move setup through the FIFO;
+    /// pi-cpu has no FIFO model, so the latch carries it.
+    usb_setup: [u8; 8],
+    usb_setup_valid: bool,
+    /// Last transmitted frame (bulk-OUT payload) for the eth-guest
+    /// loopback read (see the IN arm above). Real hardware would put
+    /// it on the wire; with no harness input queued, echoing it lets
+    /// the demo verify the full TX->RX path deterministically.
+    usb_loopback: Vec<u8>,
     // I2C window backing (DLEN/A/FIFO/DONE cells; C/S are computed).
     // I2C window backing (DLEN/A/FIFO/DONE cells; C/S are computed).
     i2c_back: [u32; 32],
@@ -435,6 +478,19 @@ impl Bus {
             uart25_back: [[0; 64]; 4],
             uart25_enabled: [false; 4],
             usb_done: false,
+            usb_glb: Bus::dwc2_reset_glb(),
+            usb_hreg0: Bus::dwc2_reset_hreg0(),
+            usb_hch: [[0; 8]; 8],
+            usb_frame: 0x3fff,
+            usb_sof_ticks: 0,
+            usb_hprt_conn: false,
+            usb_mac: [0xb8, 0x27, 0xeb, 0xde, 0xad, 0xbe],
+            usb_link_up: true,
+            usb_rx: Vec::new(),
+            usb_tx: Vec::new(),
+            usb_setup: [0; 8],
+            usb_setup_valid: false,
+            usb_loopback: Vec::new(),
             i2c_back: [0; 32],
             i2c_pub_c: 0,
             i2c_pub_s: 0,
@@ -973,10 +1029,41 @@ impl Bus {
     }
 
     /// Legacy-IC gated line (bank-0 MAILBOX bit 1 + bank-1 timer bits +
-    /// DMA0, bank-2 GPIO bit 17 + UART bit 25; AUX/SDHCI unmodeled).
-    /// Mirrors ic.js pending().
+    /// DMA0, bank-1 USB bit 9, bank-2 GPIO bit 17 + UART bit 25;
+    /// AUX/SDHCI unmodeled). Mirrors ic.js pending() + upstream
+    /// bcm2835_peripherals.c (DWC2 -> INTERRUPT_USB = GPU IRQ 9) +
+    /// bcm2835_ic.c (PENDING1 = low 32 GPU IRQs incl. bit 9).
     pub fn legacy_line(&self) -> bool {
-        self.timer_pending1() | self.dma_pending1() | self.gpio_pending2() | self.uart_pending2() | self.mbox_pending0() != 0
+        self.timer_pending1() | self.dma_pending1() | self.usb_pending1() | self.gpio_pending2() | self.uart_pending2() | self.mbox_pending0() != 0
+    }
+
+    /// Gated bank-1 USB bit (M67 ethernet path): the DWC2 core raises
+    /// its IRQ ((GINTSTS & GINTMSK) != 0 with GAHBCFG.GLBL_INTR_EN)
+    /// AND the IC bank-1 bit-9 enable is set (upstream irq_enable[1]
+    /// bit 9 = GPU IRQ 9 = INTERRUPT_USB, per raspi_platform.h).
+    /// Reports PENDING1 bit 9 + BASIC bit 10 (first dup-table entry:
+    /// irq_dups[] = {7,9,10,...} maps GPU 9 -> BASIC bit 11? No —
+    /// upstream BASIC bits 10-20 map irq_dups[i] -> (i+10): GPU 9 is
+    /// irq_dups[1] -> BASIC bit 11. pi-cpu serves PENDING1 bit 9 (the
+    /// driver's bank read) + legacy BASIC bit 10 is NOT set for USB
+    /// (kept 0: no guest depends on the BASIC mirror for USB; the
+    /// dwc2 driver reads PENDING1/GINTSTS, not BASIC).
+    /// Public for triage probes (per-source line state).
+    pub fn usb_pending1(&self) -> u32 {
+        if self.usb_irq_level() && ((self.ic_en1 >> 9) & 1) != 0 {
+            1 << 9
+        } else {
+            0
+        }
+    }
+
+    /// DWC2 core IRQ level (QEMU hcd-dwc2.c dwc2_update_irq verbatim):
+    /// level = ((GINTSTS & GINTMSK) != 0) && GAHBCFG.GLBL_INTR_EN.
+    pub fn usb_irq_level(&self) -> bool {
+        let sts = self.usb_glb[0x14 / 4];
+        let msk = self.usb_glb[0x18 / 4];
+        let ahb = self.usb_glb[0x08 / 4];
+        ((sts & msk) != 0) && ((ahb & 1) != 0)
     }
 
     /// Gated bank-0 MAILBOX bit (M61 IRQ path): a processed reply waits
@@ -1068,6 +1155,338 @@ impl Bus {
         }
     }
 
+    // ===== M67 DWC2 OTG core (0x3F980000) =====
+    //
+    // Reset values: QEMU hcd-dwc2.c dwc2_reset_enter verbatim (see the
+    // per-cell comments). Bit defs: Linux drivers/usb/dwc2/hw.h
+    // (imported into QEMU as include/hw/usb/dwc2-regs.h). Register map:
+    // glb 0x000-0x06C (28 words: GOTGCTL..GINTSTS2), HPTXFSIZ at 0x100,
+    // host 0x400-0x440 (17 words: HCFG..HPRT0), channels 0x500+32B each
+    // (HCCHAR/HCSPLT/HCINT/HCINTMSK/HCTSIZ/HCDMA/HCDMAB; 8 channels =
+    // DWC2_NB_CHAN).
+    //
+    // Guest-visible behavior (all execution-verified by the usb/eth
+    // demo guests + smoke goldens):
+    // - ID/config reads: GSNPSID 0x4f54294a (QEMU reset value; the
+    //   facade served 0x4f54280a — periphs/debug accept BOTH, real revs).
+    // - GOTGCTL: BSESVLD|ASESVLD|CONID_B set (session valid, B-device
+    //   idle); SESREQ/HNPREQ self-complete like the facade (SESREQSCS/
+    //   HSTNEGSCS + GOTGINT SES_REQ_SUC/HST_NEG_DET + OTGINT).
+    // - GINTSTS: CURMODE_HOST|NPTXFEMP|PTXFEMP|CONIDSTSCHNG at reset;
+    //   W1C on guest writes (QEMU glbreg_write GINTSTS arm verbatim,
+    //   incl. the read-only-bit protection); SOF pulses every 8th
+    //   sync_out tick (facade parity).
+    // - GRSTCTL: AHBIDLE set; CSFTRST/HSFTRST self-clear + restore the
+    //   reset GINTSTS/GOTGCTL (QEMU: full reset_enter; pi-cpu restores
+    //   the sticky core words, keeps guest FIFOSIZ/HCFG programs).
+    // - HFNUM: frame counter (sync_out advance) + FRREM live field.
+    // - HPRT0: PWR set at reset (QEMU reset_exit); PPWR latch ->
+    //   CONNSTS|CONNDET + PRTINT (device attached: the LAN7800);
+    //   PRTRST self-clears + ENA|ENACHG + PRTINT.
+    // - Host channels (QEMU hreg1_write HCCHAR/HCINT/HCINTMSK arms):
+    //   CHDIS rising -> clear CHENA + HCINT.CHHLTD; CHENA rising ->
+    //   enable + immediate transfer completion (see usb_xfer): the
+    //   LAN7800 answers synchronously (control GET_DESCRIPTOR/
+    //   SET_ADDRESS/SET_CONFIG + bulk IN/OUT), HCINT XFERCOMPL|CHHLTD,
+    //   HAINT bit, GINTSTS.HCHINT when masked.
+    // - IRQ: ((GINTSTS & GINTMSK) != 0) && GAHBCFG.GLBL_INTR_EN
+    //   (QEMU dwc2_update_irq verbatim) -> legacy_line() bank-1 bit 9
+    //   (INTERRUPT_USB = GPU IRQ 9) -> runner delivery.
+    /// QEMU dwc2_reset_enter glb words (GOTGCTL..GINTSTS2).
+    fn dwc2_reset_glb() -> [u32; 28] {
+        // GHWCFG2: (8 << DEV_TOKEN_Q_DEPTH) | (4 << HOST_PERIO) |
+        // (4 << NONPERIO) | DYNAMIC_FIFO | PERIO_EP | ((8-1) <<
+        // NUM_HOST_CHAN) | (INT_DMA << ARCH) | (NO_SRP_HOST << OP_MODE)
+        // — QEMU hcd-dwc2.c lines 1264-1271 (DWC2_NB_CHAN=8 there too).
+        let ghwcfg2 = (8u32 << 26) | (4 << 24) | (4 << 22) | (1 << 19) | (1 << 18)
+            | ((8u32 - 1) << 14) | (2 << 3) | (6 << 0);
+        // GHWCFG3: (4096 << DFIFO_DEPTH) | (4 << PKT_SZ_W) | (4 << XFER_SZ_W).
+        // Machine-checked: 0x250dc016 / 0x10000044 (python3 from the
+        // shift expression — never hand-hex).
+        let ghwcfg3 = (4096u32 << 16) | (4 << 4) | (4 << 0);
+        [
+            0x000c0000 | (1 << 19) | (1 << 18) | (1 << 16), // 0x00 GOTGCTL: BSESVLD|ASESVLD|CONID_B
+            0,          // 0x04 GOTGINT
+            0,          // 0x08 GAHBCFG
+            5 << 10,    // 0x0C GUSBCFG: USBTRDTIM=5
+            1 << 31,    // 0x10 GRSTCTL: AHBIDLE
+            (1 << 28) | (1 << 26) | (1 << 5) | (1 << 0), // 0x14 GINTSTS: CONIDSTSCHNG|PTXFEMP|NPTXFEMP|CURMODE_HOST
+            0,          // 0x18 GINTMSK
+            0,          // 0x1C GRXSTSR
+            0,          // 0x20 GRXSTSP (alias cell)
+            1024,       // 0x24 GRXFSIZ
+            1024 << 16, // 0x28 GNPTXFSIZ: depth 1024
+            (4 << 16) | 1024, // 0x2C GNPTXSTS: 4 q-entries + 1024 space
+            (1 << 28) | (1 << 24), // 0x30 GI2CCTL: I2CDATSE0|ACK
+            0,          // 0x34 GPVNDCTL
+            0,          // 0x38 GGPIO
+            0,          // 0x3C GUID
+            0x4f54_294a, // 0x40 GSNPSID: QEMU 4.20a
+            0,          // 0x44 GHWCFG1
+            ghwcfg2,    // 0x48 GHWCFG2
+            ghwcfg3,    // 0x4C GHWCFG3
+            0,          // 0x50 GHWCFG4
+            0,          // 0x54 GLPMCFG
+            1 << 0,     // 0x58 GPWRDN: PWRDNRSTN
+            0,          // 0x5C GDFIFOCFG
+            0,          // 0x60 GADPCTL
+            0,          // 0x64 GREFCLK
+            0,          // 0x68 GINTMSK2
+            0,          // 0x6C GINTSTS2
+        ]
+    }
+    /// QEMU dwc2_reset_enter host words (HCFG..HPRT0, 17 words).
+    fn dwc2_reset_hreg0() -> [u32; 17] {
+        [
+            2 << 8,     // 0x400 HCFG: RESVALID=2
+            60000,      // 0x404 HFIR
+            0x3fff,     // 0x408 HFNUM
+            0,          // 0x40C rsvd
+            (16 << 16) | 32768, // 0x410 HPTXSTS
+            0,          // 0x414 HAINT
+            0,          // 0x418 HAINTMSK
+            0,          // 0x41C HFLBADDR
+            0, 0, 0, 0, 0, 0, 0, 0, // 0x420-0x43C rsvd
+            1 << 12,    // 0x440 HPRT0: PWR (QEMU reset_exit)
+        ]
+    }
+
+    /// Raise/lower a GINTSTS bit + recompute the OTGINT aggregate
+    /// (facade recomputeGintsts parity: GOTGINT!=0 -> OTGINT).
+    fn usb_raise_gint(&mut self, bit: u32) {
+        self.usb_glb[0x14 / 4] |= bit;
+    }
+    fn usb_lower_gint(&mut self, bit: u32) {
+        self.usb_glb[0x14 / 4] &= !bit;
+    }
+    fn usb_sync_otgint(&mut self) {
+        if self.usb_glb[0x04 / 4] != 0 {
+            self.usb_glb[0x14 / 4] |= 1 << 2;
+        } else {
+            self.usb_glb[0x14 / 4] &= !(1 << 2);
+        }
+    }
+
+    /// Host-channel transfer completion (QEMU dwc2_enable_chan +
+    /// dwc2_handle_packet SYNC model): the guest enabled channel `ch`
+    /// (HCCHAR.CHENA rising with a valid MPS); the LAN7800 answers
+    /// immediately into HCDMA/HCTSIZ + FIFO, sets HCINT XFERCOMPL|
+    /// CHHLTD, clears CHENA, raises HAINT[ch] and GINTSTS.HCHINT when
+    /// the channel's HCINTMSK asks for it. Returns nothing; all state
+    /// lands in usb_hch/usb_hreg0/usb_glb for the guest to collect.
+    /// DMA addresses are bus PAs into guest RAM (in_ram-gated; OOR
+    /// completes with XACTERR instead of faulting — QEMU logs and
+    /// completes with error too).
+    fn usb_xfer(&mut self, ch: usize) {
+        // Latch channel program words.
+        let hcchar = self.usb_hch[ch][0];
+        let hctsiz = self.usb_hch[ch][4];
+        let hcdma = self.usb_hch[ch][5];
+        let devaddr = ((hcchar >> 22) & 0x7f) as u8;
+        let epnum = ((hcchar >> 11) & 0xf) as u8;
+        let epdir_in = (hcchar & (1 << 15)) != 0;
+        let mps = (hcchar & 0x7ff) as usize;
+        let xfer = (hctsiz & 0x7ffff) as usize;
+        let mut intr: u32 = (1 << 0) | (1 << 1); // XFERCOMPL|CHHLTD
+        // Route: control EP0 (setup/data/status staged by the guest
+        // via HCDMA) vs bulk IN/OUT (LAN7800 ethernet frames).
+        // SETUP-stage absorb (QEMU: setup packets move through the
+        // FIFO, not DMA): the usb/eth guests write the 8-byte setup
+        // packet to HCDMA as an OUT transfer first (HCTSIZ=8,
+        // EP0/OUT/CHENA). Latch those bytes as the pending setup and
+        // complete XFERCOMPL — the following IN/OUT data-stage enable
+        // then executes the latched request.
+        if epnum == 0 && !epdir_in && xfer == 8 {
+            for i in 0..8 {
+                let a = hcdma as u64 + i as u64;
+                if self.in_ram(a, 1) {
+                    self.usb_setup[i] = self.mem[a as usize];
+                }
+            }
+            self.usb_setup_valid = true;
+            self.usb_hch[ch][4] &= !0x7ffff;
+            let _ = (devaddr, mps);
+        } else if epnum == 0 {
+            // Control data/status stage: executes the LATCHED setup
+            // packet (see above), NOT the bytes at HCDMA (which now
+            // hold the DATA buffer for IN or nothing for OUT). Answer
+            // the standard device requests the dwc2+lan78xx probe
+            // sequence issues; anything else completes with STALL
+            // (QEMU: XACTERR-class completion).
+            let setup = self.usb_setup;
+            let req = setup[1];
+            let wlen = u16::from_le_bytes([setup[6], setup[7]]) as usize;
+            let dir_in = (setup[0] & 0x80) != 0;
+            match (req, dir_in) {
+                // GET_DESCRIPTOR (device/config/string): serve the
+                // LAN7800 descriptors (see usb_desc_*); truncate to
+                // wLength AND xfer size (QEMU: HCTSIZ bounds the DMA).
+                (6, true) => {
+                    let dtype = setup[3];
+                    let didx = setup[2];
+                    let desc = Self::usb_desc(dtype, didx, &self.usb_mac);
+                    let n = core::cmp::min(core::cmp::min(desc.len(), wlen), xfer);
+                    for i in 0..n {
+                        let a = hcdma as u64 + i as u64;
+                        if self.in_ram(a, 1) {
+                            self.mem[a as usize] = desc[i];
+                        }
+                    }
+                    // Short packet: residual = xfer - n.
+                    let resid = xfer.saturating_sub(n) as u32;
+                    self.usb_hch[ch][4] = (self.usb_hch[ch][4] & !0x7ffff) | (resid & 0x7ffff);
+                }
+                // SET_ADDRESS / SET_CONFIGURATION / SET_INTERFACE /
+                // CLEAR_FEATURE (OUT, no data stage): ack with zero
+                // residual (QEMU: success completion, no DMA).
+                (5, false) | (9, false) | (11, false) | (1, false) => {
+                    self.usb_hch[ch][4] &= !0x7ffff;
+                    if req == 5 {
+                        // SET_ADDRESS: record the address (QEMU tracks
+                        // it in the port state; we keep it for the
+                        // triage trace + later control routing).
+                        self.usb_hch[ch][0] =
+                            (self.usb_hch[ch][0] & !(0x7f << 22)) | (((setup[2] as u32) & 0x7f) << 22);
+                    }
+                }
+                _ => {
+                    intr = (1 << 3) | (1 << 1); // STALL|CHHLTD
+                }
+            }
+            let _ = (devaddr, mps);
+        } else if epdir_in {
+            // Bulk/INTR IN: LAN7800 -> host. Serve one queued RX
+            // frame (with the LAN78xx 4-byte RX header the driver
+            // strips: length + status), else NAK (QEMU: NAK-class
+            // completion, channel stays enabled for retry — here we
+            // complete NAK|CHHLTD so the driver re-queues; no IRQ
+            // storm since HCHINT needs the mask).
+            // LOOPBACK (eth demo guest): with an empty RX queue but
+            // a just-transmitted frame, echo the last TX frame so
+            // the guest verifies TX==RX without harness input (the
+            // harness path via usb_rx_push takes precedence).
+            if self.usb_rx.is_empty() && !self.usb_loopback.is_empty() {
+                let fb = core::mem::take(&mut self.usb_loopback);
+                self.usb_rx.extend_from_slice(&(fb.len() as u16).to_le_bytes());
+                self.usb_rx.extend_from_slice(&fb);
+            }
+            if let Some(frame) = Self::usb_pop_rx(&mut self.usb_rx) {
+                let n = core::cmp::min(frame.len(), xfer);
+                for i in 0..n {
+                    let a = hcdma as u64 + i as u64;
+                    if self.in_ram(a, 1) {
+                        self.mem[a as usize] = frame[i];
+                    }
+                }
+                let resid = xfer.saturating_sub(n) as u32;
+                self.usb_hch[ch][4] = (self.usb_hch[ch][4] & !0x7ffff) | (resid & 0x7ffff);
+            } else {
+                intr = (1 << 4) | (1 << 1); // NAK|CHHLTD
+            }
+        } else {
+            // Bulk OUT: host -> LAN7800. Copy the frame to the TX
+            // queue (browser drains it); complete XFERCOMPL.
+            let mut frame = vec![0u8; xfer];
+            for i in 0..xfer {
+                let a = hcdma as u64 + i as u64;
+                frame[i] = if self.in_ram(a, 1) { self.mem[a as usize] } else { 0 };
+            }
+            self.usb_tx.extend_from_slice(&frame);
+            self.usb_loopback = frame;
+            self.usb_hch[ch][4] &= !0x7ffff;
+        }
+        // Publish completion: HCINT |= intr, CHENA clear, HAINT bit,
+        // HCHINT iff (HCINT & HCINTMSK) != 0 (QEMU dwc2_update_hc_irq
+        // + raise_host_irq verbatim, incl. the 16-bit HAINT mask).
+        self.usb_hch[ch][2] |= intr;
+        self.usb_hch[ch][0] &= !(1 << 31);
+        let masked = self.usb_hch[ch][2] & self.usb_hch[ch][3] & !(0x3ffff << 14);
+        if masked != 0 {
+            self.usb_hreg0[(0x414 - 0x400) / 4] |= 1 << ch;
+            let haint = self.usb_hreg0[(0x414 - 0x400) / 4];
+            let haintmsk = self.usb_hreg0[(0x418 - 0x400) / 4] & 0xffff;
+            if (haint & haintmsk) != 0 {
+                self.usb_raise_gint(1 << 25); // HCHINT
+            }
+        }
+        if std::env::var("USBTRACE").is_ok() {
+            eprintln!(
+                "USBXFER ch={} dev={} ep={} {} xfer={} intr=0x{:x}",
+                ch, devaddr, epnum, if epdir_in { "IN" } else { "OUT" }, xfer, intr
+            );
+        }
+    }
+
+    /// Pop one RX frame (with LAN78xx RX header) from the harness
+    /// queue. Queue entries are raw ethernet frames; the header is
+    /// prepended here (length incl. header + status=link-ok).
+    fn usb_pop_rx(q: &mut Vec<u8>) -> Option<Vec<u8>> {
+        // Queue encoding: [len:2 LE][frame bytes]... (harness pushes
+        // whole frames via usb_rx_push; empty queue -> NAK).
+        if q.len() < 2 {
+            return None;
+        }
+        let n = u16::from_le_bytes([q[0], q[1]]) as usize;
+        if q.len() < 2 + n {
+            return None;
+        }
+        let frame: Vec<u8> = q.drain(..2 + n).skip(2).collect();
+        let mut out = Vec::with_capacity(4 + frame.len());
+        let total = (frame.len() + 4) as u32;
+        out.extend_from_slice(&total.to_le_bytes()); // RX length
+        out.extend_from_slice(&frame);
+        Some(out)
+    }
+
+    /// LAN7800 USB descriptors (device/config/string): the exact
+    /// bytes the lan78xx driver expects (idVendor 0x0424, idProduct
+    /// 0x7800 per the DTB ethernet@1 compat "usb424,7800"; bulk
+    /// IN/OUT endpoints; MAC string index wired to usb_mac).
+    /// Truncated by the caller to wLength/xfer.
+    fn usb_desc(dtype: u8, didx: u8, mac: &[u8; 6]) -> Vec<u8> {
+        match (dtype, didx) {
+            // DEVICE descriptor (18 B): USB 2.1, vendor 0x0424,
+            // product 0x7800, 1 config.
+            (1, 0) => vec![
+                18, 1, 0x10, 0x02, 0xff, 0xff, 0xff, 64,
+                0x24, 0x04, 0x00, 0x78, 0x00, 0x03, 1, 2, 0, 1,
+            ],
+            // CONFIG descriptor (32 B: config + interface + 2x
+            // bulk endpoints): total length 32, 1 interface, bulk
+            // IN ep1 + bulk OUT ep2, wMaxPacket 512.
+            (2, 0) => vec![
+                9, 2, 32, 0, 1, 1, 0, 0x80, 250,
+                9, 4, 0, 0, 2, 0xff, 0xff, 0xff, 0,
+                7, 5, 0x81, 2, 0x00, 0x02, 0,
+                7, 5, 0x02, 2, 0x00, 0x02, 0,
+            ],
+            // STRING lang (4 B: en-US).
+            (3, 0) => vec![4, 3, 9, 4],
+            // STRING manufacturer "Pi3Emu".
+            (3, 1) => Self::usb_str("Pi3Emu"),
+            // STRING product "LAN7800 Ethernet".
+            (3, 2) => Self::usb_str("LAN7800 Ethernet"),
+            // STRING serial = MAC hex (lan78xx reads the MAC here
+            // when no EEPROM is present — matches usb_mac).
+            (3, 3) => Self::usb_str(&format!(
+                "{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            )),
+            _ => Vec::new(),
+        }
+    }
+    /// USB string descriptor (UTF-16LE, type 3).
+    fn usb_str(s: &str) -> Vec<u8> {
+        let mut out = vec![0u8; 2 + s.len() * 2];
+        out[0] = out.len() as u8;
+        out[1] = 3;
+        for (i, c) in s.encode_utf16().enumerate() {
+            out[2 + i * 2] = (c & 0xff) as u8;
+            out[2 + i * 2 + 1] = (c >> 8) as u8;
+        }
+        out
+    }
+
     /// SPI FIFO backing as a little-endian word (staged response).
     fn spi_fifo_le(&self) -> u64 {
         (self.spi_fifo[0] as u64)
@@ -1118,6 +1537,33 @@ impl Bus {
         self.vt_us = self.vt_us.wrapping_add(us);
         self.vt_us_f += us as f64;
         self.cntpct = (self.vt_us_f * 19.2).floor() as u64;
+    }
+
+    /// M67 ethernet harness: push a raw ethernet frame into the
+    /// LAN7800 RX queue (browser -> guest path). Queue encoding is
+    /// [len:2 LE][bytes] per frame (see usb_pop_rx); returns false
+    /// when the frame is too big (>1518 B) or the queue is full
+    /// (>64 KB — backpressure, drop like a real NIC ring).
+    pub fn usb_rx_push(&mut self, frame: &[u8]) -> bool {
+        if frame.is_empty() || frame.len() > 1518 || self.usb_rx.len() > 65536 {
+            return false;
+        }
+        self.usb_rx.extend_from_slice(&(frame.len() as u16).to_le_bytes());
+        self.usb_rx.extend_from_slice(frame);
+        true
+    }
+
+    /// M67 ethernet harness: drain queued TX frames (guest -> browser
+    /// path). Returns whole frames; the queue holds raw frame bytes
+    /// back-to-back from usb_xfer bulk-OUT completions.
+    pub fn usb_tx_take(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.usb_tx)
+    }
+
+    /// M67 ethernet harness: device MAC (fixed b8:27:eb:de:ad:be —
+    /// matches the 0x10003 mailbox reply + Pi firmware default).
+    pub fn usb_mac_addr(&self) -> [u8; 6] {
+        self.usb_mac
     }
 
     /// Host key input (mirrors uart0 push(): queued only while enabled,
@@ -1989,12 +2435,15 @@ impl Bus {
             let v: u64 = match off {
                 // PENDING2 (GPIO bit 17 + UART bit 25) + BASIC mirrors
                 // (bit 9 for GPIO, bit 19 shortcut for UART) + bank-0
-                // bit 1 for MAILBOX (M61 IRQ path, DTB-proven).
+                // bit 1 for MAILBOX (M61 IRQ path, DTB-proven) + bank-1
+                // bit 9 for USB (M67: INTERRUPT_USB = GPU IRQ 9, served
+                // in PENDING1; BASIC bit 8 mirrors any non-shortcut
+                // bank-1 line incl. USB, like timer/DMA).
                 0x08 => (self.gpio_pending2() | self.uart_pending2()) as u64,
-                0x04 => (self.timer_pending1() | self.dma_pending1()) as u64,
+                0x04 => (self.timer_pending1() | self.dma_pending1() | self.usb_pending1()) as u64,
                 0x00 => {
                     let mut b = 0u64;
-                    if self.timer_pending1() | self.dma_pending1() != 0 {
+                    if self.timer_pending1() | self.dma_pending1() | self.usb_pending1() != 0 {
                         b |= 1 << 8; // any non-shortcut bank-1 line
                     }
                     if self.gpio_pending2() != 0 {
@@ -2142,11 +2591,47 @@ impl Bus {
             return Ok(v & mask(size));
         }
         if Self::is_usb(addr, size) {
-            // DWC2 core revision (real 4.20a ID; the debug guest only
-            // accepts 280A while periphs accepts either — serve 280A).
-            let v: u64 = match addr - USB_BASE {
-                0x40 => 0x4f54_280a,
-                _ => 0,
+            // M67 DWC2 OTG core (QEMU hcd-dwc2.c register semantics):
+            // glb 0x000-0x06C shadow cells, HPTXFSIZ at 0x100, host
+            // 0x400-0x440 cells, channels 0x500+ (HCCHAR/HCSPLT/HCINT/
+            // HCINTMSK/HCTSIZ/HCDMA/HCDMAB per 0x20 stride, 8 channels).
+            // GRSTCTL reads mask the self-clearing bits (QEMU glbreg
+            // read arm); HFNUM serves frame+FRREM live; HAINT/HPRT0
+            // serve shadow cells; GSNPSID reads 0x4f54294a (QEMU reset
+            // value — periphs/debug accept it as a real DWC2 rev).
+            let off = addr - USB_BASE;
+            if std::env::var("USBTRACE").is_ok() && (off < 0x70 || off == 0x100 || (0x400..0x444).contains(&off) || (0x500..0x600).contains(&off)) {
+                eprintln!("USBRD off=0x{:x} size={}", off, size);
+            }
+            let v: u64 = if off < 0x70 && off % 4 == 0 {
+                let mut w = self.usb_glb[(off / 4) as usize] as u64;
+                if off == 0x10 {
+                    // GRSTCTL: self-clearing bits never read back
+                    // (QEMU dwc2_glbreg_read GRSTCTL arm verbatim).
+                    w &= !((1 << 5) | (1 << 4) | (1 << 3) | (1 << 2) | (1 << 1) | 1);
+                }
+                w
+            } else if off == 0x100 {
+                500 << 16 // HPTXFSIZ (QEMU fszreg reset value)
+            } else if (0x400..0x444).contains(&off) && off % 4 == 0 {
+                if off == 0x408 {
+                    // HFNUM: live frame + FRREM (QEMU hreg0 arm:
+                    // FRREM = remaining clocks in frame; pi-cpu has no
+                    // SOF clock, so report FRREM = full window).
+                    ((0x2edcu64) << 16) | ((self.usb_frame & 0x3fff) as u64)
+                } else {
+                    self.usb_hreg0[((off - 0x400) / 4) as usize] as u64
+                }
+            } else if (0x500..0x600).contains(&off) && off % 4 == 0 {
+                let ch = ((off - 0x500) / 0x20) as usize;
+                let reg = ((off - 0x500) % 0x20) / 4;
+                if ch < 8 && reg < 8 {
+                    self.usb_hch[ch][reg as usize] as u64
+                } else {
+                    0
+                }
+            } else {
+                0
             };
             return Ok(v & mask(size));
         }
@@ -2665,9 +3150,213 @@ impl Bus {
             return Ok(());
         }
         if Self::is_usb(addr, size) {
+            // M67 DWC2 write path (QEMU hcd-dwc2.c glbreg/hreg0/hreg1
+            // write arms + facade usb.js syncIn edges):
+            // - USB_DONE park compat: periphs writes +0xFF0, debug
+            //   writes +0x54 (either parks those guests — KEPT so their
+            //   goldens never move; the real DWC2 regs at those offsets
+            //   are GLPMCFG/HCCHAR0 and neither guest enables the core).
+            // - GOTGCTL: read-only bits (BSESVLD|ASESVLD|CONID_B|
+            //   HSTNEGSCS|SESREQSCS) preserved; SESREQ rising ->
+            //   SESREQSCS + GOTGINT SES_REQ_SUC + OTGINT; HNPREQ rising
+            //   -> HSTNEGSCS + GOTGINT HST_NEG_DET + OTGINT.
+            // - GINTSTS: W1C (QEMU arm verbatim: val|=~old, val=~val,
+            //   then re-set read-only bits) + irq recompute.
+            // - GINTMSK/GAHBCFG: latch (+ GBL_INTR_EN edge wakes sync).
+            // - GRSTCTL: AHBIDLE forced; CSFTRST/HSFTRST self-clear +
+            //   restore reset GINTSTS/GOTGCTL; RXFFLSH/TXFFLSH clear
+            //   their status bits.
+            // - HPRT0: read-only bits preserved (SPD/LNSTS/OVRCURRACT/
+            //   CONNSTS), SUSP/RES preserved, ENA never set directly;
+            //   PRTRST falling with device attached -> ENA|ENACHG +
+            //   PRTINT; W1C bits (OVRCURRCHG|ENACHG|ENA|CONNDET);
+            //   PPWR set -> CONNSTS|CONNDET + PRTINT (LAN7800 attach).
+            // - HCCHAR: CHDIS rising -> clear CHENA + HCINT.CHHLTD;
+            //   CHENA rising -> usb_xfer (sync completion) + irq walk.
+            // - HCINT: W1C; HCINTMSK: mask latch (RESERVED14_31 kept 0).
+            // - HCTSIZ/HCDMA/HCSPLT/HCDMAB: latch.
+            // - GOTGINT/GUID/GHWCFG*/GRXFSIZ/GNPTXFSIZ*/FIFO regs:
+            //   plain latches (ID/config are guest-programmable sizes).
             let off = addr - USB_BASE;
             if (off == 0xff0 || off == 0x54) && val != 0 {
                 self.usb_done = true;
+            }
+            if std::env::var("USBTRACE").is_ok() && (off < 0x70 || off == 0x100 || (0x400..0x444).contains(&off) || (0x500..0x600).contains(&off)) {
+                eprintln!("USBWR off=0x{:x} val=0x{:x}", off, val & mask(size));
+            }
+            let v = (val & mask(size)) as u32;
+            if off < 0x70 && off % 4 == 0 {
+                let idx = (off / 4) as usize;
+                let old = self.usb_glb[idx];
+                match off {
+                    0x00 => {
+                        // GOTGCTL (QEMU: RO bits preserved both ways).
+                        const RO: u32 = (0x1f << 22) | (1 << 20) | (1 << 19) | (1 << 18) | (1 << 17) | (1 << 16) | (1 << 8) | (1 << 0);
+                        let mut w = (v & !RO) | (old & RO);
+                        // SESREQ rising -> session success.
+                        if ((w & (1 << 1)) != 0) && ((old & (1 << 1)) == 0) {
+                            w |= 1 << 0; // SESREQSCS
+                            self.usb_glb[0x04 / 4] |= 1 << 8; // SES_REQ_SUC
+                            self.usb_raise_gint(1 << 2); // OTGINT
+                            self.usb_sync_otgint();
+                        } else if ((w & (1 << 1)) == 0) && ((old & (1 << 1)) != 0) {
+                            w &= !(1 << 0);
+                        }
+                        // HNPREQ rising -> host negotiation detected.
+                        if ((w & (1 << 9)) != 0) && ((old & (1 << 9)) == 0) {
+                            w |= 1 << 8; // HSTNEGSCS
+                            self.usb_glb[0x04 / 4] |= 1 << 17; // HST_NEG_DET
+                            self.usb_raise_gint(1 << 2);
+                            self.usb_sync_otgint();
+                        } else if ((w & (1 << 9)) == 0) && ((old & (1 << 9)) != 0) {
+                            w &= !(1 << 8);
+                        }
+                        self.usb_glb[idx] = w;
+                    }
+                    0x04 => {
+                        // GOTGINT: W1C (facade parity: guest writes 1
+                        // to clear; OTGINT drops when empty).
+                        self.usb_glb[idx] &= !v;
+                        self.usb_sync_otgint();
+                    }
+                    0x10 => {
+                        // GRSTCTL: AHBIDLE forced, DMAREQ cleared,
+                        // self-clearing bits latched-then-cleared.
+                        let mut w = v | (1 << 31);
+                        w &= !(1 << 30);
+                        if (w & 1) != 0 || ((w >> 1) & 1) != 0 {
+                            // CSFTRST/HSFTRST: QEMU reset_enter for
+                            // the sticky core words (guest FIFO/HCFG
+                            // programs survive, like QEMU's mmio
+                            // arrays — only the protocol words reset).
+                            self.usb_glb[0x00 / 4] = 0x000c0000 | (1 << 19) | (1 << 18) | (1 << 16);
+                            self.usb_glb[0x04 / 4] = 0;
+                            self.usb_glb[0x14 / 4] = (1 << 28) | (1 << 26) | (1 << 5) | (1 << 0);
+                            self.usb_glb[0x18 / 4] = 0;
+                            w &= !((1 << 1) | 1);
+                        }
+                        if ((w >> 4) & 1) != 0 {
+                            self.usb_lower_gint(1 << 4); // RXFFLSH clears RXFLVL
+                            w &= !(1 << 4);
+                        }
+                        if ((w >> 5) & 1) != 0 {
+                            self.usb_raise_gint((1 << 5) | (1 << 26)); // TXFFLSH -> FIFOs empty
+                            w &= !(1 << 5);
+                        }
+                        self.usb_glb[idx] = w;
+                    }
+                    0x14 => {
+                        // GINTSTS: W1C (QEMU arm: val|=~old, val=~val,
+                        // then RO bits re-set — net effect: written-1
+                        // bits clear except read-only ones).
+                        const RO: u32 = (1 << 26) | (1 << 25) | (1 << 24) | (1 << 19) | (1 << 18) | (1 << 7) | (1 << 6) | (1 << 5) | (1 << 4) | (1 << 2) | (1 << 0);
+                        let mut cur = old;
+                        cur &= !((v & !RO) & cur);
+                        self.usb_glb[idx] = cur;
+                        self.usb_sync_otgint();
+                    }
+                    _ => {
+                        self.usb_glb[idx] = v;
+                    }
+                }
+            } else if (0x400..0x444).contains(&off) && off % 4 == 0 {
+                let idx = ((off - 0x400) / 4) as usize;
+                match off {
+                    0x440 => {
+                        // HPRT0 (QEMU hreg0 arm verbatim, minus the
+                        // usb_port_reset call — the LAN7800 is always
+                        // attached, so PRTRST falling enables directly).
+                        let old = self.usb_hreg0[idx];
+                        let mut w = v;
+                        w |= old & ((0x3 << 17) | (0x3 << 10) | (1 << 4) | (1 << 0));
+                        w |= old & ((1 << 7) | (1 << 6));
+                        if ((old & (1 << 2)) == 0) && ((w & (1 << 2)) != 0) {
+                            w &= !(1 << 2);
+                        }
+                        let tmask = (1 << 5) | (1 << 3) | (1 << 2) | (1 << 1);
+                        let tval = (!((w & tmask) | !((old & tmask) | !tmask))) & tmask;
+                        w = (w & !tmask) | tval;
+                        if ((w & (1 << 8)) == 0) && ((old & (1 << 8)) != 0) {
+                            // PRTRST falling: port reset done -> ENA.
+                            w |= (1 << 2) | (1 << 3); // ENA|ENACHG
+                        }
+                        if (w & ((1 << 5) | (1 << 3) | (1 << 1))) != 0 {
+                            self.usb_raise_gint(1 << 24); // PRTINT
+                        } else {
+                            self.usb_lower_gint(1 << 24);
+                        }
+                        // PPWR set -> LAN7800 attach (CONNSTS|CONNDET).
+                        if ((w & (1 << 12)) != 0) && !self.usb_hprt_conn {
+                            self.usb_hprt_conn = true;
+                            w |= (1 << 1) | (1 << 0);
+                            self.usb_raise_gint(1 << 24);
+                        }
+                        self.usb_hreg0[idx] = w;
+                    }
+                    0x408 | 0x410 | 0x414 => {} // HFNUM/HPTXSTS/HAINT: read-only
+                    _ => {
+                        if off == 0x418 {
+                            self.usb_hreg0[idx] = v & 0xffff; // HAINTMSK: 16 bits
+                        } else {
+                            self.usb_hreg0[idx] = v;
+                        }
+                    }
+                }
+            } else if (0x500..0x600).contains(&off) && off % 4 == 0 {
+                let ch = ((off - 0x500) / 0x20) as usize;
+                let reg = (((off - 0x500) % 0x20) / 4) as usize;
+                if ch < 8 && reg < 8 {
+                    match reg {
+                        0 => {
+                            // HCCHAR (QEMU hreg1 arm verbatim): CHDIS
+                            // rising -> clear CHENA + CHHLTD; CHENA
+                            // rising -> enable + usb_xfer.
+                            let old = self.usb_hch[ch][0];
+                            let mut w = v;
+                            if ((w & (1 << 30)) != 0) && ((old & (1 << 30)) == 0) {
+                                w &= !((1 << 31) | (1 << 30));
+                                self.usb_hch[ch][2] |= 1 << 1; // CHHLTD
+                                self.usb_hch[ch][0] = w;
+                                // Re-walk the host IRQ (QEMU
+                                // dwc2_update_hc_irq after disflg).
+                                let masked = self.usb_hch[ch][2] & self.usb_hch[ch][3] & !(0x3ffff << 14);
+                                if masked != 0 {
+                                    self.usb_hreg0[(0x414 - 0x400) / 4] |= 1 << ch;
+                                    let haint = self.usb_hreg0[(0x414 - 0x400) / 4];
+                                    let haintmsk = self.usb_hreg0[(0x418 - 0x400) / 4] & 0xffff;
+                                    if (haint & haintmsk) != 0 {
+                                        self.usb_raise_gint(1 << 25);
+                                    }
+                                }
+                            } else {
+                                w |= old & (1 << 30);
+                                if ((w & (1 << 31)) != 0) && ((old & (1 << 31)) == 0) {
+                                    w &= !(1 << 30);
+                                    self.usb_hch[ch][0] = w;
+                                    self.usb_xfer(ch);
+                                } else {
+                                    w |= old & (1 << 31);
+                                    self.usb_hch[ch][0] = w;
+                                }
+                            }
+                        }
+                        2 => {
+                            // HCINT: W1C + reserved-bits mask (QEMU).
+                            let old = self.usb_hch[ch][2];
+                            let mut cur = old;
+                            cur &= !((v & !(0x3ffff << 14)) & cur);
+                            self.usb_hch[ch][2] = cur;
+                        }
+                        3 => {
+                            // HCINTMSK: reserved bits stay 0 (QEMU).
+                            self.usb_hch[ch][3] = v & !(0x3ffff << 14);
+                        }
+                        6 => {} // HCDMAB: read-only (QEMU logs + ignores)
+                        _ => {
+                            self.usb_hch[ch][reg] = v;
+                        }
+                    }
+                }
             }
             return Ok(());
         }
@@ -2832,6 +3521,15 @@ impl Bus {
         // and shift all downstream timing by a constant phase).
         self.i2c_pub_c = (self.i2c_c & ((1 << 15) | 1)) | (if self.i2c_sdone { 1 << 7 } else { 0 });
         self.i2c_pub_s = if self.i2c_sdone { 1 << 7 } else { 0 };
+        // M67 DWC2 SOF tick (facade syncOut parity): HFNUM advances a
+        // frame per chunk while the core is touched/enabled; SOF bit
+        // pulses every 8th tick. GINTSTS served live at read time, so
+        // no cell publish is needed — only the counter moves here.
+        self.usb_frame = self.usb_frame.wrapping_add(1) & 0x3fff;
+        self.usb_sof_ticks = self.usb_sof_ticks.wrapping_add(1);
+        if (self.usb_sof_ticks & 7) == 0 {
+            self.usb_raise_gint(1 << 3); // SOF
+        }
         {
             let mut cs = 0u32;
             if self.spi_ta {

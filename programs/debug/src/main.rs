@@ -177,7 +177,7 @@ pub extern "C" fn rust_main() -> ! {
     let snpsid = mmio_read(USB_BASE + 0x40);
     puts("  GSNPSID: 0x");
     putx(snpsid as u64);
-    if snpsid == 0x4F54_280A {
+    if snpsid == 0x4F54_280A || snpsid == 0x4F54_294A {
         puts(" [OK]\r\n");
         pass += 1;
     } else {

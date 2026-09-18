@@ -1989,6 +1989,99 @@ completion (all ruled out by execution above).
   (m66/m66spin/m66idc/mboxdump2/idc*/loop/sched) + `~/pi62-logs/`.
 
 
+### M67 — DWC2 OTG + LAN7800 ethernet path (DONE, uncommitted)
+
+Complete ethernet protocol/device path in pi-cpu (`Bus`, `cpu/src/
+lib.rs`), so the dwc2 + lan78xx drivers can probe without the
+initcall blacklist. Previously USB was a SNPSID+DONE stub (M50) with
+only a facade-era `src/usb.js` state machine in git history (M30 +
+"DWC2 OTG PHY" commit, deleted in M49). Scope: DWC2 OTG core at
+0x3F980000 + LAN7800 device behind it (Pi 3 B+ onboard NIC,
+usb424:7800 per the DTB `usb-port@1/ethernet@1` tree) + legacy-IC
+IRQ wiring (INTERRUPT_USB = GPU IRQ 9) + harness hooks
+(`usb_rx_push`/`usb_tx_take`/`usb_mac_addr` for the browser) + two
+demo guests (`usb`, `eth`) + smoke/UI wiring.
+
+- **DTB survey (by execution, `zzethdtb*` temp probes, since
+  deleted):** `soc/usb@7e980000` compat `brcm,bcm2708-usb`, reg
+  `7e980000/10000 + 7e006000/1000`, interrupts `<0 1>+<0 9>+<2 0>`
+  (bank-0 bit 1 + GPU IRQ 9 = mailbox + USB), phys → `/phy`
+  (`usb-nop-xceiv`), port tree `usb-port@1 (usb424,2514)` →
+  `usb-port@1 (usb424,2514)` → `ethernet@1 (usb424,7800)` + MDIO
+  `ethernet-phy@1`. Clock `clk-usb` fixed 480 MHz.
+- **Upstream ground (scripts/.build/qemu-wasm, in-repo):** QEMU
+  `hw/usb/hcd-dwc2.c` reset values + `get/raise/lower_irq` semantics
+  + glbreg/hreg0/hreg1 write arms; `include/hw/usb/dwc2-regs.h`
+  (Linux `drivers/usb/dwc2/hw.h` import) bit defs;
+  `hw/arm/bcm2835_peripherals.c` (DWC2 → `INTERRUPT_USB`);
+  `include/hw/arm/raspi_platform.h` (`INTERRUPT_USB = 9`);
+  `hw/intc/bcm2835_ic.c` (PENDING1 = low-32 GPU IRQs, BASIC dup
+  table `irq_dups[]`, ENABLE1/DISABLE1 semantics).
+- **Model (`Bus`):** `usb_glb[28]` (GOTGCTL..GINTSTS2) +
+  `usb_hreg0[17]` (HCFG..HPRT0) + `usb_hch[8][8]` (HCCHAR/HCSPLT/
+  HCINT/HCINTMSK/HCTSIZ/HCDMA/HCDMAB) + frame/SOF tick + HPRT-conn
+  latch, all reset to QEMU `dwc2_reset_enter` values
+  (GSNPSID 0x4f54294a, GHWCFG2 0x250dc016, GHWCFG3 0x10000044 —
+  machine-checked via python3, never hand-hex; GOTGCTL session-
+  valid; GINTSTS CURMODE_HOST|NPTXFEMP|PTXFEMP|CONIDSTSCHNG;
+  GRXFSIZ/GNPTXFSIZ/GNPTXSTS/GI2CCTL/GPWRDN/HPTXFSIZ/HCFG/HFIR/
+  HFNUM/HPTXSTS/HPRT0-PWR). Write arms port QEMU verbatim:
+  GOTGCTL RO-bit preserve + SESREQ/HNPREQ self-complete (SESREQSCS/
+  HSTNEGSCS + GOTGINT + OTGINT); GINTSTS W1C with RO protection;
+  GRSTCTL AHBIDLE + CSFTRST/HSFTRST self-clear + sticky-word reset;
+  HPRT0 RO/W1C handling + PRTRST-falling ENA|ENACHG + PPWR attach
+  (CONNSTS|CONNDET + PRTINT); HCCHAR CHDIS/CHENA edges; HCINT W1C;
+  HCINTMSK reserved-mask; HCDMAB read-only.
+- **Transfer completion (`usb_xfer`, sync):** CHENA rising runs the
+  LAN7800 answer immediately (no async BH — QEMU has one, pi-cpu
+  completes inline like the mailbox): EP0 setup-stage absorb
+  (EP0/OUT xfer==8 latches `usb_setup[8]` — QEMU moves setup via
+  FIFO, pi-cpu has no FIFO model, so the latch carries it);
+  EP0 data/status stage executes the LATCHED setup (GET_DESCRIPTOR
+  device/config/strings incl. 0424:7800 + MAC-hex serial;
+  SET_ADDRESS/CONFIG/INTERFACE + CLEAR_FEATURE ack; else
+  STALL|CHHLTD); bulk-IN serves one RX frame with the lan78xx
+  4-byte header else NAK|CHHLTD; bulk-OUT queues to `usb_tx` +
+  `usb_loopback`. Completion publishes HCINT XFERCOMPL|CHHLTD,
+  clears CHENA, raises HAINT[ch] + GINTSTS.HCHINT iff masked (QEMU
+  `dwc2_update_hc_irq` + `raise_host_irq` verbatim).
+- **IRQ:** `usb_irq_level()` = `(GINTSTS&GINTMSK)!=0 &&
+  GAHBCFG.GLBL_INTR_EN` (QEMU `dwc2_update_irq` verbatim) →
+  `usb_pending1()` gated on IC bank-1 bit 9 → `legacy_line()` +
+  PENDING1 bit 9 + BASIC bit 8 (non-shortcut mirror, like
+  timer/DMA). Runner delivers with no extra gating (line already
+  folds every enable).
+- **LAN7800 device:** fixed MAC b8:27:eb:de:ad:be (matches the
+  0x10003 mailbox reply), link always up, `usb_rx_push` (browser→
+  guest, [len:2 LE][frame] queue, 1518 B / 64 KB caps) +
+  `usb_tx_take` (guest→browser drain) + `usb_mac_addr`.
+- **Guests:** `programs/usb/` (DWC2 bring-up: SNPSID/GHWCFG/
+  FIFO-size/GOTGCTL reads, soft reset, HPRT power/reset, HFNUM
+  tick, EP0 setup+data GET_DESCRIPTOR 0424:7800, W1C, CURMODE_HOST;
+  parks USB DONE) + `programs/eth/` (LAN7800: port up, EP2-OUT TX
+  frame, HCHINT+HAINT[0]+PENDING1-bit9 IRQ check with W1C drop,
+  EP1-IN loopback RX + header/payload verify; parks USB DONE).
+  Wired in `programs/Cargo.toml` + `build-programs.sh` +
+  `src/main.js` (`PROGRAMS` + `DONE_SEL` 7 + boot branches) +
+  `index.html` options + smoke goldens (usb 9 strings, eth 8).
+- **Gotchas (all bitten, all execution-proven):** QEMU's
+  `DWC2_NB_CHAN` is 8 in THIS tree (the facade assumed 16 —
+  GHWCFG2 value changes); `debug` pins GSNPSID 280A-only so it now
+  accepts 280A|294A (both real revs); `memset` on guest buffers
+  lowers to SIMD `mov.h` which pi-cpu faults — guests use byte
+  loops; `DATA_BUF = [0; 64]` reassign faults the same way.
+- **Verify (by execution):** usb 14 checks + eth 7 checks ALL PASS
+  native (`run` fault null); smoke 25/25 (23 old + usb + eth);
+  fuzzer 882/882; `npx vite build` clean; Linux triage 2B stall
+  byte-identical (`...0c1804`, console 9322, tail `vgaarb: loaded`
+  — expected: the kernel still blacklists dwc2; un-blacklisting is
+  the NEXT slice, not this one).
+- Open (next): drop `dwc2` (+ `smsc95xx`/`usb_ernet`) from the
+  pi-cpu `patch_dtb_chosen` blacklist and watch the live dwc2 probe
+  sequence against this model (USBTRACE-gated `USBRD/USBWR/USBXFER`
+  lines + tail + battery as proof).
+
+
 ## Key risks (M49: unicorn retired — the first two risks below are closed)
 
 - ~~Core patch (Phase 1) is the big unknown~~ CLOSED by the M49 removal:
