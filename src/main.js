@@ -164,6 +164,19 @@ let stats = { steps: 0, insns: 0, emuMs: 0, chars: 0, wallStart: 0 };
 let pwmFedTotal = 0; // drained PWM samples this boot (status + audio ring)
 const textDec = new TextDecoder();
 
+// M71 scrollable terminal: track whether the user is at the bottom.
+// draw() only autoscrolls when termStick is true — scrolling up to read
+// early boot lines no longer snaps back down every rAF frame. Any new
+// output while stuck re-pins to the bottom on the next scroll event.
+let termStick = true;
+try {
+  term.addEventListener('scroll', () => {
+    try {
+      termStick = (term.scrollHeight - term.scrollTop - term.clientHeight) < 48;
+    } catch (_) { termStick = true; }
+  });
+} catch (_) {}
+
 // Virtual time (?vt=1): the system timer advances per executed instruction
 // (262144 ips — integer-exact 15625 us per 4096-slice) instead of wall
 // clock — deterministic runs, instant sleeps.
@@ -177,8 +190,13 @@ function setStatus(text) {
 }
 
 function draw(text) {
+  if (!text) return;
+  // M71 scrollable terminal: only autoscroll when the user is already
+  // near the bottom (termStick). Before this, every slice forced
+  // scrollTop=scrollHeight — during pi-linux's rAF loop that fires
+  // every frame, so scrolling up snapped straight back down.
   term.textContent += text;
-  term.scrollTop = term.scrollHeight;
+  if (termStick) term.scrollTop = term.scrollHeight;
 }
 
 function takeConsole() {
@@ -593,14 +611,28 @@ function blit() {
 // runKernelPost so typed keys reach its echo loop (handleKey's rAF
 // path pushes directly); pi-linux joins it after its slice budget so
 // the real kernel keeps executing across frames.
+// M71 pi-linux throughput: the interpreter does ~10-20 MIPS in wasm
+// while the browser tab only gets ~16 ms/frame — one 4K slice per
+// frame (~250 slices/s ≈ 1M insns/s) makes the kernel look frozen
+// ("stuck after EFI/CPU1 lines": those print in the first 2M insns,
+// then initcalls grind at ~0.1 virtual-s per wall-s). So pi-linux
+// runs a WALL-CLOCK slice budget per frame (~110 ms of work, 7× the
+// other guests' 16 ms) instead of a single 4K slice: progress per
+// frame is visible within seconds, and the tab stays responsive
+// (rAF yields between frames; scroll/input still handled). If a frame
+// overruns badly (background tab throttling), the next frame simply
+// does fewer slices — no runaway backlog.
+const PI_LINUX_FRAME_MS = 110;
 function irqRun() {
   let out = '';
   const frame = () => {
     if (mode !== IRQ_MODE && mode !== LIRQ_MODE && mode !== UPY_MODE && mode !== 'rpikernel' && mode !== PI_LINUX_MODE) return;
     const t0 = performance.now();
+    const budgetMs = (mode === PI_LINUX_MODE) ? PI_LINUX_FRAME_MS : 16;
     do {
       out += runSlice(SLICE_INSNS);
-    } while (performance.now() - t0 < 16);
+      if (faultHalted()) break;
+    } while (performance.now() - t0 < budgetMs);
     draw(out);
     out = '';
     updateStats();

@@ -1233,3 +1233,9 @@ dist/                 production bundle
   Ctrl/Meta), `#term` gets `user-select: text`, and a `Copy Log`
   button copies the log via clipboard API + execCommand fallback.
   Smoke 25/25, fuzzer 882/882.
+- M71 -- pi-linux UX (UNCOMMITTED): scrollable log (`termStick` flag
+  — `draw()` autoscrolls only at the bottom, so reading early boot
+  lines no longer snaps back) + 7× frame budget for pi-linux
+  (`PI_LINUX_FRAME_MS` = 110 ms wall-clock slices/frame — the kernel
+  was never stuck, just slow at 1 slice/frame ≈ 1M insns/s).
+  Smoke 25/25, `npx vite build` clean.

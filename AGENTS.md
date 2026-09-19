@@ -2178,6 +2178,27 @@ async API rejects on non-secure contexts). Verified: `npx vite
 build` clean, button + handler present in `dist/`, smoke 25/25 +
 fuzzer 882/882 green.
 
+### M71 — pi-linux UX: scrollable log + 7× frame budget (DONE, uncommitted)
+
+Two complaints from the live `pi-linux` tab, both fixed in
+`src/main.js` (verified: minified `le` = termStick in `dist/`):
+
+- **Cannot scroll up.** `draw()` forced `scrollTop = scrollHeight`
+  on EVERY slice — pi-linux's rAF loop fires every frame, so
+  scrolling up snapped back down instantly. Fix: `termStick` flag
+  (scroll listener, 48 px threshold) — autoscroll only when the
+  user is already at the bottom.
+- **"So slow, stuck after EFI/CPU1 lines."** NOT stuck: those lines
+  print in the first 2M insns (the bootPiLinux initial budget), and
+  native 2B runs prove the kernel keeps going (9044→17921 console,
+  hung-task traces = scheduled workqueues). The browser only looked
+  frozen because one 4K slice/frame ≈ 1M insns/s ≈ 0.1 virtual-s
+  per wall-s. Fix: pi-linux frames run a ~110 ms wall-clock slice
+  budget (`PI_LINUX_FRAME_MS`, 7× the other guests' 16 ms) — steady
+  visible progress, tab stays responsive (rAF still yields; scroll
+  + input handled).
+- Battery still green (smoke 25/25); `npx vite build` clean.
+
 
 ## Key risks (M49: unicorn retired — the first two risks below are closed)
 
