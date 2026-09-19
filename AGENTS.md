@@ -2199,6 +2199,126 @@ Two complaints from the live `pi-linux` tab, both fixed in
   + input handled).
 - Battery still green (smoke 25/25); `npx vite build` clean.
 
+### M72 — pi-linux speed: batch slices, keep 4K (DONE, uncommitted)
+
+"Too slow + stuck after EFI/CPU1 lines" — two real fixes plus an
+honest workers verdict, all measured natively first:
+
+- **Measure first.** Native triage: interpreter ≈ 18–27 MIPS
+  (shell 2M = 69 MIPS warm; kernel 2M/4096 = 18.4 MIPS; 20M = 26–27
+  MIPS). The browser's ~1M insns/s is wasm + per-slice JS overhead,
+  not the step loop — so the fix is batching, not a faster decoder.
+- **Batch count, never size (`runSliceN` + 64×4K/frame).** New
+  `runSliceN(count, n)`: one `wall_tick` up front, N `pi.run`
+  calls, one `take_console` + one `insns()` at the end; the frame
+  does one `draw` + one `updateStats`. Speeds the 110 ms frame from
+  ~27 slices to 64×4K (≈260K insns/frame ≈ 2–4M insns/s in wasm).
+  **Slice size is NOT free:** native bisect at 500M proves 8192+
+  diverges the trajectory (4096: `pc=...b92e7c con=12668
+  irqs=20680`; 8192: `pc=...0226b4 con=8334 irqs=12337`; 65536:
+  `pc=...b92d44 con=8189 irqs=552`) — IRQ/timer delivery happens at
+  chunk boundaries, so bigger slices change interleaving, not just
+  overhead. First cut used 64K slices (fault-null but WRONG tail);
+  reverted to 4K×64 on the bisect evidence.
+- **Workers/SAB: NO (measured, honest).** A worker moves the SAME
+  single-threaded interpreter off the UI thread — it does NOT add
+  MIPS (wasm has no threads here; SAB needs COOP/COEP + a threaded
+  build). Throughput stays ~2–4M insns/s; the only win is UI
+  smoothness, which rAF yields already give. The kernel is a
+  single vCPU (maxcpus=1) — there is nothing to parallelize. Drop
+  this unless the interpreter itself gets faster (then re-measure).
+- **"Stuck" was a reading problem.** EFI/CPU1 lines print in the
+  first 2M insns; initcalls then grind ~2B insns between console
+  bursts (9044→17921). Fix: the stats row now shows `boot XM
+  insns / Y chars` every frame for pi-linux — liveness is visible
+  even when the console is silent.
+- Battery still green (smoke 25/25); `npx vite build` clean.
+
+### M73 — interpreter speed: TLB + zero-cost traces (DONE, uncommitted)
+
+Next phase per user ("focus on how to increase its speed more"):
+profile-first, semantics-unchanged interpreter speedups, all
+measured natively (`prof.sh`: 20M kernel triage @4096 + shell 2M):
+
+- **opt-level 3 / fat-LTO tried, REVERTED.** `opt-level=3,
+  lto="fat", codegen-units=1` vs shipped `opt-level="s",
+  lto=true`: kernel 20M 0.66s vs 0.73s (~10% faster), shell 2M
+  identical. NOT worth it: +build time, +wasm size pressure for
+  the browser, marginal gain. Shipped profile stays `opt-level="s"`
+  (small binary, fast CI).
+- **TLB (the real win: 27 → 60+ MIPS).** Every MMU-on fetch/read/
+  write paid a 4-level table walk (4–5 RAM round-trips per insn).
+  New 256-entry direct-mapped TLB (`tlb_tag/tlb_pa/tlb_gen` on
+  `Bus`): VA-page → PA-page for 4K pages AND 2M/1G blocks (offset
+  re-planted per access), tag = full (VPN, half, gen) tuple, gen
+  bumps on EVERY regime MSR (TCR/TTBR/SCTLR via the system arm +
+  MMU_CTL writes). Kernel 20M: 0.73s → 0.30s (**27 → 65 MIPS**);
+  shell 2M unchanged (MMU off — no TLB path). Traps bitten: tag
+  MUST be full-gen (first cut folded to 8 bits — stale-hit risk
+  across regimes, rejected); cached value MUST be the PAGE base
+  (`pa & !0xfff` — full-pa caching double-plants the offset);
+  `translate()`/`fetch()` go `&mut self` (callers: read/write/
+  fetch/step + triage probes — all already `&mut`).
+- **Zero-cost traces.** `Cpu::step`'s write-watch check cost two
+  `std::env::var("WWATCH")` lookups per step even when never
+  armed — reordered to `hits-changed && wwatch_on && env` (env
+  runs only while a probe arms the watch). Same pattern kept for
+  MBOXTAG/TIMERTRACE/SDTRACE/USBTRACE (all already flag-first).
+- **Correctness proof (not just speed):** smoke 25/25 + fuzzer
+  882/882 green; `tlbcheck.mjs` pins 20M (`...fadec0 con=4236
+  irqs=0`) and 500M (`...b92e7c con=12668 irqs=20680`) trajectories
+  byte-identical to pre-TLB goldens.
+- **M73b footgun FIXED the same session (TLBI op1 gate).** The TLBI
+  arm first shipped as `op0==1 && op1==3 && crn==8` — but assembler
+  truth (sysops.s: vmalle1=0xD508871F → op1==0; DC ZVA=0xD50B7420 →
+  op1==3) proves TLBI is op1==0, DC is op1==3. The wrong gate
+  swallowed ZERO tlbis (all real TLBIs fell into the DC arms as
+  harmless NOPs, no gen bump) — and 500M REGRESSED to
+  `pc=...037370 con=678 irqs=0` (boot wedged in the 036x loop).
+  Fixed to `op0==1 && op1==0 && crn==8` (any CRm: vmalle1 CRm==3,
+  vae1/aside1/vaale1 CRm==7): 500M golden restored byte-identical
+  (`...b92e7c con=12668 irqs=20680`, 8.0s), battery still green.
+  Lesson: D5-hex lookalikes (D50887xx vs D50B74xx) lie — decode the
+  fields, never eyeball the top byte.
+- Open (next, if more speed is needed): decode dispatch is a long
+  if-else chain on `bits(w,...)` — a 256-entry opcode-class table
+  would cut ~10 compares/insn; `sync_out`/`sync_in` run per 4K
+  chunk (fine); the remaining cost is the interpreter loop itself
+  (a JIT is out of scope for pi-cpu-by-design).
+
+### M73b note — SAB / multicore verdict for pi-cpu (record, no work)
+
+User asked (2026-09-19) whether SharedArrayBuffer + worker threads /
+multicore could make pi-linux as fast as the qemu-wasm tab. Verdict,
+by measurement + architecture (no code changed):
+
+- qemu-wasm boots to a shell in **68 s** (measured
+  `test/linux-boot-bench.mjs`, threads=auto → MTTCG, SAB on): JIT
+  (TCG→Wasm hot TBs) + 4 emulated cores + block-level translation.
+  pi-cpu is a single-threaded Rust interpreter at ~60 MIPS native
+  (~2–4M insns/s in wasm after the M72 batching); the two engines
+  differ by kind (JIT vs interpreter), not by thread count.
+- A Web Worker running the SAME interpreter adds **zero MIPS**:
+  wasm here is single-threaded (no `wasm_thread` build, no shared
+  memory between UI and worker); the worker only moves the same
+  single-threaded loop off the UI thread. UI smoothness is already
+  covered by rAF yields. SAB on this page exists for the qemu-wasm
+  pthread build only (`public/linux/`, COOP/COEP + sab-toggle) —
+  pi-cpu (`public/pi_cpu/`) shares nothing with it.
+- True multicore (2 vCPUs on 2 workers) is out of scope: the guest
+  kernel runs `maxcpus=1` by necessity (M68: we model ONE core;
+  spin-table secondaries never come online), so a second worker
+  would idle. SMP in-tree (`SmpRunner`) is for the bare-metal smp
+  guest only, not the Linux runner.
+- What WOULD move pi-linux speed (ranked): (1) interpreter loop
+  itself (decode-dispatch table, fewer branches/insn — the
+  remaining ~14 ns/insn after the TLB); (2) bigger honest wins are
+  boot-path, not MIPS (shorter path to shell: blacklist/initcall
+  trims, initramfs shape); (3) only then would a worker be worth
+  revisiting (responsiveness at higher MIPS, never throughput).
+  Do NOT re-open SAB/multicore without a new measurement showing
+  the interpreter itself got faster first.
+
 
 ## Key risks (M49: unicorn retired — the first two risks below are closed)
 

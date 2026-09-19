@@ -1239,3 +1239,16 @@ dist/                 production bundle
   (`PI_LINUX_FRAME_MS` = 110 ms wall-clock slices/frame — the kernel
   was never stuck, just slow at 1 slice/frame ≈ 1M insns/s).
   Smoke 25/25, `npx vite build` clean.
+- M72 -- pi-linux speed (UNCOMMITTED): batch count, never size
+  (`runSliceN` + 64×4K/frame ≈ 2–4M insns/s in wasm; slice size is
+  NOT free — native bisect proves 8192+ diverges the trajectory, so
+  4K stays); workers/SAB honestly NO (same single-threaded
+  interpreter, no extra MIPS — only UI smoothness, which rAF yields
+  already give); stats row shows `boot XM insns / Y chars` liveness.
+  Smoke 25/25, `npx vite build` clean.
+- M73 -- interpreter speed (UNCOMMITTED): 256-entry TLB (VA-page →
+  PA-page, full-gen tag, gen bumps on every regime MSR) takes kernel
+  20M 0.73s → 0.30s (27 → 65 MIPS); opt-3/fat-LTO tried, reverted
+  (~10% gain, not worth binary size); write-watch check reordered to
+  zero-cost. Trajectories pinned (20M/500M byte-identical). Smoke
+  25/25, fuzzer 882/882.

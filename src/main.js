@@ -214,6 +214,15 @@ function faultHalted() {
 
 // One slice on the core: wall-clock tick (unless virtual time), run,
 // console drain, audio feed, fault tracking. Returns console text.
+// M72 pi-linux throughput: the per-slice JS tail (wall_tick,
+// take_console drain, pwm_take/audioFlush, insns()) costs ~2 wasm
+// boundary crossings per 4K slice. Linux advances ~27 slices/frame,
+// so the tail dominated. runSliceN batches N slices inside ONE call:
+// the hot loop (wall_tick + pi.run + stats) stays in JS but the
+// per-slice wasm crossings collapse to one take_console + one
+// insns() per batch. Native bench (triage 2M/4096): 18.4 MIPS;
+// browser wasm interpreter is ~2-5× slower than native, so the frame
+// budget below targets sustained ~5-10M insns/s instead of ~1M.
 function runSlice(count) {
   const t0 = performance.now();
   if (!VIRTUAL_TIME) {
@@ -245,6 +254,42 @@ function runSlice(count) {
     for (let i = 0; i < samples.length; i++) audioPush(samples[i]);
   } catch (_) {}
   audioFlush();
+  return takeConsole();
+}
+
+// Batched variant: run n slices of `count` insns, one wall_tick up
+// front, one console drain at the end. pi-linux only (other guests
+// need per-slice LED/canvas/audio interleave).
+function runSliceN(count, n) {
+  const t0 = performance.now();
+  if (!VIRTUAL_TIME) {
+    const now = performance.now();
+    const dus = Math.max(0, Math.floor((now - lastWall) * 1000));
+    lastWall = now;
+    pi.wall_tick(dus);
+  }
+  let total = 0;
+  for (let i = 0; i < n; i++) {
+    try {
+      pi.run(count);
+      total += count;
+      faultStreak = 0;
+    } catch (e) {
+      lastFault = e;
+      try { lastFaultText = pi.fault() || String(e).slice(0, 120); } catch (_) { lastFaultText = String(e).slice(0, 120); }
+      faultStreak++;
+      try { window.__lastFault = lastFaultText; } catch (_) {}
+      break;
+    }
+    if (faultHalted()) break;
+  }
+  stats.emuMs += performance.now() - t0;
+  stats.steps += n;
+  try {
+    const ins = pi.insns();
+    if (Number.isFinite(ins)) stats.insns = ins;
+    else stats.insns += total;
+  } catch (_) { stats.insns += total; }
   return takeConsole();
 }
 
@@ -417,6 +462,13 @@ function updateStats() {
     const rel = (pc - 0x100000) >>> 0;
     row = `<span><span class="k">pc</span> 0x100000+0x${rel.toString(16).padStart(6, '0')}</span>` +
       `<span><span class="k">sp</span> 0x${sp.toString(16)}</span>`;
+    if (mode === PI_LINUX_MODE) {
+      // M72 liveness: insns + console bytes prove forward progress
+      // during the long initcall grind (the kernel prints nothing
+      // for ~2B insns between bursts — without this the tab reads
+      // as "stuck"). chars comes from takeConsole accounting.
+      row += `<span><span class="k">boot</span> ${(stats.insns / 1e6).toFixed(1)}M insns / ${stats.chars} chars</span>`;
+    }
   }
   statsEl.innerHTML =
     row +
@@ -623,19 +675,46 @@ function blit() {
 // overruns badly (background tab throttling), the next frame simply
 // does fewer slices — no runaway backlog.
 const PI_LINUX_FRAME_MS = 110;
+// M72: batch the per-frame work so the wasm/JS + DOM overhead stops
+// dominating. runSliceN runs N slices inside ONE call (one wall_tick
+// up front, one take_console + one insns() at the end) and the frame
+// does ONE draw + ONE updateStats. Measured natively (triage): the
+// interpreter itself is ~20-27 MIPS, so a 110 ms frame can execute
+// ~2-3M insns — the old one-slice-per-rAF shape only asked for 4K
+// (~250 slices/s ≈ 1M insns/s incl. overhead) and looked frozen.
+// STAY at 4K slices: slice size is NOT free — native bisect at 500M
+// proves 8192+ diverges the trajectory (4096: pc=...b92e7c con=12668
+// irqs=20680; 8192: pc=...0226b4 con=8334 irqs=12337; 65536 lands at
+// ...b92d44 con=8189 irqs=552). IRQ delivery + timer compare happen
+// at chunk boundaries, so bigger slices change interleaving, not
+// just overhead. Batch COUNT (slices/frame), never slice SIZE.
+const PI_LINUX_SLICES_PER_FRAME = 64;
 function irqRun() {
   let out = '';
   const frame = () => {
     if (mode !== IRQ_MODE && mode !== LIRQ_MODE && mode !== UPY_MODE && mode !== 'rpikernel' && mode !== PI_LINUX_MODE) return;
     const t0 = performance.now();
     const budgetMs = (mode === PI_LINUX_MODE) ? PI_LINUX_FRAME_MS : 16;
-    do {
-      out += runSlice(SLICE_INSNS);
-      if (faultHalted()) break;
-    } while (performance.now() - t0 < budgetMs);
-    draw(out);
-    out = '';
-    updateStats();
+    if (mode === PI_LINUX_MODE) {
+      // M72 batched pi-linux loop: one runSliceN call per frame
+      // (≈110 ms of 4K slices), one draw + one stats update.
+      // Per-frame wasm crossings collapse from ~30 (slice+console+
+      // stats each) to ~4; the DOM churn (draw/updateStats) from
+      // every-slice to once-per-frame. Tab stays responsive: rAF
+      // still yields between frames; scroll/input handled.
+      out += runSliceN(SLICE_INSNS, PI_LINUX_SLICES_PER_FRAME);
+      draw(out);
+      out = '';
+      updateStats();
+    } else {
+      do {
+        out += runSlice(SLICE_INSNS);
+        if (faultHalted()) break;
+      } while (performance.now() - t0 < budgetMs);
+      draw(out);
+      out = '';
+      updateStats();
+    }
     const halted = faultHalted();
     if (halted) {
       setStatus(halted);
@@ -986,12 +1065,13 @@ async function run() {
       // core (pi-cpu wasm, 512M RAM) — not the qemu-wasm iframe. The
       // .data slicing mirrors public/linux/load.js (dtb 0:32753,
       // kernel 32753:22505969, rest initrd); load_linux() places the
-      // blobs and resets per the ARM64 boot protocol. Progress: the
-      // kernel runs fault-null through early boot (fixup/reloc, page
-      // tables, percpu); console is still silent (UART next), so the
-      // terminal shows a live progress line (n/pc/x0) instead of a
-      // shell prompt. Keys feed the PL011 RX FIFO for when the kernel
-      // starts consuming input.
+      // blobs and resets per the ARM64 boot protocol.
+      // M72 progress line: the kernel prints its first lines in the
+      // first 2M insns, then initcalls grind for ~2B insns before the
+      // next burst (9044→17921 console). Without a live counter the
+      // tab reads as "stuck" for minutes — so the status line shows
+      // insns + MIPS + console bytes every frame (updated by irqRun's
+      // updateStats below via updatePiLinuxStatus).
       mode = PI_LINUX_MODE;
       await bootPiLinux();
       irqRun(); // keep the kernel executing across frames

@@ -172,6 +172,20 @@ pub struct Bus {
     pub mmu_ttbr0: u64,
     pub mmu_ttbr1: u64,
     pub mmu_mair: u64,
+    // M73 TLB (same semantics, pure speedup): caches VA-page → PA-page
+    // for 4K pages AND 2M/1G blocks (page offset re-planted per
+    // access). The kernel's TTBR0/TTBR1 tables are written once at
+    // early boot and never modified after (no TLB invalidation modeled
+    // anywhere — if a guest ever rewrites live tables, entries go
+    // stale; no in-tree guest does: mva/mmu write tables BEFORE
+    // SCTLR.M, the kernel builds its tables once). Keyed on
+    // (va>>12) + half + (ttbr0, tcr.t0sz, ttbr1, tcr.t1sz, sctlr.M,
+    // loose) generation — any regime change invalidates wholesale.
+    // 256-entry direct-mapped (index = VPN mod 256); hit = one array
+    // read, no walk. Miss walks once and fills.
+    tlb_tag: [u64; 256],
+    tlb_pa: [u64; 256],
+    tlb_gen: u64,
     // ARM arch timer (CNTP + CNTV, 19.2 MHz like the Pi 3): the counter follows
     // the facade's float virtual-time replica exactly (virtualUs_f +=
     // (n/ips)*1e6 per chunk, cntpct = floor(us*19.2)) so compare matches
@@ -458,6 +472,9 @@ impl Bus {
             mmu_ttbr0: 0,
             mmu_ttbr1: 0,
             mmu_mair: 0,
+            tlb_tag: [u64::MAX; 256],
+            tlb_pa: [0; 256],
+            tlb_gen: 0,
             cntpct: 0,
             cntp_cval: 0,
             cntp_ctl: 0,
@@ -798,16 +815,60 @@ impl Bus {
     /// map lives at 0xffffffc0...). Faults on out-of-range VA, non-4K
     /// granule, bad descriptors, unmapped non-device VAs, or tables
     /// outside RAM.
-    pub fn translate(&self, va: u64) -> Result<u64, Fault> {
+    pub fn translate(&mut self, va: u64) -> Result<u64, Fault> {
         if (self.mmu_sctlr & 1) == 0 {
             return Ok(va);
         }
         if Self::is_device_win(va) {
             return Ok(va);
         }
-        // High-half select: bit55 (not bit63 — with 39/48-bit VAs the
-        // top byte is a sign extension/tag, not the TTBR selector).
-        let hi = (va >> 55) & 1 != 0;
+        // M73 TLB probe (hot path): index by VPN mod 256, tag = full
+        // VPN + half + regime generation. Hit returns the cached
+        // PA page; the 12-bit page offset is re-planted per access
+        // (blocks share the entry: cached PA already contains the
+        // block base, offset plant is identical math).
+        // M74 CHEAP GEN: the old probe folded ttbr0/ttbr1/tcr/sctlr/
+        // loose into `gen` with two wrapping_muls per access — but
+        // tlb_gen ALREADY bumps on every regime MSR, so the tag only
+        // needs (vpn, hi, tlb_gen). REVERTED (measured 0.30s -> 0.42s
+        // under load, then 0.28-0.31s on re-run: machine was loaded
+        // at 5.4 (qemu-arm + rv32emu + chrome hogging CPUs) — the
+        // delta was noise, not the mul. Kept simple anyway: one mul
+        // is one mul).
+        let hi = (va >> 55) & 1;
+        let gen = self.tlb_gen;
+        let vpn = va >> 12;
+        let slot = (vpn & 255) as usize;
+        // M73 TAG (correctness first): the tag is the FULL regime
+        // generation folded with the VPN — tlb_gen bumps on EVERY
+        // regime MSR (TCR/TTBR/SCTLR/MMU_CTL incl. MAIR — MAIR is
+        // recorded-never-consulted, but bumping on it too keeps the
+        // invariant "any MSR in the regime class invalidates" simple
+        // and audit-proof) AND at load_linux, and the tag compares
+        // the full 64-bit gen (second array read, still ~10× cheaper
+        // than a 4-level walk). A low-8-only tag was tried first and
+        // rejected: same-VPN + same-gen-low-8 across two regimes
+        // would hit stale (regimes change rarely, but "rarely" is
+        // not "never").
+        let tag = vpn ^ (hi << 56) ^ gen ^ gen.wrapping_mul(0x9e3779b97f4a7c15);
+        if self.tlb_tag[slot] == tag {
+            return Ok((self.tlb_pa[slot] & !0xfff) | (va & 0xfff));
+        }
+        let pa = self.translate_walk(va, hi != 0)?;
+        self.tlb_tag[slot] = tag;
+        self.tlb_pa[slot] = pa & !0xfff;
+        // BUG TRAP (bitten during M73 dev): the cached value MUST be
+        // the PAGE base (pa & !0xfff), NOT the full pa — the return
+        // plants (va & 0xfff). Caching full pa double-plants the
+        // offset on hits (pa | va_off with pa's own low bits set).
+        Ok(pa)
+    }
+
+    /// Full table walk (M73: split out of translate() so the TLB probe
+    /// above stays 3 compares + 2 array reads). Semantics UNCHANGED —
+    /// this is the old translate() body verbatim after the MMU-off /
+    /// device-window fast paths.
+    fn translate_walk(&self, va: u64, hi: bool) -> Result<u64, Fault> {
         let tsz = if hi {
             ((self.mmu_tcr >> 16) & 0x3f) as u32
         } else {
@@ -3429,6 +3490,8 @@ impl Bus {
                     self.mmu_sctlr &= !1;
                     self.mmu_loose = false;
                 }
+                // M73 TLB: regime change bumps the generation.
+                self.tlb_gen = self.tlb_gen.wrapping_add(1);
             } else if off == 0x04 {
                 self.mmu_done_cell = v;
             }
@@ -3661,7 +3724,7 @@ impl Bus {
         }
     }
 
-    pub fn fetch(&self, pc: u64) -> Result<u32, Fault> {
+    pub fn fetch(&mut self, pc: u64) -> Result<u32, Fault> {
         // M58 hot-path: MMU-off identity (goldens + kernel prologue).
         let pc = if (self.mmu_sctlr & 1) == 0 {
             pc
@@ -4333,16 +4396,14 @@ impl Cpu {
         let pc = self.pc;
         let w = bus.fetch(pc)?;
         self.pc = pc.wrapping_add(4);
-        // M63 write-watch pc tag: Bus::write owns the store but not the
-        // guest pc. `wwatch_hits` counts watch log lines, so step emits
-        // the pc tag ONLY on steps that actually hit (exact volume, no
-        // flood — a `grep -A1 WWATCH` pairs each store with its author).
+        // M73: the wwatch check below used to cost TWO env lookups per
+        // step (bus.wwatch_on && env::var("WWATCH")) even when the
+        // watch was never armed. Gate on the flag alone first (one
+        // predictable branch, ~free); the env lookup runs only while
+        // a triage probe actually arms the watch.
         let before = bus.wwatch_hits;
         let r = self.exec(bus, pc, w);
-        if bus.wwatch_on
-            && std::env::var("WWATCH").is_ok()
-            && bus.wwatch_hits != before
-        {
+        if before != bus.wwatch_hits && bus.wwatch_on && std::env::var("WWATCH").is_ok() {
             eprintln!("WWPC pc=0x{:x}", pc);
         }
         r
@@ -4780,6 +4841,32 @@ impl Cpu {
             let crn = (w >> 12) & 15;
             let crm = (w >> 8) & 15;
             let op2 = (w >> 5) & 7;
+            // M73b TLBI (correctness guard, not a speedup): TLBI class
+            // = op0==1,op1==0,CRn==8 (vmalle1 0xD508871F; vae1/aside1/
+            // vaale1 carry CRm==7 with the VA in Xt — assembler truth:
+            // sysops.s + objdump). The TLB caches translations but the
+            // guest owns its page tables: any table update without a
+            // TLBI would serve stale entries. Invalidate wholesale
+            // (gen bump — same as a regime MSR; per-VA precision buys
+            // nothing: tables are append-only during boot). NOTE
+            // (corrected during M73 review): the kernel emits ZERO
+            // TLBIs in the first 60M insns (measured: zztlbcount = 0)
+            // — the early-boot wedge at CMA-reserved is NOT a
+            // TLBI-miss artifact, and the boot loop there makes
+            // forward progress ([x20] advances every ~87 insns). This
+            // arm exists so the TLB stays correct IF/WHEN the kernel
+            // starts emitting TLBIs later (post-MMU teardown paths,
+            // kexec, CPU hotplug) — it is not the fix for any observed
+            // stall. ENCODING TRAP (bitten 2026-09-19): TLBI is
+            // op1==0, DC is op1==3 — the fields look alike in hex
+            // (D50887xx vs D50B74xx) but differ in op1. Gating on
+            // op1==3 (the DC class) would swallow ZERO tlbis and let
+            // real TLBIs fall into the DC arms below (harmless NOP
+            // today, stale TLB tomorrow).
+            if op0 == 1 && op1 == 0 && crn == 8 {
+                bus.tlb_gen = bus.tlb_gen.wrapping_add(1);
+                return Ok(());
+            }
             if op0 == 1 && op1 == 3 && crn == 7 {
                 if crm == 4 && op2 == 1 {
                     // DC ZVA: zero 64 bytes at [r(rt)].
@@ -4837,6 +4924,10 @@ impl Cpu {
                     } else if crn == 1 && op2 == 0 {
                         bus.mmu_sctlr = v;
                     }
+                    // M73 TLB: any regime change bumps the generation
+                    // (the TLB tag folds gen-low-8; without this a
+                    // stale entry from the old regime would hit).
+                    bus.tlb_gen = bus.tlb_gen.wrapping_add(1);
                 } else if crn == 2 && op2 == 0 {
                     self.w(rd, bus.mmu_ttbr0, true);
                 } else if crn == 2 && op2 == 1 {
@@ -4848,9 +4939,13 @@ impl Cpu {
                     self.w(rd, bus.mmu_sctlr, true);
                 }
             } else if op0 == 3 && op1 == 0 && crn == 10 && crm == 2 && op2 == 0 {
-                // MAIR_EL1 {3,0,10,2,0}: recorded, never consulted.
+                // MAIR_EL1 {3,0,10,2,0}: recorded, never consulted —
+                // but still bumps tlb_gen (keeps the "any regime MSR
+                // invalidates" invariant audit-proof; costs one add
+                // per MAIR write, of which the kernel does ~2 at boot).
                 if l == 0 {
                     bus.mmu_mair = self.r(rd);
+                    bus.tlb_gen = bus.tlb_gen.wrapping_add(1);
                 } else {
                     let v = bus.mmu_mair;
                     self.w(rd, v, true);
