@@ -1989,7 +1989,7 @@ completion (all ruled out by execution above).
   (m66/m66spin/m66idc/mboxdump2/idc*/loop/sched) + `~/pi62-logs/`.
 
 
-### M67 — DWC2 OTG + LAN7800 ethernet path (DONE, uncommitted)
+### M67 — DWC2 OTG + LAN7800 ethernet path (DONE, committed dd3959d)
 
 Complete ethernet protocol/device path in pi-cpu (`Bus`, `cpu/src/
 lib.rs`), so the dwc2 + lan78xx drivers can probe without the
@@ -2080,6 +2080,103 @@ demo guests (`usb`, `eth`) + smoke/UI wiring.
   pi-cpu `patch_dtb_chosen` blacklist and watch the live dwc2 probe
   sequence against this model (USBTRACE-gated `USBRD/USBWR/USBXFER`
   lines + tail + battery as proof).
+
+
+### M68 — single-core honesty: maxcpus=1 kills the CPU1-3 wait (DONE, uncommitted)
+
+The browser screenshot showed the pi-linux console parked after
+`EFI services will not be available` + `CPU1: failed to come
+online` / `failed in unknown state : 0x0`. Triage by execution:
+
+- **EFI line is NORMAL, not an error.** `efi: UEFI not found` prints
+  on every raspi3ap boot without UEFI (qemu oracle prints it too);
+  the screenshot's `EFI services will not be available` is that same
+  line. NOT the boot blocker — do not chase it.
+- **CPU1-3 waits are the stall.** pi-cpu runs ONE core (the
+  SmpRunner exists only for the bare-metal smp guest; the Linux
+  runner never starts secondaries), but the DTB advertises 4
+  spin-table CPUs (`enable-method spin-table`, release addrs
+  0xd8/0xe0/0xe8/0xf0, proven by a zzdtbcpus FDT dump). Without
+  maxcpus the kernel spends ~3000s of virtual time per secondary
+  waiting on its spin-table release, then `Brought up 1 node, 1 CPU`
+  — boot continues but 1000s late.
+- **Fix (one word):** `maxcpus=1` appended to the pi-cpu
+  `patch_dtb_chosen` bootargs (comment M68 in lib.rs). 2B/4096
+  before: `pc=...0c1804 console=9322 irqs=21089` with CPU1/2/3
+  `failed to come online` lines in the tail; after:
+  `pc=...b92e44 console=9044 irqs=17059`, tail shows `Bringing up
+  secondary CPUs ... Brought up 1 node, 1 CPU / SMP: Total of 1
+  processors activated` with ZERO failed-to-come-online lines, and
+  the boot runs ~3000 virtual-seconds further (tail `vgaarb: loaded`
+  at [1135] instead of [4046]). Battery green both sides
+  (smoke 25/25 + fuzzer 882/882).
+
+### M69 — exclusive monitor: ticket-lock unlock stops clobbering (DONE, uncommitted)
+
+The M68 stall moved to `pc=...b92e44` (a `...b92d20` weigh-wrapper
+frame: `mrs sp_el0 / ldr w4,[sp0+8] / cbz w4->ret w20`) with console
+9044 and tail still `vgaarb: loaded` — but the mailbox line was now
+DRAINED (`mbox_pending=0 legacy=0 drains=[381816832]`, NO firmware
+timeout in the tail). New waiter: the `[sp_el0+8]` task-refcount
+word `w4` (M63 identity) stuck at 0x10000/0x10001 across the whole
+500M→2B series (zzwseries: 0x0/0x100/0x2/0x10000 — never collapses).
+
+Root cause (all execution-proven, disassembler-checked):
+
+- The holder path is `...0c2870` get/put (`ldr w1,[x0,#8] /
+  add w1,w19,w1 / str` vs `...0c28fc` sub-put) around a weigh loop
+  at `...b92dc8` (`bl ...0f5330` strcmp-style helper; w4!=0
+  re-weighs).
+- The put never lands because the TICKET-LOCK unlock CASAL
+  (`c8e5fc62 casal x5,x2,[x3]` in `...0f9be4`) compares a STALE
+  LDXR snapshot: pi-cpu executed EVERY STXR/CAS with unconditional
+  success (status 0), so the unlock CAS overwrote the lock word even
+  though memory had moved on since the reservation — corrupting the
+  word the holder's put needed.
+- Evidence: `zzexcl` counts 1965 LDXR vs 134 STLXR over 400M (the
+  percpu path is exclusive-heavy); field decode of the three live
+  words (`ldxr x0,[x3]`=0xc85f7c60, `stlxr w1,x2,[x3]`=0xc801fc62,
+  `casal`=0xc8e5fc62 — assembler-truth via `.arch armv8.1-a+lse`)
+  shows the unlock shape exactly.
+
+Fix (`cpu/src/lib.rs`, `Cpu::excl_*` monitor, single-core):
+
+- `LDXR/LDAXR` records (addr, value, size); `STXR/STLXR` succeeds
+  (status 0 + store) only when memory still matches the
+  reservation, else status 1 + NO store; `CAS-family` stores only
+  when mem==comparand AND the reservation still matches (plain CAS
+  without LDXR, e.g. 0xC8A07C41, keeps compare-only behavior);
+  every STXR/CAS clears the reservation (ARM ARM).
+- Effect by execution: w4 series collapses (0x0/0x100/0x2 at
+  500M/1B/1.5B — the holder runs), console 9044→17921 (+8877 B:
+  the boot runs ~800 virtual-seconds further into initcalls), 2B
+  tail moves from `vgaarb: loaded` to hung-task `Call trace`
+  (`rwsem_down_write_slowpath / down_write / event_trace_init` +
+  `__mutex_lock / init_kprobe_trace` — the kernel now schedules
+  workqueues and runs initcalls instead of spinning the mailbox
+  waiter), `drains=[381816832]` (mailbox completes), NO firmware
+  timeout. New stall pc `...b92d28` is the weigh-wrapper entry
+  (same w4 frame, deeper budget).
+- Battery: smoke 25/25 + fuzzer 882/882 (monitor changes nothing
+  for the bare-metal guests — no exclusive contention there).
+- Open (next): the hung-task/rwsem stall (tracer + kprobe initcalls
+  block on each other — likely needs the next device/IRQ model, or
+  a scheduler tick the IMASK now suppresses; map it the same way:
+  disassemble the waiter, sample its inputs, fix by execution).
+
+### M70 — copyable terminal + Copy Log button (DONE, uncommitted)
+
+The pi-linux console in the browser could not be copied: the key
+handler called `preventDefault()` on every keypress including
+Ctrl/⌘+C, so the browser copy never fired; `#term` also lacked an
+explicit `user-select`. Fix (`src/main.js`, `index.html`,
+`src/styles.css`): `handleKey` returns early on Ctrl/Meta (browser
+shortcuts untouched); `#term` gets `user-select: text; cursor:
+text`; a `Copy Log` button copies `term.textContent` via
+`navigator.clipboard` with an `execCommand` textarea fallback (the
+async API rejects on non-secure contexts). Verified: `npx vite
+build` clean, button + handler present in `dist/`, smoke 25/25 +
+fuzzer 882/882 green.
 
 
 ## Key risks (M49: unicorn retired — the first two risks below are closed)

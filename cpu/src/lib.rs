@@ -3728,6 +3728,21 @@ pub struct Cpu {
     /// Backed u64s, zero at reset; MRS/MSR wired in the system arm.
     pub sp_el0: u64,
     pub tpidr_el1: u64,
+    /// M69 exclusive monitor (single-core): LDXR/LDAXR records (addr,
+    /// value, size); STXR/STLXR + CAS-family succeed only when the
+    /// current memory matches the reservation (real exclusive
+    /// semantics). Before M69 every STXR/CAS succeeded unconditionally
+    /// (status 0), which broke TICKET-LOCK unlock: the unlock CASAL
+    /// compared a STALE LDXR snapshot (always-0 because pi-cpu never
+    /// recorded reservations) and overwrote the lock word, so the
+    /// holder's refcount put never completed and the ...b92e44 waiter
+    /// spun forever on w4=0x10000. With the monitor, the stale CAS
+    /// fails (memory changed since the reservation) and the lock word
+    /// survives — execution-proven by the w4 series collapsing to 0.
+    excl_addr: u64,
+    excl_val: u64,
+    excl_size: u64,
+    excl_valid: bool,
     /// M54 sync-exception state (ch11/12 shape): ESR_EL1/FAR_EL1
     /// filled on SVC entry; ESR MSR absorbed (MRS returns the latched
     /// syndrome). Encodings from assembler truth: ESR MRS=0xD5385200,
@@ -3750,7 +3765,7 @@ pub struct Cpu {
 
 impl Cpu {
     pub fn new(entry: u64) -> Self {
-        Cpu { x: [0; 31], sp: 0, pc: entry, q: [0; 32], vbar_el1: 0, daif: 0xf, elr_el1: 0, spsr_el1: 0, spsr_el2: 0, elr_el2: 0, sp_el1: 0, cur_el: 2, spsr_el2_msrd: false, esr_el1: 0, far_el1: 0, sp_el0: 0, tpidr_el1: 0, n: false, z: false, c: false, v: false, fpsr_cum: 0 }
+        Cpu { x: [0; 31], sp: 0, pc: entry, q: [0; 32], vbar_el1: 0, daif: 0xf, elr_el1: 0, spsr_el1: 0, spsr_el2: 0, elr_el2: 0, sp_el1: 0, cur_el: 2, spsr_el2_msrd: false, esr_el1: 0, far_el1: 0, sp_el0: 0, tpidr_el1: 0, excl_addr: 0, excl_val: 0, excl_size: 0, excl_valid: false, n: false, z: false, c: false, v: false, fpsr_cum: 0 }
     }
 
     /// M56 Linux-track reset: ARM64 boot protocol regs (x0=DTB PA,
@@ -3771,6 +3786,7 @@ impl Cpu {
         self.spsr_el2_msrd = false;
         self.esr_el1 = 0;
         self.far_el1 = 0;
+        self.excl_valid = false;
         self.n = false;
         self.z = false;
         self.c = false;
@@ -5555,13 +5571,29 @@ impl Cpu {
             // M60 WIDTH (same fix as LDXR above): W=4B, X=8B by
             // bits[31:30], never sf (sf==1 for both W-stxr 88027E61
             // and X-stxr C8037E62).
+            // M69 MONITOR: STXR/STLXR succeed only when memory still
+            // matches the LDXR reservation (addr+value+size); else
+            // status 1 and NO store (real exclusive semantics — the
+            // unconditional-success shortcut broke ticket-lock
+            // unlock, see the excl_* field comment).
             let nbytes = 1u64 << bits(w, 31, 30);
-            let v = if nbytes == 8 { self.r(rd) } else { self.r(rd) & mask(nbytes) };
             let addr = self.rsp(rn);
-            bus.write(addr, nbytes, v).map_err(|_| Fault::UnmappedData(addr))?;
+            let ok = if self.excl_valid && self.excl_addr == addr && self.excl_size == nbytes {
+                bus.read(addr, nbytes).map(|cur| cur == (self.excl_val & mask(nbytes))).unwrap_or(false)
+            } else {
+                false
+            };
+            // Any STXR clears the reservation (success or fail — ARM ARM).
+            self.excl_valid = false;
             let rs = bits(w, 20, 16);
-            if rs != 31 {
-                self.w(rs, 0, false);
+            if ok {
+                let v = if nbytes == 8 { self.r(rd) } else { self.r(rd) & mask(nbytes) };
+                bus.write(addr, nbytes, v).map_err(|_| Fault::UnmappedData(addr))?;
+                if rs != 31 {
+                    self.w(rs, 0, false);
+                }
+            } else if rs != 31 {
+                self.w(rs, 1, false);
             }
             return Ok(());
         }
@@ -5890,6 +5922,12 @@ impl Cpu {
                     }
                     let nbytes = 1u64 << bits(w, 31, 30);
                     let v = bus.read(addr, nbytes).map_err(|_| Fault::UnmappedData(addr))?;
+                    // M69 MONITOR: record the reservation (addr+value
+                    // +size) for the STXR/CAS success check below.
+                    self.excl_addr = addr;
+                    self.excl_val = v & mask(nbytes);
+                    self.excl_size = nbytes;
+                    self.excl_valid = true;
                     self.w(rd, v, nbytes == 8);
                 } else if (o2 == 0b100 && l == 0) || (o2 == 0b110 && l == 1) {
                     // STLR (o2==100/L==0) / LDAR (o2==110/L==1):
@@ -5988,7 +6026,21 @@ impl Cpu {
                 // w1,w2,[x3]=0x88A17C62 has Rs=1/Rt=2 — old value goes
                 // to Rt=w2, NOT to a separate Rd. Verified against the
                 // disassembler field map, same as STXR above.)
-                if old == (cmp & mask(size_b)) {
+                // M69 MONITOR: a CAS only stores when the memory also
+                // matches the LDXR reservation (stale-comparand unlock
+                // CASAL must fail once the lock word moved on — see the
+                // excl_* field comment). The Rt=old writeback happens
+                // regardless (like hardware's failed-CAS old return).
+                let reserved_ok = if self.excl_valid && self.excl_addr == addr && self.excl_size == size_b {
+                    old == (self.excl_val & mask(size_b))
+                } else {
+                    // No reservation (plain CAS without LDXR, e.g. the
+                    // 0xC8A07C41 plain-CAS word): compare-only, no
+                    // monitor gate — matches the old behavior exactly.
+                    true
+                };
+                self.excl_valid = false;
+                if old == (cmp & mask(size_b)) && reserved_ok {
                     bus.write(addr, size_b, new & mask(size_b))
                         .map_err(|_| Fault::UnmappedData(addr))?;
                 }
@@ -7743,7 +7795,18 @@ fn patch_dtb_chosen(bus: &mut Bus, initrd_len: u64) {
     // output; M24 "no earlycon" applies to the qemu-wasm TCG slow path
     // only. pi-cpu UART writes are a RAM tap (free), so earlycon can
     // only help visibility, never slow execution.
-    let bootargs = b"earlycon=pl011,0x3f201000 console=ttyAMA0,115200 lpj=7000000 nokaslr mitigations=off nowatchdog nosoftlockup audit=0 cgroup_disable=memory ipv6.disable=1 cryptomgr.notests loglevel=8 root=/dev/mmcblk0 rootfstype=ext4 rootwait initcall_blacklist=bcm2835_pm_driver_init,bcm2835_cpufreq_init,bcm2835_wdt_init,leds-gpio,thermal,gpio-fan,pwm-fan,dwc2,xhci-hcd,smsc95xx,usb_ernet,rndis_host,cdc_ether,usb-storage,sdhci-iproc,i2c-bcm2835,spi-bcm2835,bcm2835-rng,brcmstb_thermal,snd_bcm2835,vchiq,snd_pcm,snd_timer,snd,soundcore,joydev,rfkill,bcm2835_v4l2,cfg80211,rfkill_gpio\0";
+    // M68 maxcpus=1 (single-core honesty): pi-cpu runs ONE core (the
+    // SmpRunner exists only for the bare-metal smp guest; the Linux
+    // runner never starts cores 1..3), but the DTB advertises 4
+    // spin-table CPUs — without maxcpus the kernel spends ~3000s of
+    // virtual time waiting on each secondary's spin-table release
+    // ("CPU1/2/3: failed to come online ... failed in unknown state"
+    // then "Brought up 1 node, 1 CPU" — qemu boots all 4, pi-cpu
+    // cannot yet). maxcpus=1 tells the kernel to skip secondaries and
+    // matches the emulation reality. The "EFI services will not be
+    // available" line just above it is NORMAL on every platform
+    // without UEFI (qemu raspi3ap prints it too) — not an error.
+    let bootargs = b"earlycon=pl011,0x3f201000 console=ttyAMA0,115200 lpj=7000000 nokaslr mitigations=off nowatchdog nosoftlockup audit=0 cgroup_disable=memory ipv6.disable=1 cryptomgr.notests loglevel=8 maxcpus=1 root=/dev/mmcblk0 rootfstype=ext4 rootwait initcall_blacklist=bcm2835_pm_driver_init,bcm2835_cpufreq_init,bcm2835_wdt_init,leds-gpio,thermal,gpio-fan,pwm-fan,dwc2,xhci-hcd,smsc95xx,usb_ernet,rndis_host,cdc_ether,usb-storage,sdhci-iproc,i2c-bcm2835,spi-bcm2835,bcm2835-rng,brcmstb_thermal,snd_bcm2835,vchiq,snd_pcm,snd_timer,snd,soundcore,joydev,rfkill,bcm2835_v4l2,cfg80211,rfkill_gpio\0";
     // M60 memory@0 FIX (console-proven: the stock DTB's memory@0 reg is
     // all-ZERO — qemu fills real RAM size via -m 512M; without it the
     // kernel sees 0 bytes, CMA fails, panic at

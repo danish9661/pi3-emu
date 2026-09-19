@@ -37,6 +37,11 @@ h1 {
   margin: 0 0 12px;
   white-space: pre-wrap;
   word-break: break-all;
+  /* M70 copyable terminal: explicit text selection (was unselectable in
+     some browsers because #term is a focus-click target for key input). */
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
 }
 
 .bar {

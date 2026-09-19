@@ -708,6 +708,10 @@ function guestKey(code) {
 
 function handleKey(e) {
   if (!pi || runBtn.disabled) return;
+  // M70 copyable terminal: never hijack browser shortcuts (Ctrl/⌘+C/X/V/A).
+  // Before this, Ctrl+C arrived here as e.key==='c' and hit preventDefault()
+  // below, so the browser copy never fired and the log felt uncopyable.
+  if (e.ctrlKey || e.metaKey) return;
   if (mode === IRQ_MODE || mode === LIRQ_MODE || mode === UPY_MODE || mode === 'rpikernel' || mode === PI_LINUX_MODE) {
     // Continuous rAF loop picks the key up at the next slice.
     const c = e.key.length === 1 ? e.key.charCodeAt(0) : e.key === 'Enter' ? 13 : 0;
@@ -1005,6 +1009,34 @@ window.addEventListener('error', (e) => {
 });
 
 runBtn.addEventListener('click', run);
+
+// M70 Copy Log: copy the whole terminal text to the clipboard (execCommand
+// fallback included — the async API needs a secure context and rejects on
+// plain http/file, while the fallback textarea works everywhere).
+try {
+  document.getElementById('copyLog').addEventListener('click', async () => {
+    const text = term.textContent || '';
+    if (!text) { setStatus('terminal is empty — nothing to copy'); return; }
+    const done = (n) => setStatus(`copied ${n} terminal chars to clipboard`);
+    try {
+      await navigator.clipboard.writeText(text);
+      done(text.length);
+      return;
+    } catch (_) {}
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      done(text.length);
+    } catch (e) { setStatus('Copy Log failed: ' + (e && e.message || e)); }
+  });
+} catch (_) {}
 
 // MicroPython card buttons (visible while upython runs; see #cardbar).
 // Save snapshots the live card to IndexedDB + downloads it; Load reads a

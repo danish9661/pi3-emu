@@ -1206,9 +1206,9 @@ dist/                 production bundle
   (table-base 0x0 at 2nd send) and holds fn-pointers, not kinds (seed
   removed); EMPTY=1-always changes nothing. Next: post-send idc-match
   inputs. Smoke 23/23, fuzzer 882/882.
-- M67 -- DWC2 OTG + LAN7800 ethernet path (UNCOMMITTED): complete USB/
-  ethernet device protocol in pi-cpu (DWC2 core at 0x3F980000 with QEMU
-  reset values + verbatim write arms, sync transfer completion with EP0
+- M67 -- DWC2 OTG + LAN7800 ethernet path: complete USB/ethernet
+  device protocol in pi-cpu (DWC2 core at 0x3F980000 with QEMU reset
+  values + verbatim write arms, sync transfer completion with EP0
   setup-latch + GET_DESCRIPTOR 0424:7800, bulk TX/RX + loopback, IRQ as
   GPU IRQ 9 bank-1 bit 9) + LAN7800 (MAC b8:27:eb:de:ad:be, link up,
   RX/TX harness hooks) + `usb`/`eth` demo guests (14 + 7 checks ALL
@@ -1216,3 +1216,20 @@ dist/                 production bundle
   upstream-grounded (qemu-wasm tree in-repo). Linux 2B stall unchanged
   (still blacklists dwc2 — un-blacklisting is next). Smoke 25/25,
   fuzzer 882/882.
+- M68 -- single-core honesty (UNCOMMITTED): `maxcpus=1` in the pi-cpu
+  DTB bootargs kills the ~3000s-per-core CPU1-3 spin-table wait
+  (`failed to come online` lines gone; `Brought up 1 node, 1 CPU`);
+  the `EFI services will not be available` line is normal (no UEFI,
+  qemu prints it too). 2B moves `...0c1804`/9322 → `...b92e44`/9044.
+  Smoke 25/25, fuzzer 882/882.
+- M69 -- exclusive monitor (UNCOMMITTED): `Cpu::excl_*` reservation
+  tracking (LDXR records, STXR/CAS succeed-if-match) stops the
+  ticket-lock unlock CASAL from clobbering the lock word. w4 refcount
+  collapses (0x0/0x100/0x2), console 9044 → 17921, tail `vgaarb:
+  loaded` → hung-task `Call trace` (rwsem/mutex initcalls now run),
+  mailbox drains, no firmware timeout. Smoke 25/25, fuzzer 882/882.
+- M70 -- copyable terminal + Copy Log button (UNCOMMITTED): Ctrl/⌘+C
+  no longer swallowed by the key handler (`handleKey` returns early on
+  Ctrl/Meta), `#term` gets `user-select: text`, and a `Copy Log`
+  button copies the log via clipboard API + execCommand fallback.
+  Smoke 25/25, fuzzer 882/882.
