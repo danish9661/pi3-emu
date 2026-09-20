@@ -2320,6 +2320,81 @@ by measurement + architecture (no code changed):
   the interpreter itself got faster first.
 
 
+### M74 — unmodeled-peripheral faults + dead-end verdicts (DONE, uncommitted)
+
+Three `UnmappedData` faults past the 5.6B breakthrough (con 17921→19772,
+`Freeing initrd memory`), each fixed by execution (walk_dump PA + disasm
++ upstream source), plus two honest negative verdicts (kept as record so
+nobody retries them):
+
+- **M74c clock block** (`CLK_LEN` 0x3000): 7.6B fault VA
+  `0xffffffc0097bd100/200` → PA `0x3f1021xx` (L3 `0x6800003f102713`) —
+  the clk-bcm2835 driver scans a second window at `0x3f102000`, not the
+  M30 `CLK_BASE` page. Whole `0x3f100000..0x3f103000` block now
+  zero-read/absorb (same honesty as other M30 untouched windows).
+- **M74d peripheral umbrella** (`PERIPH_BASE/LEN` =
+  `0x3f000000/0x300000`): 6.69B store PA `0x3f00604c` (dwc_otg
+  `hcd_init_fiq` MPHI init) + 6.71B read PA `0x3f212004`
+  (bcm2835_thermal tsens — blacklist skips its initcall, not its regs).
+  Covers everything below SDHCI that isn't a modeled window; modeled
+  windows keep priority (arm placed after them); census = misc.
+  `PERIPHTRACE` env gates per-touch logging (zero-cost off).
+- **M74b blacklist verdict (NEGATIVE, reverted):** blacklisting
+  `event_trace_init` + `init_kprobe_trace` does NOT skip the hung path
+  (still parks at `vgaarb: loaded`, con 9190, mbox pending) — the
+  tracer/kprobe waits are symptoms of the firmware-timeout stall, not
+  the cause. Stays stock-minimal (oracle cmdline); do NOT retry.
+- **M74e ramdisk verdict (NEGATIVE, reverted):** both `root=/dev/ram0`
+  (con 9041, irqs frozen) and `+rdinit=/sbin/init` (con 8939, worse)
+  starve before the mailbox tx loop; only `root=/dev/mmcblk0` reaches
+  the 10.3B VFS panic with con 223k. Real work is the SDHCI/DMA block
+  path (M75), not ramdisk shortcuts; do NOT retry.
+- Battery after revert: smoke 25/25 + fuzzer 882/882.
+
+### M75 — sdhost@3F202000 model: card enumerates, IRQs deliver (DONE, uncommitted)
+
+The SDHCI window (`0x3F300000`) stays permanently zero (cmd/arg/irpt 0
+at every 1B sample) — the Pi 3 boots its card from the **sdhost**
+controller at `0x3F202000` (DTB `mmc@7e202000`, `brcm,bcm2835-sdhost`;
+qemu `MMCI0_OFFSET`), which shares its page with the bare-metal SMP
+spin-table mailbox (`SMP_BASE` == same address). Full model in
+`cpu/src/lib.rs`, QEMU `hw/sd/bcm2835_sdhost.c` register map verbatim
+(SDCMD/ARG/RSP/HSTS/VDD/EDM/CFG/HBCT/DATA/HBLC + 16-deep FIFO), split
+from SMP by `linux_mode` (sdhost arms precede SMP in read()/write();
+SMP arms are `!linux_mode`-gated; bare-metal green proves the split):
+
+- **Placement footgun (fixed):** first cut placed the sdhost READ arm
+  AFTER the SMP arm — SMP byte backing swallowed all 11k touches (0
+  SDHRD lines with SDTRACE on). `SDTRACE` env now gates SDHWR/SDHRD
+  logging on both arms (zero-cost off).
+- **IRQ bank fix (the big one):** first cut gated PENDING1 bit 24
+  (= GPU IRQ 24/DMA — wrong bank, line never delivered). Upstream
+  truth (QEMU `bcm2835_ic.c`: `PENDING_2 = gpu_pending>>32`;
+  `irq_dups[]` index 8 = IRQ 56 → BASIC bit 18): sdhost is GPU IRQ 56
+  = **PENDING2 bit 24 + BASIC bit 18** (`sdh_pending2`, wired into
+  PENDING2/BASIC reads + `legacy_line()`). Card enumerates immediately
+  (`mmc0: new SD card at address 1234`).
+- **Card model** (QEMU `hw/sd/sd.c` verbatim): CMD55 latches APP_CMD
+  (R1 carries the APP_CMD bit or the ACMD is rejected); ACMD41 R3 OCR
+  = VDD_WIN_HI|CCS|POWER_UP (busy first poll, ready after); illegal
+  SDIO/MMC CMDs (1/5/52/53/54/58/59) FAIL+TIME_OUT (answering R1-ok
+  gave error -22); CMD9 CSD v2.0 (C_SIZE=7 for the 4MB image), CMD16
+  blocklen; R1 = TRAN+READY_FOR_DATA (old 0x900 stalled
+  `__mmc_poll_for_busy`); ACMD51 SCR (8-byte data phase, datacnt
+  consumed); SDEDM live fifo-count + DATAMODE FSM; SDIO recompute on
+  CFG writes (driver programs CFG after data is ready); BUSY_IRPT.
+- **M75h DMA bridge** (`dma_sdhost_transfer`): the driver uses DMA,
+  not PIO, for block reads (zero SDDATA reads in 30M insns) with CBs
+  aimed at SDDATA — routed through the sdhost FIFO (device→RAM pops
+  with card refill, RAM→device pushes), PIO-completion tail
+  (datacnt=0 + DATA_FLAG + SDIO_IRPT).
+- **Status:** timeouts/-22 GONE (no `-110`/`-22` after the R1 fix);
+  card clean-enumerates but no `mmcblk0` yet — zero CMD17/18 block
+  READs issued (card-reg phase never completes; no partition scan).
+  Next: CMD17/18 + partition-scan path to `mmcblk0`.
+- Battery: smoke 25/25 + fuzzer 882/882.
+
+
 ## Key risks (M49: unicorn retired — the first two risks below are closed)
 
 - ~~Core patch (Phase 1) is the big unknown~~ CLOSED by the M49 removal:

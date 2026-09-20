@@ -1252,3 +1252,26 @@ dist/                 production bundle
   (~10% gain, not worth binary size); write-watch check reordered to
   zero-cost. Trajectories pinned (20M/500M byte-identical). Smoke
   25/25, fuzzer 882/882.
+- M74 -- unmodeled-peripheral faults + dead-end verdicts
+  (UNCOMMITTED): 5.6B breakthrough (con 17921→19772, `Freeing initrd
+  memory`) then 3 `UnmappedData` faults fixed by execution — clk block
+  `0x3f100000..0x3f103000` (7.6B, clk-bcm2835 2nd window) + peripheral
+  umbrella `0x3f000000/0x300000` (6.69B dwc_otg MPHI + 6.71B thermal
+  tsens); `PERIPHTRACE` env gates logging. NEGATIVE verdicts kept as
+  record: trace-init blacklist (con 9190, still vgaarb-parked) and
+  ramdisk roots (ram0 9041 / rdinit 8939, both starve) — do NOT retry.
+  Smoke 25/25, fuzzer 882/882.
+- M75 -- sdhost@3F202000 model (UNCOMMITTED): Pi 3 boots from sdhost
+  (DTB `mmc@7e202000`, qemu `MMCI0_OFFSET`), not SDHCI (regs
+  permanently zero) — shares the page with the SMP spin-table
+  mailbox, split by `linux_mode` (sdhost arms precede SMP;
+  `SDTRACE`-gated). IRQ bank fix (PENDING2 bit 24 + BASIC bit 18 =
+  GPU IRQ 56; first cut gated PENDING1/DMA — line never delivered).
+  Card model (QEMU sd.c: APP_CMD latch, ACMD41 OCR busy→ready,
+  illegal SDIO/MMC FAIL+TIME_OUT, CSD v2.0 C_SIZE=7, R1
+  TRAN+READY, ACMD51 SCR, SDEDM fifo-count/DATAMODE, SDIO recompute,
+  BUSY_IRPT) + DMA bridge (`dma_sdhost_transfer` for SDDATA CBs) +
+  `sdh_pending2` in PENDING2/BASIC/`legacy_line()`. Timeouts/-22
+  GONE; card clean-enumerates (`new SD card at address 1234`) but no
+  `mmcblk0` yet (zero CMD17/18 READs — card-reg phase incomplete).
+  Smoke 25/25, fuzzer 882/882.

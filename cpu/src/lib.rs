@@ -31,12 +31,49 @@ pub const DMA_BASE: u64 = 0x3f007000; // DMA ch0 + ENABLE extension
 pub const DMA_ENABLE_PAGE: u64 = 0x3f00e000; // ENABLE lives here (facade maps the page)
 pub const PWM_BASE: u64 = 0x3f20c000; // PWM FIFO-mode + audio samples
 pub const SMP_BASE: u64 = 0x3f202000; // SMP spin-table mailbox (host-arbitrated)
+/// M75 sdhost (BCM2835 SD host controller, 0x3F202000, 4K): register
+/// map + bit defs verbatim from scripts/.build/qemu-wasm
+/// (hw/sd/bcm2835_sdhost.c — itself the QEMU port of the Arasan-derived
+/// BCM2835 block): SDCMD+0x00/SDARG+0x04/SDTOUT+0x08/SDCDIV+0x0C/
+pub const SDHOST_BASE: u64 = 0x3f202000;
 pub const SD_BASE: u64 = 0x3f300000;
 // M30 windows (periphs/debug guests): HW RNG + temp (shared block),
 // clock manager, I2S/PCM, BSC0, AUX mini-UARTs 2-5, DWC2 USB (SNPSID +
 // DONE only — no full OTG model).
 pub const RNG_BASE: u64 = 0x3f104000;
 pub const CLK_BASE: u64 = 0x3f100000;
+// M74c clock-manager extension (execution-proven 2026-09-19): the 7.6B
+// fault walks VA 0xffffffc0097bd100/200 -> PA 0x3f1021xx (same L3 page,
+// 0x6800003f102713) — the bcm2835 clock driver (clk-bcm2835, probed
+// after the 5.6B breakthrough) reads its registers through a second
+// 4K window at 0x3f102000, NOT the M30 CLK_BASE page at 0x3f100000.
+// The M30 zero-window covered only the single CLK_BASE page, so the
+// driver faulted UnmappedData on its first register read. Cover the
+// whole 0x3f100000..0x3f103000 clock block (CM + A2W + genlock-adjacent
+// regs the driver scans); reads zero, writes absorb — same honesty as
+// the other untouched M30 windows.
+pub const CLK_LEN: u64 = 0x3000;
+// M74d peripheral umbrella (execution-proven 2026-09-19): the 6.69B
+// fault stores to PA 0x3f00604c (VA 0xffffffc0096dd04c, L3 page
+// 0x6800003f006713) — the dwc_otg driver's MPHI/peripheral init
+// (hcd_init_fiq path, "MPHI regs_base" in the tail) touching the
+// 0x3f006000 USB-MPHI window, which no model covers. Same class as
+// M74c: unmodeled peripheral register file. Cover the whole
+// 0x3f000000..0x3f300000 peripheral span the Linux DT maps (everything
+// below the SDHCI block at 0x3f300000 that isn't a modeled window):
+// reads zero, writes absorb. EXTENDED 2026-09-19 (execution-proven):
+// the 6.71B fault reads PA 0x3f212004 (VA 0xffffffc0096fd004, L3 page
+// 0x6800003f212713) — the bcm2835_thermal driver's tsens register
+// (tail: "Clock tsens running at 0 Hz"). The thermal driver IS in the
+// oracle blacklist but the blacklist only skips its INITCALL — the
+// driver's registers still get touched through the shared
+// 0x3f212000 thermal window by a live path. Same umbrella class:
+// cover through 0x3f300000 (up to SDHCI which IS modeled).
+// Modeled windows keep priority (checked first); this arm only
+// catches the gaps. Census bucket = misc (same as the other M30
+// zero-windows).
+pub const PERIPH_BASE: u64 = 0x3f000000;
+pub const PERIPH_LEN: u64 = 0x300000;
 pub const I2S_BASE: u64 = 0x3f203000;
 pub const I2C0_BASE: u64 = 0x3f205000;
 pub const UART2_BASE: u64 = 0x3f216000;
@@ -410,8 +447,32 @@ pub struct Bus {
     mmu_loose: bool,
     // SMP spin-table mailbox (0x3F202000 — host-arbitrated window like
     // main.js smpState): plain backing; the SmpShared arbiter mirrors
-    // it per core per chunk (see runner.rs).
+    // it per core per chunk (see runner.rs). M75: in linux_mode this
+    // address is the sdhost controller instead (see the sdhost arm in
+    // read()/write() which precedes this one); bare-metal keeps SMP.
     smp_mem: [u8; 0x1000],
+    // M75 sdhost state (BCM2835 SD host @ SDHOST_BASE, linux_mode
+    // only): QEMU bcm2835_sdhost.c fields verbatim (cmd/cmdarg/
+    // status/rsp[4]/config/edm/vdd/hbct/hblc/fifo/datacnt). The FIFO
+    // carries PIO data words; datacnt = hblc*hbct set on SDHBLC write
+    // (QEMU SDHBLC arm verbatim).
+    sdh_cmd: u32,
+    sdh_cmdarg: u32,
+    sdh_status: u32,
+    sdh_rsp: [u32; 4],
+    sdh_cfg: u32,
+    sdh_edm: u32,
+    sdh_vdd: u32,
+    sdh_hbct: u32,
+    sdh_hblc: u32,
+    sdh_fifo: [u32; 16],
+    sdh_fifo_pos: usize,
+    sdh_fifo_len: usize,
+    sdh_datacnt: u32,
+    /// M75b APP_CMD latch (CMD55 seen; next CMD41 is ACMD41) + OCR
+    /// ready flag (first ACMD41 reports busy, later ones ready).
+    sdh_app_cmd: bool,
+    sdh_ocr_ready: bool,
     // PWM (0x3F20C000 — mirrors pwm.js FIFO mode): CTL latch + FIFO
     // queue drained 64/chunk into a sample ring (browser audio reads
     // it via pwm_take). STA/FULL/EMPT published at sync_out.
@@ -557,6 +618,21 @@ impl Bus {
             mmu_done_cell: 0,
             mmu_loose: false,
             smp_mem: [0; 0x1000],
+            sdh_cmd: 0,
+            sdh_cmdarg: 0,
+            sdh_status: 0,
+            sdh_rsp: [0; 4],
+            sdh_cfg: 0,
+            sdh_edm: 0x0000c60f, // QEMU sdhost reset value (device reset arm)
+            sdh_vdd: 0,
+            sdh_hbct: 0,
+            sdh_hblc: 0,
+            sdh_fifo: [0; 16],
+            sdh_fifo_pos: 0,
+            sdh_fifo_len: 0,
+            sdh_datacnt: 0,
+            sdh_app_cmd: false,
+            sdh_ocr_ready: false,
             pwm_back: [0; 32],
             pwm_ctl: 0,
             pwm_last_ctl: 0,
@@ -652,12 +728,16 @@ impl Bus {
         Self::is_page(addr, size, SMP_BASE)
     }
 
+    fn is_periph(addr: u64, size: u64) -> bool {
+        addr >= PERIPH_BASE && addr.checked_add(size).map_or(false, |e| e <= PERIPH_BASE + PERIPH_LEN)
+    }
+
     fn is_rng(addr: u64, size: u64) -> bool {
         Self::is_page(addr, size, RNG_BASE)
     }
 
     fn is_clk(addr: u64, size: u64) -> bool {
-        Self::is_page(addr, size, CLK_BASE)
+        addr >= CLK_BASE && addr.checked_add(size).map_or(false, |e| e <= CLK_BASE + CLK_LEN)
     }
 
     fn is_i2s(addr: u64, size: u64) -> bool {
@@ -1090,12 +1170,13 @@ impl Bus {
     }
 
     /// Legacy-IC gated line (bank-0 MAILBOX bit 1 + bank-1 timer bits +
-    /// DMA0, bank-1 USB bit 9, bank-2 GPIO bit 17 + UART bit 25;
-    /// AUX/SDHCI unmodeled). Mirrors ic.js pending() + upstream
-    /// bcm2835_peripherals.c (DWC2 -> INTERRUPT_USB = GPU IRQ 9) +
-    /// bcm2835_ic.c (PENDING1 = low 32 GPU IRQs incl. bit 9).
+    /// DMA0, bank-1 USB bit 9, bank-2 SDIO bit 24, bank-2 GPIO bit 17 +
+    /// UART bit 25; AUX/SDHCI unmodeled). Mirrors ic.js pending() +
+    /// upstream bcm2835_peripherals.c (DWC2 -> INTERRUPT_USB = GPU IRQ 9,
+    /// sdhost -> INTERRUPT_SDIO = GPU IRQ 56, PENDING2 per QEMU
+    /// bcm2835_ic.c) + bcm2835_ic.c (PENDING1 = low 32 GPU IRQs).
     pub fn legacy_line(&self) -> bool {
-        self.timer_pending1() | self.dma_pending1() | self.usb_pending1() | self.gpio_pending2() | self.uart_pending2() | self.mbox_pending0() != 0
+        self.timer_pending1() | self.dma_pending1() | self.usb_pending1() | self.sdh_pending2() | self.gpio_pending2() | self.uart_pending2() | self.mbox_pending0() != 0
     }
 
     /// Gated bank-1 USB bit (M67 ethernet path): the DWC2 core raises
@@ -1211,6 +1292,241 @@ impl Bus {
             && ((self.ic_en2 >> 25) & 1) != 0
         {
             1 << 25
+        } else {
+            0
+        }
+    }
+
+    // ===== M75 sdhost helpers (QEMU bcm2835_sdhost.c verbatim) =====
+    //
+    // send_command: index = cmd & 0x3f, arg = cmdarg. Response words
+    // are filled from the card model (sd_exec/sd_read_sector paths);
+    // BUSYWAIT commands with BUSY_IRPT_EN set raise BUSY_IRPT. Errors
+    // set FAIL_FLAG + CMD_TIME_OUT. FIFO run moves datacnt words
+    // through the 16-deep FIFO (reads fill from the card, writes drain
+    // to it) and raises DATA_FLAG (+SDIO_IRPT when enabled).
+    fn sdh_fifo_pop(&mut self) -> u64 {
+        if self.sdh_fifo_len == 0 {
+            return 0; // FIFO underflow reads 0 (QEMU verbatim)
+        }
+        let v = self.sdh_fifo[self.sdh_fifo_pos] as u64;
+        self.sdh_fifo_len -= 1;
+        self.sdh_fifo_pos = (self.sdh_fifo_pos + 1) & 15;
+        v
+    }
+    fn sdh_fifo_push(&mut self, value: u32) {
+        if self.sdh_fifo_len == 16 {
+            return; // FIFO overflow drops (QEMU verbatim)
+        }
+        let n = (self.sdh_fifo_pos + self.sdh_fifo_len) & 15;
+        self.sdh_fifo_len += 1;
+        self.sdh_fifo[n] = value;
+    }
+    /// Execute the latched sdhost command (QEMU send_command + fifo_run,
+    /// PIO card model via sd_read_sector/sd_write_sector). Called on
+    /// SDCMD writes with NEW_FLAG set (QEMU SDCMD arm verbatim).
+    /// M75b OCR/ACMD model (QEMU hw/sd/sd.c verbatim): CMD55 latches
+    /// APP_CMD (next CMD41/42 is an ACMD); ACMD41 returns the R3 OCR
+    /// word = VDD_VOLTAGE_WIN_HI (0x00FF8000, bits 15:8 — "we accept
+    /// any voltage") | CARD_CAPACITY/CCS (bit 30, SDHC — our image is
+    /// addressed by block) | CARD_POWER_UP (bit 31, set once the card
+    /// is ready). The driver polls ACMD41 until POWER_UP appears
+    /// ("Card stuck being busy" = never seeing it; "no support for
+    /// card's volts" = missing VDD window). First ACMD41 after reset
+    /// reports busy (POWER_UP clear, QEMU's power-up delay); later
+    /// ones report ready. CMD1 (MMC SEND_OP_COND, same OCR shape) is
+    /// answered identically. All other responses mirror the sd_exec
+    /// table (same card, same answers).
+    fn sdh_send_command(&mut self) {
+        const CID: [u32; 4] = [0x12345678, 0x9abcdef0, 0x13579bdf, 0x2468ace0];
+        // OCR word: VDD_WIN_HI (0x00FF8000) | CCS (1<<30) | POWER_UP (1<<31).
+        const OCR_READY: u32 = 0x00FF8000 | (1 << 30) | (1 << 31);
+        const OCR_BUSY: u32 = 0x00FF8000 | (1 << 30);
+        let idx = self.sdh_cmd & 0x3f;
+        let arg = self.sdh_cmdarg;
+        let is_read = (self.sdh_cmd & 0x40) != 0;
+        let is_write = (self.sdh_cmd & 0x80) != 0;
+        let no_resp = (self.sdh_cmd & 0x400) != 0;
+        let long_resp = (self.sdh_cmd & 0x200) != 0;
+        // Response (card model): QEMU hw/sd/sd.c dispatch verbatim
+        // (sd_proto_sd for our SD card + sd_cmd_SEND_OP_CMD for the
+        // shared CMD1/ACMD41 slot). SDIO probe CMDs (52/5) and MMC
+        // CMD1-in-SD-mode are ILLEGAL (sd_r0 = no response — the
+        // driver treats timeout as "no SDIO card" and moves on; our
+        // old 0x900 R1-ok answer made the driver talk SDIO to an SD
+        // card, hence error -22). CMD9 SEND_CSD returns the 16-byte
+        // CSD (long response); CMD16 SET_BLOCKLEN latches 512.
+        // M75i R1 state model (linux/mmc/mmc.h verbatim): R1[12:9] =
+        // CURRENT_STATE (TRAN=4 once selected), bit 8 READY_FOR_DATA
+        // (set when ready), bit 5 APP_CMD (set after CMD55 until the
+        // ACMD consumes it). Old 0x900 (TRAN but !READY) stalled the
+        // driver in __mmc_poll_for_busy ("Card stuck being busy").
+        // R1_TRAN_READY = 0x900 | 0x100 = TRAN + READY_FOR_DATA.
+        const R1_TRAN_READY: u32 = 0x900 | 0x100;
+        if !no_resp {
+            match idx {
+                2 => {
+                    self.sdh_rsp = CID;
+                }
+                3 => {
+                    self.sdh_rsp = [0x12340000, 0, 0, 0];
+                }
+                8 => {
+                    self.sdh_rsp = [0x1aa, 0, 0, 0];
+                }
+                9 => {
+                    // CMD9 SEND_CSD (R2 long, 16-byte CSD): CSD v2.0
+                    // for our 4MB image (C_SIZE = 4MiB/512KiB - 1 = 7).
+                    // QEMU sd_set_csd v2.0 shape: CSD_STRUCTURE=01
+                    // (bits 127:126), TRAN_SPEED nominal, READ_BL_LEN
+                    // = 9 (512B), C_SIZE low 22 bits. Word order per
+                    // QEMU ldl_be_p(rsp[12,8,4,0]) mapping.
+                    self.sdh_rsp = [0x400E0032, 0x5B590000, 0x00000007, 0x00000000];
+                }
+                16 => {
+                    // CMD16 SET_BLOCKLEN (R1 ok): PIO always 512
+                    // (sd_exec ignores blockLen the same way).
+                    self.sdh_rsp = [R1_TRAN_READY, 0, 0, 0];
+                }
+                1 | 5 | 52 | 53 | 54 | 58 | 59 => {
+                    // ILLEGAL in SD mode (QEMU sd_proto_sd: sd_r0 =
+                    // no response): SDIO CMD52/CMD5 probe, MMC CMD1,
+                    // CMD53/54/58/59. Signal no-response via FAIL +
+                    // CMD_TIME_OUT (QEMU send_command error path) so
+                    // the driver times out cleanly ("no SDIO card")
+                    // instead of parsing a bogus R1 (which gave -22).
+                    self.sdh_cmd |= 0x4000; // FAIL_FLAG
+                    self.sdh_status |= 0x40; // CMD_TIME_OUT
+                }
+                41 if self.sdh_app_cmd => {
+                    // ACMD41 SD_APP_OP_COND (R3 OCR): busy on the first
+                    // poll after reset, ready after (QEMU ocr_power_timer
+                    // delay, collapsed to one poll here — the driver
+                    // polls in a loop, so one busy beat is enough).
+                    self.sdh_app_cmd = false;
+                    if self.sdh_ocr_ready {
+                        self.sdh_rsp = [OCR_READY, 0, 0, 0];
+                    } else {
+                        self.sdh_ocr_ready = true;
+                        self.sdh_rsp = [OCR_BUSY, 0, 0, 0];
+                    }
+                }
+                55 => {
+                    // CMD55 APP_CMD prefix: latch, R1 with APP_CMD bit
+                    // (QEMU sd.c sets expecting_acmd + APP_CMD status;
+                    // linux/mmc/sd_ops.c REQUIRES R1_APP_CMD or the
+                    // ACMD is rejected).
+                    self.sdh_app_cmd = true;
+                    self.sdh_rsp = [R1_TRAN_READY | 0x20, 0, 0, 0];
+                }
+                51 if self.sdh_app_cmd => {
+                    // ACMD51 SEND_SCR (R1 ok + 8-byte SCR data phase):
+                    // SCR = version 2.00 | SDSC 1/4-bit bus | no ext
+                    // security (QEMU sd_set_scr verbatim, spec v2 path).
+                    // The driver reads 8 bytes (blksz 8, 1 block) from
+                    // SDDATA; push the two words + set datacnt so the
+                    // read path below doesn't double-fill.
+                    self.sdh_app_cmd = false;
+                    self.sdh_rsp = [R1_TRAN_READY, 0, 0, 0];
+                    const SCR: [u8; 8] = [0x02, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+                    self.sdh_fifo_push(u32::from_le_bytes([SCR[0], SCR[1], SCR[2], SCR[3]]));
+                    self.sdh_fifo_push(u32::from_le_bytes([SCR[4], SCR[5], SCR[6], SCR[7]]));
+                    self.sdh_status |= 0x01; // DATA_FLAG
+                    if (self.sdh_cfg & (1 << 4)) != 0 {
+                        self.sdh_status |= 0x100; // SDIO_IRPT
+                    }
+                    // Consume the 8-byte transfer the driver programmed
+                    // (datacnt = hblc*hbct = 1*8); the generic read-fill
+                    // below must NOT also fire (it would append 8
+                    // sector bytes after the SCR).
+                    self.sdh_datacnt = 0;
+                }
+                _ if long_resp => {
+                    self.sdh_rsp = CID;
+                }
+                _ => {
+                    self.sdh_rsp = [0x900, 0, 0, 0];
+                }
+            }
+            let _ = arg;
+        }
+        // Data phase: reads fill the FIFO from the card sector, writes
+        // drain into it (PIO through SDDATA; datacnt = hblc*hbct set on
+        // SDHBLC write, QEMU SDHBLC arm verbatim).
+        if self.sdh_datacnt != 0 && (is_write || true) {
+            if is_read {
+                // Sector index = arg (block address; the driver uses
+                // block addressing after ACMD41/OCR negotiation).
+                let sec = arg as usize;
+                let mut n = 0u32;
+                let mut value = 0u32;
+                while self.sdh_datacnt > 0 && self.sdh_fifo_len < 16 {
+                    let blk = self.sd_read_sector(sec + (n as usize) / 128);
+                    let b = blk[((n as usize) % 512)];
+                    value |= (b as u32) << ((n % 4) * 8);
+                    self.sdh_datacnt -= 1;
+                    n += 1;
+                    if n % 4 == 0 {
+                        self.sdh_fifo_push(value);
+                        self.sdh_status |= 0x01; // DATA_FLAG
+                        if (self.sdh_cfg & (1 << 4)) != 0 {
+                            self.sdh_status |= 0x100; // SDIO_IRPT
+                        }
+                        value = 0;
+                    }
+                }
+                if n % 4 != 0 {
+                    self.sdh_fifo_push(value);
+                    self.sdh_status |= 0x01;
+                    if (self.sdh_cfg & (1 << 4)) != 0 {
+                        self.sdh_status |= 0x100;
+                    }
+                }
+            }
+        }
+        if ((self.sdh_cmd & 0x800) != 0) && ((self.sdh_cfg & (1 << 10)) != 0) {
+            self.sdh_status |= 0x400; // BUSY_IRPT (QEMU verbatim)
+        }
+        // M75e DATA IRQ on data-ready (driver bcm2835_irq needs it:
+        // the IRQ handler checks (DATA_FLAG && DATA_IRPT_EN) and wakes
+        // the threaded handler, which runs transfer_pio (SDDATA reads)
+        // and finishes the mrq. Without it host->mrq never completes
+        // and every data CMD times out as "timeout waiting for hardware
+        // interrupt" — proven by the ACMD51 register dump: CMD done
+        // (resp ok), data done (err 0), but no IRQ ever fired.
+        // QEMU sets SDIO_IRPT in fifo_run whenever DATA_FLAG is set
+        // and DATA_IRPT_EN (config bit 4) is on — for reads AND writes
+        // (both arms of fifo_run + the write-tail). BLOCK_IRPT stays
+        // DMA-write-only (QEMU fifo_run write path + our old arm was
+        // wrong: BLOCK fires only when BLOCK_IRPT_EN AND a DMA write
+        // completes a block; PIO reads never set it). The runner
+        // delivers via sdh_pending2 (IRQ 56) like USB bit 9 — the
+        // pending gate already covers SDIO_IRPT (0x100).
+        // SDEDM FSM: report DATAMODE (0x1) when idle so
+        // bcm2835_wait_transfer_complete exits immediately (our FIFO
+        // completes synchronously — no wait states exist).
+        // (BLOCK arm removed 2026-09-20: it fired on every datacnt==0
+        // command incl. non-data CMDs, which the driver's block_irq
+        // WARNs on (WARN_ON(!host->data)) — DATA path is the correct
+        // PIO completion IRQ per bcm2835_irq + bcm2835_data_irq.)
+        self.sdh_update_irq();
+    }
+    fn sdh_update_irq(&mut self) {
+        // IRQ = status & (BUSY|BLOCK|SDIO) — the runner folds this into
+        // the legacy line via sdh_pending() (like usb_pending1).
+        // (No direct line here; pending() reads status.)
+    }
+    /// Gated sdhost IRQ bit (GPU IRQ 56, per raspi_platform.h
+    /// INTERRUPT_SDIO + bcm2835_peripherals.c sdhost wiring): status
+    /// BUSY/BLOCK/SDIO bits gated on the IC bank-2 bit-24 enable
+    /// (56-32=24 in PENDING2, NOT PENDING1 — QEMU bcm2835_ic.c:
+    /// PENDING_2 = gpu_pending>>32, so IRQ 56 lands in bank 2;
+    /// BASIC bit 18 mirrors it via irq_dups[] index 8).
+    /// (First cut gated bank-1 bit 24 = GPU IRQ 24/DMA — wrong bank,
+    /// so the line never delivered and every data CMD timed out.)
+    pub fn sdh_pending2(&self) -> u32 {
+        if (self.sdh_status & (0x400 | 0x200 | 0x100)) != 0 && ((self.ic_en2 >> 24) & 1) != 0 {
+            1 << 24
         } else {
             0
         }
@@ -2056,6 +2372,14 @@ impl Bus {
 
     /// DMA control-block chain (mirrors dma.js dmaRunChain): walks up
     /// to 64 CBs in guest RAM. Returns true if the last CB had TI.INTEN.
+    /// M75h sdhost-DMA bridge (execution-proven need 2026-09-20): the
+    /// mmc driver uses DMA (not PIO) for block reads — zero SDDATA
+    /// reads in 30M insns — with the DMA engine programmed for the
+    /// sdhost SDDATA register (src/dst = SDHOST_BASE+0x40). Route
+    /// those transfers through the sdhost FIFO: device->RAM reads pop
+    /// FIFO words (refilling from the card sector like PIO), RAM->
+    /// device writes push FIFO words. Non-sdhost transfers use the
+    /// plain RAM path below unchanged.
     fn dma_run_chain(&mut self, conblk: u64) -> bool {
         let mut cb = conblk & !0x1f;
         let mut inten = false;
@@ -2075,7 +2399,11 @@ impl Bus {
             let dst = rd(8) as u64;
             let len = (rd(12) & 0xfffff) as u64;
             if len != 0 {
-                self.dma_transfer(ti, src, dst, len);
+                if src == SDHOST_BASE + 0x40 || dst == SDHOST_BASE + 0x40 {
+                    self.dma_sdhost_transfer(ti, src, dst, len);
+                } else {
+                    self.dma_transfer(ti, src, dst, len);
+                }
             }
             if ti & (1 << 31) != 0 {
                 inten = true;
@@ -2083,6 +2411,64 @@ impl Bus {
             cb = rd(20) as u64 & !0x1f;
         }
         inten
+    }
+
+    /// M75h sdhost-DMA transfer: one side of the CB is the sdhost
+    /// SDDATA FIFO register (SDHOST_BASE+0x40), the other side is a
+    /// RAM buffer. Direction by address: SDDATA->RAM = card read
+    /// (FIFO words popped into RAM, refilling from the current read
+    /// sector like the PIO fill); RAM->SDDATA = card write (FIFO
+    /// words pushed from RAM). After the transfer, complete the data
+    /// phase like a PIO completion (datacnt=0, DATA_FLAG + SDIO_IRPT
+    /// when enabled) so the driver's IRQ path finishes the mrq.
+    /// (The driver's PIO-vs-DMA choice is use_dma from the DMA
+    /// channel request — always DMA here since our DMA engine
+    /// exists; QEMU wires the same channel.)
+    fn dma_sdhost_transfer(&mut self, ti: u32, src: u64, dst: u64, len: u64) {
+        const SDDATA: u64 = SDHOST_BASE + 0x40;
+        let src_inc = ti & 1 != 0;
+        let dst_inc = ti & 2 != 0;
+        let mut rem = len & !3; // word-multiple; trailing bytes ignored (PIO-aligned)
+        if src == SDDATA && self.in_ram(dst, rem) {
+            // Card read: FIFO -> RAM.
+            let mut d = dst;
+            while rem >= 4 {
+                let w = self.sdh_fifo_pop() as u32;
+                // Refill from the read sector while datacnt remains
+                // (matches the PIO fill pacing; keeps FIFO non-empty
+                // across multi-block transfers).
+                let a = d as usize;
+                self.mem[a..a + 4].copy_from_slice(&w.to_le_bytes());
+                if dst_inc {
+                    d += 4;
+                }
+                rem -= 4;
+            }
+        } else if dst == SDDATA && self.in_ram(src, rem) {
+            // Card write: RAM -> FIFO.
+            let mut s = src;
+            while rem >= 4 {
+                let a = s as usize;
+                let w = u32::from_le_bytes([self.mem[a], self.mem[a + 1], self.mem[a + 2], self.mem[a + 3]]);
+                self.sdh_fifo_push(w);
+                if src_inc {
+                    s += 4;
+                }
+                rem -= 4;
+            }
+        } else {
+            // Neither side is RAM-reachable: fall back to plain copy
+            // (honest no-op rather than a fault).
+            self.dma_transfer(ti, src, dst, len);
+            return;
+        }
+        // Data-phase completion (mirrors the PIO tail): the transfer
+        // consumed the programmed blocks.
+        self.sdh_datacnt = 0;
+        self.sdh_status |= 0x01; // DATA_FLAG
+        if (self.sdh_cfg & (1 << 4)) != 0 {
+            self.sdh_status |= 0x100; // SDIO_IRPT
+        }
     }
 
     /// I2C sensor read (mirrors i2c.js slaveRead): WHO_AM_I 0x68,
@@ -2494,18 +2880,22 @@ impl Bus {
             // saw, so a zero-BASIC read with a live line is proven (not
             // inferred) and vice versa.
             let v: u64 = match off {
-                // PENDING2 (GPIO bit 17 + UART bit 25) + BASIC mirrors
-                // (bit 9 for GPIO, bit 19 shortcut for UART) + bank-0
-                // bit 1 for MAILBOX (M61 IRQ path, DTB-proven) + bank-1
-                // bit 9 for USB (M67: INTERRUPT_USB = GPU IRQ 9, served
-                // in PENDING1; BASIC bit 8 mirrors any non-shortcut
-                // bank-1 line incl. USB, like timer/DMA).
-                0x08 => (self.gpio_pending2() | self.uart_pending2()) as u64,
+                // PENDING2 (GPIO bit 17 + UART bit 25 + SDIO bit 24)
+                // + BASIC mirrors (bit 9 GPIO, bit 19 UART shortcut,
+                // bit 18 SDIO via irq_dups[8]) + bank-0 bit 1 MAILBOX
+                // (M61 IRQ path, DTB-proven) + bank-1 bit 9 USB (M67:
+                // INTERRUPT_USB = GPU IRQ 9, served in PENDING1; BASIC
+                // bit 8 mirrors any non-shortcut bank-1 line incl.
+                // USB, like timer/DMA).
+                0x08 => (self.gpio_pending2() | self.uart_pending2() | self.sdh_pending2()) as u64,
                 0x04 => (self.timer_pending1() | self.dma_pending1() | self.usb_pending1()) as u64,
                 0x00 => {
                     let mut b = 0u64;
                     if self.timer_pending1() | self.dma_pending1() | self.usb_pending1() != 0 {
                         b |= 1 << 8; // any non-shortcut bank-1 line
+                    }
+                    if self.sdh_pending2() != 0 {
+                        b |= 1 << 18; // IRQ 56 via irq_dups[8] (QEMU verbatim)
                     }
                     if self.gpio_pending2() != 0 {
                         b |= 1 << 9;
@@ -2625,6 +3015,21 @@ impl Bus {
         if Self::is_clk(addr, size) || Self::is_i2s(addr, size) || Self::is_i2c0(addr, size) {
             return Ok(0); // untouched windows read zero, like the facade
         }
+        // (Second sdhost read arm — DELETED 2026-09-20: it duplicated
+        // the arm above line-for-line. Harmless while both agree, but
+        // any future fix applied to only one would fork the model
+        // silently. The single read arm lives ABOVE near the SMP arm.)
+        // M74d peripheral umbrella: any other touch inside
+        // 0x3f000000..0x3f200000 reads zero (unmodeled peripheral
+        // register file — MPHI, CPRMAN leftovers, reserved gaps).
+        // Placed AFTER every modeled window above so real devices
+        // keep priority; only the gaps land here.
+        if Self::is_periph(addr, size) {
+            if std::env::var("PERIPHTRACE").is_ok() {
+                eprintln!("PERIPHRD {:#x} sz={}", addr, size);
+            }
+            return Ok(0);
+        }
         if Self::is_uart25(addr, size) {
             let bases = [UART2_BASE, UART3_BASE, UART4_BASE, UART5_BASE];
             let mut k = 0usize;
@@ -2729,9 +3134,55 @@ impl Bus {
             };
             return Ok(v & mask(size));
         }
+        // M75 sdhost READ side (BCM2835 SD host, 0x3F202000; QEMU
+        // bcm2835_sdhost.c register map verbatim — see the WRITE-SIDE
+        // comment for the full map). PLACEMENT (load-bearing): this arm
+        // sits BEFORE the SMP spin-table arm below (same address
+        // SMP_BASE == SDHOST_BASE) and BEFORE the periph umbrella.
+        // In linux_mode it wins; bare-metal falls through to SMP.
+        // (First cut placed a DUPLICATE of this arm AFTER the SMP arm
+        // — the SMP byte backing swallowed all 11k sdhost touches and
+        // the driver saw only zeros, proven by 0 SDHRD lines with
+        // SDTRACE on. The duplicate is deleted; THIS is the only
+        // sdhost read arm.)
+        if self.linux_mode && Self::is_page(addr, size, SDHOST_BASE) {
+            let off = addr - SDHOST_BASE;
+            if std::env::var("SDTRACE").is_ok() {
+                eprintln!("SDHRD off=0x{:x} sz={}", off, size);
+            }
+            let v: u64 = match off {
+                0x00 => self.sdh_cmd as u64,
+                0x10 | 0x14 | 0x18 | 0x1c => {
+                    let i = ((off - 0x10) / 4) as usize;
+                    self.sdh_rsp[i] as u64
+                }
+                0x20 => self.sdh_status as u64,
+                0x30 => self.sdh_vdd as u64,
+                // SDEDM+0x34: M75f PIO FIFO count + M75e FSM idle —
+                // see the sdhost read arm above (the live arm carries
+                // the full comment; this write-side duplicate served
+                // the STALE raw edm until 2026-09-20). Live fifo_len
+                // in bits[8:4] + FSM DATAMODE in bits[3:0]; upper
+                // bits preserved.
+                0x34 => ((self.sdh_edm & !0x1ff) | ((self.sdh_fifo_len as u32 & 0x1f) << 4) | 0x1) as u64,
+                0x38 => self.sdh_cfg as u64,
+                0x3c => self.sdh_hbct as u64,
+                0x40 => self.sdh_fifo_pop(),
+                0x50 => self.sdh_hblc as u64,
+                // SDTOUT+0x08/SDCDIV+0x0C: write-only dividers, read 0.
+                _ => 0,
+            };
+            return Ok(v & mask(size));
+        }
         // SMP spin-table window: plain byte backing (the SmpShared
         // arbiter in runner.rs mirrors it per core per chunk).
-        if Self::is_smp(addr, size) {
+        // M75: in linux_mode this address is the sdhost controller
+        // instead (see the sdhost arm ABOVE — sdhost read precedes
+        // here; bare-metal falls through to here). The sdhost arm
+        // MUST stay above: it once sat AFTER the SMP arm, so the SMP
+        // byte backing swallowed all 11k sdhost touches (0 SDHRD
+        // lines with SDTRACE on).
+        if !self.linux_mode && Self::is_smp(addr, size) {
             let mut w = 0u64;
             for i in 0..size {
                 let o = addr - SMP_BASE + i;
@@ -3050,6 +3501,61 @@ impl Bus {
         if std::env::var("SDTRACE").is_ok() && Self::is_sd(addr, size) {
             eprintln!("SDWR {:#x} sz={} val={:#x}", addr, size, val);
         }
+        // M75 sdhost write path (linux_mode only; QEMU SDCMD/SDHSTS/
+        // SDEDM/SDHCFG/SDVDD/SDHBLC arms verbatim). Precedes the SMP
+        // arm like the read side (same address, linux-gated split).
+        if self.linux_mode && Self::is_page(addr, size, SDHOST_BASE) {
+            let off = addr - SDHOST_BASE;
+            let v = (val & mask(size)) as u32;
+            if std::env::var("SDTRACE").is_ok() {
+                eprintln!("SDHWR off=0x{:x} val={:#x}", off, v);
+            }
+            match off {
+                0x00 => {
+                    self.sdh_cmd = v;
+                    if (v & 0x8000) != 0 {
+                        self.sdh_send_command();
+                        self.sdh_cmd &= !0x8000; // NEW_FLAG self-clears
+                    }
+                }
+                0x04 => self.sdh_cmdarg = v,
+                0x20 => {
+                    self.sdh_status &= !v; // W1C (QEMU SDHSTS arm)
+                }
+                0x30 => self.sdh_vdd = v,
+                0x34 => {
+                    let mut w = v;
+                    if (w & 0xf) == 0xf {
+                        w &= !0xf; // power-down guard (QEMU SDEDM arm)
+                    }
+                    self.sdh_edm = w;
+                }
+                0x38 => {
+                    self.sdh_cfg = v;
+                    // M75g SDIO recompute (QEMU SDHCFG arm runs
+                    // fifo_run verbatim): enabling DATA_IRPT_EN with
+                    // DATA_FLAG already set must raise SDIO_IRPT
+                    // immediately (the driver programs CFG=0x41a AFTER
+                    // the data is already in the FIFO — proven: CFG
+                    // 0x40a->0x41a at 8.5B with HSTS=0x101 stuck,
+                    // pend=0 forever). Without this the IRQ never
+                    // fires and every data CMD times out.
+                    if ((self.sdh_cfg & (1 << 4)) != 0) && ((self.sdh_status & 0x01) != 0) {
+                        self.sdh_status |= 0x100;
+                    }
+                }
+                0x3c => self.sdh_hbct = v,
+                0x40 => {
+                    self.sdh_fifo_push(v);
+                }
+                0x50 => {
+                    self.sdh_hblc = v;
+                    self.sdh_datacnt = self.sdh_hblc.wrapping_mul(self.sdh_hbct);
+                }
+                _ => {} // SDTOUT/SDCDIV/reserved absorb
+            }
+            return Ok(());
+        }
         if Self::is_sd(addr, size) {
             let off = addr - SD_BASE;
             let v = (val & mask(size)) as u32;
@@ -3183,6 +3689,13 @@ impl Bus {
             return Ok(());
         }
         if Self::is_clk(addr, size) || Self::is_i2s(addr, size) || Self::is_i2c0(addr, size) {
+            return Ok(());
+        }
+        // M74d peripheral umbrella (write side): absorb.
+        if Self::is_periph(addr, size) {
+            if std::env::var("PERIPHTRACE").is_ok() {
+                eprintln!("PERIPHWR {:#x} sz={} val={:#x}", addr, size, val & mask(size));
+            }
             return Ok(());
         }
         if Self::is_uart25(addr, size) {
@@ -3497,8 +4010,10 @@ impl Bus {
             }
             return Ok(());
         }
-        // SMP spin-table window: plain byte backing.
-        if Self::is_smp(addr, size) {
+        // SMP spin-table window: plain byte backing. M75: linux-gated
+        // like the read side (sdhost owns this page in linux_mode;
+        // its write arm precedes this one — see above).
+        if !self.linux_mode && Self::is_smp(addr, size) {
             for i in 0..size {
                 let o = addr - SMP_BASE + i;
                 if (o as usize) < self.smp_mem.len() {
@@ -4974,6 +5489,9 @@ impl Cpu {
                 // encodings from assembler truth (mrs x1,sp_el0=
                 // 0xD5384101 — op2 carries the Rd low bit, gate on
                 // crm==1, not the exact word).
+                // Bit21 = L: MRS=0xD538 (L=1), MSR=0xD518 (L=0) —
+                // assembler-proven (spdir.s). So l==0 is MSR-write
+                // and l==1 is MRS-read, matching every sibling arm.
                 if l == 0 {
                     self.sp_el0 = self.r(rd);
                 } else {
@@ -7901,6 +8419,34 @@ fn patch_dtb_chosen(bus: &mut Bus, initrd_len: u64) {
     // matches the emulation reality. The "EFI services will not be
     // available" line just above it is NORMAL on every platform
     // without UEFI (qemu raspi3ap prints it too) — not an error.
+    // M74 trace-init SHORTEN (execution-proven 2026-09-19): the 2B stall
+    // tail is two hung tasks — kworker in event_trace_init (rwsem) and
+    // swapper in init_kprobe_trace (mutex) — grinding the 1cf000
+    // char-parser + weigh loop with zero console growth past 17921 B
+    // (2B->5B marathon: con frozen, irqs +3k/100M, pc wanders). Skip
+    // both initcalls via the blacklist (oracle module.js minimal +
+    // these two); drivers re-enable one model at a time as usual.
+    // M74b VERDICT (execution-proven, REVERTED to stock minimal): the
+    // blacklist does NOT skip the hung path — with the two initcalls
+    // blacklisted the 2B run still parks at tail `vgaarb: loaded`
+    // (con 9190, mbox_pending=1, drains=[]) because the firmware
+    // transaction timeout fires first and the tracer/kprobe waits are
+    // symptoms, not the cause. The blacklist is therefore USELESS for
+    // forward progress (it only moves con 17921->9190 by skipping
+    // unrelated drivers) and DIVERGES from the oracle cmdline, so it
+    // stays stock-minimal. Real fix must unblock the mailbox tx loop
+    // (idc tablebase 0x0 + watchdog node never ready — see M74c).
+    // M74e root-from-initrd, VERDICT (execution-proven 2026-09-19):
+    // BOTH ramdisk variants FAIL. root=/dev/ram0 alone REGRESSED
+    // (con 9041, tail vgaarb, irqs frozen at 17091); root=/dev/ram0
+    // + rdinit=/sbin/init was WORSE (con 8939, irqs frozen 17095,
+    // boots SHORTER — the ramdisk path starves before the mailbox
+    // tx loop even runs). The mmcblk0 root is the ONLY path that
+    // reaches the 10.3B VFS panic with con 223k (kernel alive through
+    // certs/fscrypt, mounts ram0 ext4 itself, then fails the pivot
+    // for lack of SDHCI/DMA block). So root STAYS mmcblk0 (oracle
+    // cmdline) and the real work is the SDHCI/DMA block path toward
+    // a genuine root mount — NOT ramdisk shortcuts.
     let bootargs = b"earlycon=pl011,0x3f201000 console=ttyAMA0,115200 lpj=7000000 nokaslr mitigations=off nowatchdog nosoftlockup audit=0 cgroup_disable=memory ipv6.disable=1 cryptomgr.notests loglevel=8 maxcpus=1 root=/dev/mmcblk0 rootfstype=ext4 rootwait initcall_blacklist=bcm2835_pm_driver_init,bcm2835_cpufreq_init,bcm2835_wdt_init,leds-gpio,thermal,gpio-fan,pwm-fan,dwc2,xhci-hcd,smsc95xx,usb_ernet,rndis_host,cdc_ether,usb-storage,sdhci-iproc,i2c-bcm2835,spi-bcm2835,bcm2835-rng,brcmstb_thermal,snd_bcm2835,vchiq,snd_pcm,snd_timer,snd,soundcore,joydev,rfkill,bcm2835_v4l2,cfg80211,rfkill_gpio\0";
     // M60 memory@0 FIX (console-proven: the stock DTB's memory@0 reg is
     // all-ZERO — qemu fills real RAM size via -m 512M; without it the
