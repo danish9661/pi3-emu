@@ -108,6 +108,10 @@ impl Runner {
                 bus.uart0_push(self.keys.remove(0).1);
             }
             bus.sync_out();
+            // M76 storm-watch chunk tag: the sdhost model snapshots
+            // these when the CMD13 storm declares (Bus has no pc/n).
+            bus.sdh_chunk_n = self.n;
+            bus.sdh_chunk_pc = cpu.pc;
             // Actuation (facade runSlice start: irqResume || irqVector, both
             // cleared unconditionally once consumed-or-not).
             let do_resume = self.resume_armed;
@@ -254,6 +258,16 @@ impl Runner {
                 cpu.daif = 0xf;
                 self.saved_pc = Some(cpu.pc);
                 self.irqs += 1;
+                // M76s delivery-source trace (DMATRACE-gated + dma_trace
+                // armed): proves DMA/sdhost IRQs deliver (vs latch but
+                // never deliver). Zero-cost otherwise.
+                if bus.dma_trace && std::env::var("DMATRACE").is_ok() {
+                    let dp1 = bus.dma_pending1();
+                    let sp2 = bus.sdh_pending2();
+                    if dp1 != 0 || sp2 != 0 {
+                        eprintln!("DMADLV n={} pc=0x{:x} dma_p1=0x{:x} sdh_p2=0x{:x}", self.n, cpu.pc, dp1, sp2);
+                    }
+                }
                 if self.irq_pcs.len() < 8 {
                     self.irq_pcs.push(cpu.pc);
                 }

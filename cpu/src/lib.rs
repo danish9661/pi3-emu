@@ -383,16 +383,6 @@ pub struct Bus {
     /// `WWATCH` trace line with the store's own `size`/`val` and the
     /// value already there. The CALLER (Cpu::step, which owns the guest
     /// pc) appends the pc — see the `WWATCH` site there.
-    /// PROVEN (ww.err 2B run, 2.75M hits): PA 0x1e28008 = [sp_el0+8] is
-    /// the shared completion word — the weigh/wake pair from the stall
-    /// loop (`...0c1828 sub+str` / `...0c28b0 add+str`) plus sibling
-    /// sites with the IDENTICAL `ldr w1,[x0,#8] / add w1,w1,#1` /
-    /// `str w1,[x0,#8]` shape (`...1c0b48/68/ec/c00`, `...1c0774/94/
-    /// d0/e8`). The advancer is normal guest code, NOT the mailbox IRQ
-    /// handler (ICRD=0 everywhere) — so no handler exists to complete
-    /// inline in mbox_process; the completion must come from the
-    /// already-written synchronous reply being OBSERVED (see the
-    /// M63 note on mbox_process).
     /// `wwatch_hits` counts watch log lines so step emits the pc tag
     /// ONLY on steps that actually hit (exact volume, no flood).
     pub wwatch_on: bool,
@@ -427,12 +417,41 @@ pub struct Bus {
     // guest writes persist and read back until sync overwrites); END/INT
     // latch on chain completion at sync_in; CS reads serve backing (the
     // publish overwrites it every sync_out, so ACTIVE never echoes back
-    // past a boundary — same as the facade).
-    dma_back: [u32; 256],
+    // past a boundary — same as the facade). M76: dma_back is 1024
+    // words so all 16 channels (0x100 stride) fit; the old 256-word
+    // backing silently dropped channel 4+ CONBLK writes (idx 257+
+    // out of range → write vanished, dma_chains=0 across 8.8B).
+    dma_back: [u32; 1024],
     dma_en_back: [u32; 256],
     dma_end: bool,
     dma_int: bool,
+    /// M76 per-channel END/INT latches (the old shared dma_end/
+    /// dma_int OR-ed all channels into ch0's bit; channel 4's IRQ
+    /// needs its own bit 20). dma_end/dma_int stay as shared ORs
+    /// for the publish path + legacy readers.
+    dma_end_ch: [bool; 16],
+    dma_int_ch: [bool; 16],
+    /// M76s per-channel guest-ACK flag (INT written by the guest;
+    /// the publish's INT never sets this).
+    dma_ack_ch: [bool; 16],
     dma_last_cs: u32,
+    /// M76 per-channel last published CS (ACTIVE-rising edge per
+    /// channel; the old single dma_last_cs only watched ch0).
+    dma_last_cs_ch: [u32; 16],
+    /// M76 DMA triage counters (zero-cost unless read): chains run
+    /// + sdhost-routed transfers. Proves by execution whether the
+    /// driver's chain ever reached the engine.
+    pub dma_chains_run: u64,
+    pub dma_sdhost_hits: u64,
+    /// M76i last DMA dst first-word sample (DMATRACE triage: proves
+    /// the copy landed real bytes, not zeros).
+    pub dma_last_dst_sample: u32,
+    /// M76j last DMA dst magic@1080 sample (proves sector payload).
+    pub dma_last_dst_magic: u16,
+    /// M76 DMA write trace (DMATRACE=1 env, zero-cost off): logs
+    /// channel CS/CONBLK_AD/ENABLE writes so the driver's channel
+    /// + chain address are proven by execution.
+    pub dma_trace: bool,
     // MMU_CTL compat window (0x3F00D000 — mirrors the host-assisted
     // model for the mmu guest): writing root|1 programs the REAL
     // stage-1 regime (TTBR0=root, T0SZ=16 48-bit 4K, MAIR, SCTLR.M)
@@ -473,6 +492,30 @@ pub struct Bus {
     /// ready flag (first ACMD41 reports busy, later ones ready).
     sdh_app_cmd: bool,
     sdh_ocr_ready: bool,
+
+    /// M76 read-stream cursor (refill-on-pop): starting sector +
+    /// bytes consumed for the CURRENT read transfer, latched at
+    /// send_command when is_read && datacnt > 0. `sdh_read_active`
+    /// gates the refill; cleared when the stream drains (datacnt
+    /// hits 0) or a non-read command issues (stale-clear, same
+    /// rule as datacnt).
+    sdh_read_active: bool,
+    sdh_read_sec: usize,
+    sdh_read_off: u32,
+    /// M76 CMD13-storm watch (triage only): counts consecutive CMD13
+    /// completions; when the count first reaches 20, snapshots the
+    /// runner's `n` + guest pc (written by the runner pre-chunk) so
+    /// the storm's start is proven by execution. Zero-cost unless
+    /// armed (`sdh_storm_watch`); never fires in wasm.
+    /// `sdh_chunk_n`/`sdh_chunk_pc` are ALSO the n-stamp source for
+    /// the SDHCMD/SDHSTSV log lines, so they are written by the
+    /// runner every chunk regardless of the watch.
+    pub sdh_storm_watch: bool,
+    pub sdh_storm_count: u32,
+    pub sdh_storm_n: u64,
+    pub sdh_storm_pc: u64,
+    pub sdh_chunk_n: u64,
+    pub sdh_chunk_pc: u64,
     // PWM (0x3F20C000 — mirrors pwm.js FIFO mode): CTL latch + FIFO
     // queue drained 64/chunk into a sample ring (browser audio reads
     // it via pwm_take). STA/FULL/EMPT published at sync_out.
@@ -609,11 +652,20 @@ impl Bus {
             fb_depth: 0,
             fb_pitch: 0,
             fb_ready: false,
-            dma_back: [0; 256],
+            dma_back: [0; 1024],
             dma_en_back: [0; 256],
             dma_end: false,
             dma_int: false,
+            dma_end_ch: [false; 16],
+            dma_int_ch: [false; 16],
+            dma_ack_ch: [false; 16],
             dma_last_cs: 0,
+            dma_last_cs_ch: [0; 16],
+            dma_chains_run: 0,
+            dma_sdhost_hits: 0,
+            dma_last_dst_sample: 0,
+            dma_last_dst_magic: 0,
+            dma_trace: false,
             mmu_ctl_cell: 0,
             mmu_done_cell: 0,
             mmu_loose: false,
@@ -633,6 +685,15 @@ impl Bus {
             sdh_datacnt: 0,
             sdh_app_cmd: false,
             sdh_ocr_ready: false,
+            sdh_read_active: false,
+            sdh_read_sec: 0,
+            sdh_read_off: 0,
+            sdh_storm_watch: false,
+            sdh_storm_count: 0,
+            sdh_storm_n: 0,
+            sdh_storm_pc: 0,
+            sdh_chunk_n: 0,
+            sdh_chunk_pc: 0,
             pwm_back: [0; 32],
             pwm_ctl: 0,
             pwm_last_ctl: 0,
@@ -841,6 +902,23 @@ impl Bus {
 
     fn sd_read_sector(&self, sec: usize) -> [u8; 512] {
         self.sd_disk.get(sec & 0xffff).copied().unwrap_or([0; 512])
+    }
+
+    /// M76 triage: first 64 bytes of sd_disk sector 0 (proves what
+    /// the card model serves for the partition-table read).
+    pub fn sd_disk0_64(&self) -> Vec<u8> {
+        self.sd_disk.first().map(|s| s[..64].to_vec()).unwrap_or(vec![0; 64])
+    }
+    /// M76 triage: sd_disk sector count.
+    pub fn sd_disk_len(&self) -> usize {
+        self.sd_disk.len()
+    }
+    /// M76 triage: sdhost FIFO/datacnt state (proves the data phase).
+    pub fn sdh_fifo_len_pub(&self) -> usize {
+        self.sdh_fifo_len
+    }
+    pub fn sdh_datacnt_pub(&self) -> u32 {
+        self.sdh_datacnt
     }
 
     fn sd_write_sector(&mut self, sec: usize, data: [u8; 512]) {
@@ -1229,17 +1307,24 @@ impl Bus {
         (self.tmr_pending & 0xf) & self.ic_en1
     }
 
-    /// Gated bank-1 DMA0 bit (facade icLines dma0: CS.INT latched while
-    /// the channel is enabled; enable read live from the window backing
-    /// — the decision runs post-chunk like the facade's line()).
+    /// Gated bank-1 DMA bits (M76: per-channel; the old code served
+    /// bit 16/DMA0 only). Each channel's INT latches on chain
+    /// completion; the bit served is 16+ch (GPU IRQ 16+ch: the DTB
+    /// wires dma0..dma12 to GPU IRQs 16..28). NO ic_en1 gate
+    /// (M76b: the bcm2835-dma engine has no per-channel enable on
+    /// the IRQ path either — DMATRACE proves zero ENABLE writes
+    /// across 8.8B while the driver acks ch4's IRQ; gating on
+    /// enable would starve every dmaengine IRQ). The dma guest
+    /// (ch0) path is unchanged (bit 16).
     /// Public for the M61 triage probe (per-source line state).
     pub fn dma_pending1(&self) -> u32 {
-        let enable = self.dma_en_back.get(0x50 / 4).copied().unwrap_or(0);
-        if self.dma_int && (enable & 1) != 0 {
-            (1 << 16) & self.ic_en1
-        } else {
-            0
+        let mut p = 0u32;
+        for ch in 0..16u32 {
+            if self.dma_int_ch[ch as usize] {
+                p |= 1 << (16 + ch);
+            }
         }
+        p
     }
 
     /// Gated bank-2 bits (for PENDING2/BASIC reads).
@@ -1267,6 +1352,26 @@ impl Bus {
     }
     pub fn ic_en0_pub(&self) -> u32 {
         self.ic_en0
+    }
+    /// M76 probe helpers: bank-1/bank-2 enable cells + sdhost status
+    /// (the sdhost IRQ gate needs ic_en2-bit24; enable regs read 0 on
+    /// real HW so probes read model state, not MMIO).
+    pub fn ic_en1_pub(&self) -> u32 {
+        self.ic_en1
+    }
+    pub fn ic_en2_pub(&self) -> u32 {
+        self.ic_en2
+    }
+    pub fn sdh_status_pub(&self) -> u32 {
+        self.sdh_status
+    }
+    /// M76 DMA enable state (triage): facade page + real 0xFF0 reg.
+    pub fn dma_enable_pub(&self) -> u32 {
+        self.dma_en_back[(0x50 / 4) as usize] | self.dma_back[(0xFF0 / 4) as usize]
+    }
+    /// M76 DMA ch4 CS/CONBLK cells (triage: the driver's channel).
+    pub fn dma_ch4_pub(&self) -> (u32, u32) {
+        (self.dma_back[4 * 64], self.dma_back[4 * 64 + 1])
     }
     /// M61 probe helper: local per-core timer enable cell (gates the
     /// CORE_IRQ_SRC arch-timer bits and the runner's cntp delivery).
@@ -1312,6 +1417,35 @@ impl Bus {
         let v = self.sdh_fifo[self.sdh_fifo_pos] as u64;
         self.sdh_fifo_len -= 1;
         self.sdh_fifo_pos = (self.sdh_fifo_pos + 1) & 15;
+        // M76 REFILL-ON-POP (QEMU fifo_run parity): the 16-deep FIFO
+        // holds at most 64 bytes, but block reads (CMD17/18, datacnt
+        // up to 4096) stream through it. QEMU refills from the card
+        // on every SDDATA read while datacnt remains; without this
+        // the DMA/PIO drain gets the first 16 words then underflow
+        // zeros, and the transfer times out ('timeout waiting for
+        // hardware interrupt' on every CMD18, proven 8.8B). Refill
+        // one word per pop from the read stream while the current
+        // read transfer is active; DATA_FLAG stays set (more data).
+        if self.sdh_read_active && self.sdh_datacnt > 0 {
+            let mut w = 0u32;
+            for i in 0..4 {
+                if self.sdh_datacnt == 0 {
+                    break;
+                }
+                let sec = self.sdh_read_sec + (self.sdh_read_off as usize) / 512;
+                let blk = self.sd_read_sector(sec);
+                w |= (blk[(self.sdh_read_off as usize) % 512] as u32) << (8 * i);
+                self.sdh_read_off += 1;
+                self.sdh_datacnt -= 1;
+            }
+            // (datacnt>0 guaranteed at least one byte above, so w
+            // is a real word; even a partial tail word completes.)
+            self.sdh_fifo_push(w);
+            self.sdh_status |= 0x01; // DATA_FLAG
+            if (self.sdh_cfg & (1 << 4)) != 0 {
+                self.sdh_status |= 0x100; // SDIO_IRPT
+            }
+        }
         v
     }
     fn sdh_fifo_push(&mut self, value: u32) {
@@ -1348,6 +1482,23 @@ impl Bus {
         let is_write = (self.sdh_cmd & 0x80) != 0;
         let no_resp = (self.sdh_cmd & 0x400) != 0;
         let long_resp = (self.sdh_cmd & 0x200) != 0;
+        // M76 CMD completion log (SDTRACE-gated, zero-cost off): the
+        // model state sampled at chunk edges always shows CMD=0/RSP=0
+        // (NEW_FLAG self-clears + RSP consumed intra-chunk), so the
+        // ident-gate question "did ACMD41 complete?" is unanswerable
+        // without this. Logs idx/arg/resp0 at completion time.
+        // M76r: chunk_n stamps every CMD (correlates CMDs with
+        // console virtual-time + probe samples).
+        macro_rules! sdh_log {
+            () => {
+                if std::env::var("SDTRACE").is_ok() {
+                    eprintln!(
+                        "SDHCMD n={} idx={} arg=0x{:x} rsp0=0x{:08x}",
+                        self.sdh_chunk_n, idx, arg, self.sdh_rsp[0]
+                    );
+                }
+            };
+        }
         // Response (card model): QEMU hw/sd/sd.c dispatch verbatim
         // (sd_proto_sd for our SD card + sd_cmd_SEND_OP_CMD for the
         // shared CMD1/ACMD41 slot). SDIO probe CMDs (52/5) and MMC
@@ -1366,7 +1517,17 @@ impl Bus {
         if !no_resp {
             match idx {
                 2 => {
-                    self.sdh_rsp = CID;
+                    // CID (R2 long): QEMU order is LSB-first on the
+                    // wire regs — s->rsp[0]=BE(rsp[12..15]) (LSB),
+                    // s->rsp[3]=BE(rsp[0..3]) (MSB) — so the driver
+                    // (resp[3-i]=SDRSPi + memcpy + UNSTUFF_BITS from
+                    // index 0 = MSB) parses MSB from csd[0]. Serve
+                    // reversed vs the MSB-first CID literal (proven:
+                    // MSB-first gave CSD_STRUCTURE=0 -> 'lacks
+                    // mandatory SD Status/switch' + half-init card +
+                    // no mmcblk0 + VFS panic, 8.8B run).
+                    self.sdh_rsp = [CID[3], CID[2], CID[1], CID[0]];
+                    sdh_log!();
                 }
                 3 => {
                     self.sdh_rsp = [0x12340000, 0, 0, 0];
@@ -1379,45 +1540,121 @@ impl Bus {
                     // for our 4MB image (C_SIZE = 4MiB/512KiB - 1 = 7).
                     // QEMU sd_set_csd v2.0 shape: CSD_STRUCTURE=01
                     // (bits 127:126), TRAN_SPEED nominal, READ_BL_LEN
-                    // = 9 (512B), C_SIZE low 22 bits. Word order per
-                    // QEMU ldl_be_p(rsp[12,8,4,0]) mapping.
-                    self.sdh_rsp = [0x400E0032, 0x5B590000, 0x00000007, 0x00000000];
+                    // = 9 (512B). Word order LSB-first (same QEMU
+                    // ldl_be_p(rsp[12,8,4,0]) mapping as CID above —
+                    // MSB-first here parsed as CSD_STRUCTURE=0,
+                    // proven by the 8.8B 'lacks mandatory' warnings +
+                    // VFS panic).
+                    // M76h C_SIZE placement (execution-proven: kernel
+                    // said "512 KiB" = C_SIZE 0): full v2.0 assembly
+                    // (bit-verified: STRUCTURE/CCC/C_SIZE decode back
+                    // correctly through the driver's UNSTUFF_BITS):
+                    // w3 = STRUCTURE(01)+TAAC(0x0E)+TRAN_SPEED(0x32),
+                    // w2 = CCC(0x5B5)+READ_BL_LEN(9), w1 = C_SIZE(7)
+                    // at bits 63:48 + ERASE(0x7F), w0 = R2W(2) +
+                    // WRITE_BL_LEN(9). LSB-first on the wire regs.
+                    self.sdh_rsp = [0x0A400000, 0x00077F00, 0x5B590000, 0x400E0032];
+                    sdh_log!();
                 }
                 16 => {
                     // CMD16 SET_BLOCKLEN (R1 ok): PIO always 512
                     // (sd_exec ignores blockLen the same way).
                     self.sdh_rsp = [R1_TRAN_READY, 0, 0, 0];
                 }
-                1 | 5 | 52 | 53 | 54 | 58 | 59 => {
+                52 | 53 | 54 | 58 | 59 => {
                     // ILLEGAL in SD mode (QEMU sd_proto_sd: sd_r0 =
-                    // no response): SDIO CMD52/CMD5 probe, MMC CMD1,
-                    // CMD53/54/58/59. Signal no-response via FAIL +
-                    // CMD_TIME_OUT (QEMU send_command error path) so
-                    // the driver times out cleanly ("no SDIO card")
-                    // instead of parsing a bogus R1 (which gave -22).
+                    // no response): SDIO CMD52 probe, CMD53/54/58/59.
+                    // Signal no-response via FAIL + CMD_TIME_OUT (QEMU
+                    // send_command error path) so the driver times out
+                    // cleanly instead of parsing a bogus R1 (which gave
+                    // -22). NOTE: CMD5 needs an R4 OCR answer (own arm),
+                    // CMD1 needs OCR_BUSY (own arm) — neither FAILs here.
                     self.sdh_cmd |= 0x4000; // FAIL_FLAG
                     self.sdh_status |= 0x40; // CMD_TIME_OUT
                 }
-                41 if self.sdh_app_cmd => {
-                    // ACMD41 SD_APP_OP_COND (R3 OCR): busy on the first
-                    // poll after reset, ready after (QEMU ocr_power_timer
-                    // delay, collapsed to one poll here — the driver
-                    // polls in a loop, so one busy beat is enough).
-                    self.sdh_app_cmd = false;
-                    if self.sdh_ocr_ready {
-                        self.sdh_rsp = [OCR_READY, 0, 0, 0];
+                1 => {
+                    // CMD1 MMC_SEND_OP_COND (R3 OCR, polled via
+                    // __mmc_poll_for_busy until MMC_CARD_BUSY): the
+                    // MMC attach path (mmc_attach_mmc) runs THIRD,
+                    // after SDIO (CMD5) and SD (CMD55/41) both fail.
+                    // Our card is SD — answer OCR_BUSY (POWER_UP
+                    // clear): the poll spins its timeout then moves
+                    // on, instead of parking the rescan loop here.
+                    // (Old: OCR_READY immediately — the MMC path then
+                    // proceeded into CID/RCA/CSD where our SD answers
+                    // confused it, and the rescan loop never reached
+                    // the SD retry. Verify by CMD2/3/8e35xx activity
+                    // after this change.)
+                    self.sdh_rsp = [OCR_BUSY, 0, 0, 0];
+                }
+                5 => {
+                    // CMD5 SD_IO_SEND_OP_COND (R4 OCR probe): the SDIO
+                    // attach path sends this FIRST (mmc_attach_sdio
+                    // via mmc_send_io_op_cond with ocr=0, single pass;
+                    // the loop then polls while BUSY is clear).
+                    // Our card is SD, not SDIO — answer R4 = VDD
+                    // window ONLY (0x00FF8000, no BUSY bit31, no CCS,
+                    // no MEMORY_PRESENT): BUSY-clear exits the probe
+                    // loop after one pass, VDD bits overlap host
+                    // ocr_avail (3.2~3.4V) so the probe completes
+                    // (err 0) but reports no SDIO function
+                    // (MEMORY_PRESENT clear) → falls through to
+                    // mmc_attach_sd (CMD55/ACMD41).
+                    // (FAIL+TIME_OUT retried 580x; R4-zero polled 100x;
+                    // OCR_BUSY passed select_voltage but claimed SDIO —
+                    // all proven by CMD trace. Fourth try — verify by
+                    // CMD55/41 appearing.)
+                    self.sdh_rsp = [0x00FF8000, 0, 0, 0];
+                }
+                41 => {
+                    // ACMD41 SD_APP_OP_COND (R3 OCR): the driver only
+                    // sends this after a CMD55 that latched APP_CMD
+                    // (mmc_wait_for_app_cmd checks R1_APP_CMD — our
+                    // CMD55 R1 sets it, proven by 1164 CMD55 in the
+                    // trace). If the latch is clear the driver sent a
+                    // bare CMD41 (out-of-sequence): answer OCR_BUSY
+                    // (keeps the poll spinning, never fails the mrq).
+                    // Latch set: busy on the first poll after reset,
+                    // ready after (QEMU ocr_power_timer delay,
+                    // collapsed to one poll here — the driver polls
+                    // in a loop, so one busy beat is enough).
+                    // (Old gate `41 if self.sdh_app_cmd` silently fell
+                    // to `_ => 0x900` when the latch was clear — an R1
+                    // answer to an R3 question — and never logged, so
+                    // the trace showed 1164 CMD55 + ZERO CMD41 and the
+                    // latch looked dead. This arm logs every CMD41.)
+                    if self.sdh_app_cmd {
+                        self.sdh_app_cmd = false;
+                        if self.sdh_ocr_ready {
+                            self.sdh_rsp = [OCR_READY, 0, 0, 0];
+                        } else {
+                            self.sdh_ocr_ready = true;
+                            self.sdh_rsp = [OCR_BUSY, 0, 0, 0];
+                        }
                     } else {
-                        self.sdh_ocr_ready = true;
                         self.sdh_rsp = [OCR_BUSY, 0, 0, 0];
                     }
                 }
                 55 => {
-                    // CMD55 APP_CMD prefix: latch, R1 with APP_CMD bit
-                    // (QEMU sd.c sets expecting_acmd + APP_CMD status;
-                    // linux/mmc/sd_ops.c REQUIRES R1_APP_CMD or the
-                    // ACMD is rejected).
+                    // CMD55 APP_CMD prefix: latch + CLEAR STICKY ERROR
+                    // BITS (QEMU send_command error path is per-command:
+                    // FAIL_FLAG lives in sdh_cmd and is overwritten by
+                    // the next CMD write, but CMD_TIME_OUT lives in
+                    // sdh_status until W1C-cleared — and the driver only
+                    // clears errors it SEES. Our CMD52 FAIL+TIME_OUT
+                    // from the sdio_reset probe (2x per rescan cycle)
+                    // left TIME_OUT set across the CMD8/CMD5/CMD55
+                    // that followed; bcm2835_finish_command checks
+                    // SDCMD_FAIL_FLAG first and fails the mrq on the
+                    // STALE bit. Real HW clears status on the next
+                    // command issue (QEMU models this via fresh status
+                    // per send_command). Clear error bits on every NEW
+                    // command (except the FAIL-setting illegal arm
+                    // below, which sets them after).
+                    self.sdh_status &= !(0x40 | 0x80 | 0x20 | 0x10 | 0x08);
                     self.sdh_app_cmd = true;
                     self.sdh_rsp = [R1_TRAN_READY | 0x20, 0, 0, 0];
+                    sdh_log!();
                 }
                 51 if self.sdh_app_cmd => {
                     // ACMD51 SEND_SCR (R1 ok + 8-byte SCR data phase):
@@ -1426,6 +1663,19 @@ impl Bus {
                     // The driver reads 8 bytes (blksz 8, 1 block) from
                     // SDDATA; push the two words + set datacnt so the
                     // read path below doesn't double-fill.
+                    // M76o LE PACKING (same rule as the 6/13 arm: the
+                    // driver's be32_to_cpu needs LE words to produce
+                    // spec order; unit-proven bus_widths=5).
+                    // M76q FIFO RESET (execution-proven: the generic
+                    // reset in the datacnt!=0 block never runs for
+                    // this arm — it zeroes datacnt inline BEFORE the
+                    // reset check — so 14 stale words from a previous
+                    // 64B synthetic survived and the driver popped
+                    // STALE ZEROS instead of SCR -> 'invalid bus
+                    // width' + error -22 every cycle; valued reads
+                    // proved len=15/14 zeros at pop time).
+                    self.sdh_fifo_len = 0;
+                    self.sdh_fifo_pos = 0;
                     self.sdh_app_cmd = false;
                     self.sdh_rsp = [R1_TRAN_READY, 0, 0, 0];
                     const SCR: [u8; 8] = [0x02, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
@@ -1440,21 +1690,266 @@ impl Bus {
                     // below must NOT also fire (it would append 8
                     // sector bytes after the SCR).
                     self.sdh_datacnt = 0;
+                    sdh_log!();
+                }
+                6 if self.sdh_app_cmd => {
+                    // ACMD6 SET_BUS_WIDTH (R1, NO data phase —
+                    // upstream mmc_app_set_bus_width: MMC_RSP_R1 |
+                    // MMC_CMD_AC, arg 0/2; execution-proven dmatr11:
+                    // the driver programs NO HBLC/HBCT for it and
+                    // serving a 64B switch-status here made the
+                    // following CMD18 inherit a stale datacnt — the
+                    // block read then completed with err set and the
+                    // boot died in a 1909x CMD13 storm after CMD12).
+                    // Consume the APP latch, answer TRAN+READY.
+                    self.sdh_app_cmd = false;
+                    self.sdh_rsp = [R1_TRAN_READY, 0, 0, 0];
+                    sdh_log!();
+                }
+                6 => {
+                    // CMD6 SWITCH_FUNC (R1 + 64B switch-status data
+                    // phase when the driver programs HBLC/HBCT for it
+                    // — the mode-0 CHECK and mode-1 SET both do; the
+                    // arg-decoded payload is served below. NOTE: the
+                    // ACMD6 bus-width variant (latch set) is armed
+                    // ABOVE with no data phase; reaching here means a
+                    // genuine SD switch command).
+                    self.sdh_rsp = [R1_TRAN_READY, 0, 0, 0];
+                    sdh_log!();
+                }
+                12 => {
+                    // CMD12 STOP_TRANSMISSION (R1, no data phase —
+                    // upstream mmc_stop_transmission: MMC_RSP_R1 |
+                    // MMC_CMD_AC, NOT ADTC; execution-proven dmatr12:
+                    // the CMD18 (multi-block read, DMA, magic ef53
+                    // GOOD) + CMD12 completed, then the driver
+                    // spammed 1911x bare CMD13 (SEND_STATUS) and the
+                    // block layer never got its data — root cause
+                    // below).
+                    // M76u CMD12 NO-OP MODEL (upstream-grounded):
+                    // STOP after a multiblock READ only tells the card
+                    // to stop sending; the card is ALREADY back in
+                    // TRAN (data done, bytes_xfered set by the DMA
+                    // completion). Real HW answers plain TRAN+READY
+                    // R1 (0x900) — exactly like every other R1 here.
+                    // (A DATA-state beat 0x500 was tried first: it
+                    // made the post-STOP status poll observe busy and
+                    // never exit — 1909x storm. The DATA beat is
+                    // correct only for R1b BUSY waits (CMD6-switch
+                    // polling), never for STOP-after-read.)
+                    self.sdh_rsp = [R1_TRAN_READY, 0, 0, 0];
+                    sdh_log!();
                 }
                 _ if long_resp => {
-                    self.sdh_rsp = CID;
+                    // Unexpected long-response CMD (QEMU: rlen==16
+                    // path serves the card register MSB-first; the
+                    // only long CMDs the driver sends are 2/9, both
+                    // armed explicitly above — this is a safety net,
+                    // same LSB-first order).
+                    self.sdh_rsp = [CID[3], CID[2], CID[1], CID[0]];
+                    sdh_log!();
                 }
                 _ => {
-                    self.sdh_rsp = [0x900, 0, 0, 0];
+                    // R1 default: TRAN + READY_FOR_DATA (NOT bare
+                    // 0x900 TRAN-only: READY-clear stalls the driver
+                    // in __mmc_poll_for_busy 'Card stuck being busy';
+                    // without READY+TRAN the switch-status poll
+                    // (CMD13 x1928 storm, 8.8B run) never exits).
+                    // Covers CMD6 (SWITCH_FUNC, R1 here + 64B status
+                    // via the data phase below when the driver
+                    // programs HBLC/HBCT) and CMD13 (SEND_STATUS).
+                    self.sdh_rsp = [R1_TRAN_READY, 0, 0, 0];
+                    sdh_log!();
+                }
+            }
+            // Shared tail log for the arms that don't log at their own
+            // sites (2/3/8/9/16/illegal/CMD1/CMD5/ACMD41 — each logged
+            // exactly once; 55/51/long/default log inline above).
+            if matches!(idx, 2 | 3 | 8 | 9 | 16 | 1 | 5 | 52 | 53 | 54 | 58 | 59 | 41) {
+                sdh_log!();
+            }
+            // M76 CMD13-storm watch: count consecutive CMD13; snapshot
+            // the chunk's n/pc when the storm declares (20 in a row).
+            // Any other CMD resets the count.
+            if self.sdh_storm_watch {
+                if idx == 13 {
+                    self.sdh_storm_count += 1;
+                    if self.sdh_storm_count == 20 {
+                        self.sdh_storm_n = self.sdh_chunk_n;
+                        self.sdh_storm_pc = self.sdh_chunk_pc;
+                    }
+                } else {
+                    self.sdh_storm_count = 0;
                 }
             }
             let _ = arg;
         }
-        // Data phase: reads fill the FIFO from the card sector, writes
-        // drain into it (PIO through SDDATA; datacnt = hblc*hbct set on
-        // SDHBLC write, QEMU SDHBLC arm verbatim).
-        if self.sdh_datacnt != 0 && (is_write || true) {
-            if is_read {
+        // Data phase (QEMU fifo_run verbatim): runs iff datacnt != 0
+        // AND (is_write OR sdbus_data_ready). pi-cpu has no sdbus —
+        // the card is always "ready", so reads run whenever datacnt
+        // is set (PIO through SDDATA; datacnt = hblc*hbct set on
+        // SDHBLC write, QEMU SDHBLC arm verbatim). Non-read CMDs with
+        // datacnt set (stale HBLC from an earlier data CMD — e.g.
+        // CMD13 STATUS polls after ACMD51's 1x8) must NOT consume
+        // datacnt or emit DATA_FLAG: QEMU's is_read gate skips them,
+        // and the stale count belongs to no transfer. Without this
+        // gate every CMD13 after a data CMD would drain datacnt and
+        // raise DATA_FLAG+SDIO_IRPT, firing a bogus data IRQ the
+        // driver WARNs on (WARN_ON(!host->data) in block_irq).
+        //
+        // M76 SWITCH-STATUS data (execution-proven need): CMD6
+        // (SWITCH_FUNC) and ACMD13 (SD_APP_SD_STATUS) carry 64-byte
+        // read payloads the driver consumes via transfer_pio (no
+        // HBLC program distinguishes them from sector reads — the
+        // driver programs HBLC=1/HBCT=64 for both). Sector-0 bytes
+        // as switch status reads as "no functions supported"
+        // (console: 'lacks mandatory switch function'). Serve the
+        // synthetic status: byte 13 (offset 13 from MSB end, i.e.
+        // buf[50] in little-endian assembly) must carry
+        // SD_MODE_HIGH_SPEED so mmc_read_switch learns hs_max_dtr;
+        // the rest zeros (no SD3 modes — the driver then skips
+        // UHS switch and keeps the card at the current timing).
+        // Sector reads (CMD17/18, 512-byte multiples) keep the
+        // PIO sector path below.
+        if self.sdh_datacnt != 0 && is_read {
+            // M76 read-stream latch (refill-on-pop cursor): the FIFO
+            // holds 16 words but the transfer streams datacnt bytes;
+            // every SDDATA pop refills one word from this cursor
+            // (see sdh_fifo_pop). Latch here at send time; the
+            // synthetic 6/13 arm below consumes its own 64 bytes
+            // inline and is NOT part of the stream (read_active
+            // stays clear so pops don't refill garbage after it).
+            self.sdh_read_active = false;
+            if idx != 6 && idx != 13 {
+                self.sdh_read_active = true;
+                self.sdh_read_sec = arg as usize;
+                self.sdh_read_off = 0;
+                // M76p FIFO RESET (execution-proven: a timed-out or
+                // DMA-residue transfer leaves unread words — 3 after
+                // every CMD18 DMA, 16 after a timed-out SSR — and the
+                // next transfer's fill APPENDED after them, shifting
+                // its stream: 'invalid bus width' (-22, stale SSR
+                // words served as SCR) and shifted sector payloads
+                // (I/O errors on partition reads). A new data phase
+                // owns the FIFO from empty; unread residue belongs to
+                // a dead transfer. QEMU's fifo drains fully per
+                // transfer; starting empty is the equivalent here.)
+                self.sdh_fifo_len = 0;
+                self.sdh_fifo_pos = 0;
+            }
+            if idx == 6 || idx == 13 {
+                // CMD6 SWITCH_FUNC (R1 + 64B switch-status) /
+                // ACMD13 SD_APP_SD_STATUS (R1 + 64B SSR).
+                // M76t ARG DECODE (execution-proven: a single HS=1
+                // payload answered BOTH the mode-0 support CHECK
+                // (arg 0x00FFFFF0, needs status[13]&HS=1) and the
+                // mode-1 HS SET (arg 0x80FFFFF1, needs
+                // status[16]&0xF==1) — the SET's status[16] read 0,
+                // 'Problem switching card into high-speed mode',
+                // driver stayed in default speed AND the boot later
+                // died in a 1859x CMD13 storm after the first block
+                // read; trace dmatr10 lines 2709/2784/2841).
+                // Layout (Linux sd.c: status[13]&HS for support,
+                // status[16]&0xF for the mode-1 result,
+                // status[9]=drive strengths, status[7:6]=current
+                // limit): mode = arg>>31; group = which 0xF nibble
+                // of ~arg is replaced ((~arg>>4)&0xF selects the
+                // function group); value = (arg>>shift)&0xF.
+                // - Mode 0 (CHECK, any group/value): support payload
+                //   — status[13] = HS (0x02: SDHC HS, no UHS-I —
+                //   host has no UHS caps so UHS groups stay 0 and
+                //   the driver never attempts 1.8V/SET for them).
+                // - Mode 1 SET group 0 (bus speed): result payload
+                //   — status[16]&0xF echoes the requested value, so
+                //   the HS SET verifies (1) and any UHS SET would
+                //   verify too (host never asks: no UHS caps).
+                // - Mode 1 SET group 1/3/4 (curr/drv/pwr limit):
+                //   result payload echoes value at status[15]/
+                //   status[14]/status[15] (driver checks
+                //   status[15]&0xF for drive strength; current/power
+                //   need no check but echoing is harmless).
+                // SSR (ACMD13, idx 13, not CMD6): all-zero words
+                // decode au=0 (valid, silent) — the driver needs
+                // err 0 only.
+                // PACKING (M76o, BE detour reverted): SDDATA words
+                // are LE assemblies of the spec byte stream (QEMU
+                // fifo_run); the driver reads CMD6 status as raw
+                // bytes and be32_to_cpus the SSR itself.
+                // M76q FIFO RESET (same proof as the 51 arm below:
+                // this arm zeroes datacnt inline before the generic
+                // reset check runs, so stale words survived).
+                self.sdh_fifo_len = 0;
+                self.sdh_fifo_pos = 0;
+                let mut payload = [0u8; 64];
+                if idx == 6 {
+                    let mode = (arg >> 31) & 1;
+                    // First zeroed nibble of ~arg (from group 5
+                    // down) selects the group; value sits there.
+                    let mut group = 0u32;
+                    let mut value = 0u32;
+                    for g in (0..6u32).rev() {
+                        let nib = (arg >> (g * 4)) & 0xF;
+                        if nib != 0xF {
+                            group = g;
+                            value = nib;
+                            break;
+                        }
+                    }
+                    if mode == 0 {
+                        // CHECK: support payload.
+                        payload[13] = 0x02;
+                    } else if group == 0 {
+                        // SET bus speed: echo result.
+                        payload[16] = (value & 0xF) as u8;
+                        // Support bits stay visible too (the
+                        // driver re-checks hs_max_dtr paths on
+                        // the same buffer in some flows).
+                        payload[13] = 0x02;
+                    } else if group == 1 {
+                        // SET current limit: echo (no check).
+                        payload[15] = (value & 0xF) as u8;
+                        payload[13] = 0x02;
+                    } else if group == 2 {
+                        // SET drive strength: echo where the
+                        // driver checks (status[15]&0xF).
+                        payload[15] = (value & 0xF) as u8;
+                        payload[13] = 0x02;
+                    } else {
+                        // Groups 3-5 (power limit etc.): echo at
+                        // the group-typical result nibble.
+                        payload[15] = (value & 0xF) as u8;
+                        payload[13] = 0x02;
+                    }
+                }
+                let mut n = 0u32;
+                let mut value = 0u32;
+                while self.sdh_datacnt > 0 && self.sdh_fifo_len < 16 {
+                    let i = n as usize;
+                    let b: u8 = payload[i];
+                    value |= (b as u32) << ((n % 4) * 8);
+                    self.sdh_datacnt -= 1;
+                    n += 1;
+                    if n % 4 == 0 {
+                        self.sdh_fifo_push(value);
+                        self.sdh_status |= 0x01; // DATA_FLAG
+                        if (self.sdh_cfg & (1 << 4)) != 0 {
+                            self.sdh_status |= 0x100; // SDIO_IRPT
+                        }
+                        value = 0;
+                    }
+                }
+                if n % 4 != 0 {
+                    self.sdh_fifo_push(value);
+                    self.sdh_status |= 0x01;
+                    if (self.sdh_cfg & (1 << 4)) != 0 {
+                        self.sdh_status |= 0x100;
+                    }
+                }
+                // The synthetic payload is fully consumed inline
+                // (datacnt hits 0 in the loop above for the programmed
+                // 1x64); read_active stays clear so later pops of
+                // these words don't refill (see the latch above).
+            } else {
                 // Sector index = arg (block address; the driver uses
                 // block addressing after ACMD41/OCR negotiation).
                 let sec = arg as usize;
@@ -1482,7 +1977,32 @@ impl Bus {
                         self.sdh_status |= 0x100;
                     }
                 }
+                // M76n CURSOR ADVANCE (execution-proven: without this
+                // the refill-on-pop stream re-read bytes 0-63 the
+                // initial fill already served — a 64-byte duplication
+                // shifting every later byte, so dst+1080 read sector
+                // 1+504 zeros instead of the superblock magic and the
+                // partition scan failed; unit probe: magic 0000).
+                // The fill above served n bytes from the stream start;
+                // the refill cursor continues after them.
+                self.sdh_read_off = n;
             }
+        }
+        // M76 STALE-DATACNT CLEAR (QEMU send_command parity): the
+        // driver programs HBLC/HBCT per transfer (prepare_data writes
+        // both before every data CMD), so a datacnt that SURVIVES a
+        // command was never its transfer's — it is a stale program
+        // from an earlier CMD whose data phase never ran (e.g.
+        // ACMD51's 1x8 left datacnt=8 consumed inline, but a CMD
+        // whose is_read bit was clear leaves its HBLC behind).
+        // Without this, the next read CMD inherits a bogus count
+        // (wrong FIFO fill length, wrong DATA_FLAG timing). QEMU
+        // recomputes per-command state in send_command; here the
+        // equivalent is: non-data commands (no is_read, no is_write)
+        // clear a leftover datacnt.
+        if !is_read && !is_write {
+            self.sdh_datacnt = 0;
+            self.sdh_read_active = false;
         }
         if ((self.sdh_cmd & 0x800) != 0) && ((self.sdh_cfg & (1 << 10)) != 0) {
             self.sdh_status |= 0x400; // BUSY_IRPT (QEMU verbatim)
@@ -1524,8 +2044,26 @@ impl Bus {
     /// BASIC bit 18 mirrors it via irq_dups[] index 8).
     /// (First cut gated bank-1 bit 24 = GPU IRQ 24/DMA — wrong bank,
     /// so the line never delivered and every data CMD timed out.)
+    /// M76w IRQ LIFECYCLE (execution-proven dmatr14: 118 sdh_p2
+    /// deliveries 6.771B-6.875B, then ZERO after the CMD12 at
+    /// n=6875013120 although status stayed 0x101/DATA_FLAG and the
+    /// enable stayed set — the driver's per-IRQ 0x7f8/0x701 W1C
+    /// clears the latched SDIO bit and nothing re-raises it, so the
+    /// level dies mid-transfer and the waiter polls 1875x CMD13):
+    /// the IRQ must be a LEVEL derived from live transfer state,
+    /// not just latched status bits. Live condition = DATA_FLAG set
+    /// (a transfer completed and its data is/was available) with no
+    /// BUSY error latched. The handler's W1C of SDIO alone must not
+    /// kill the level while DATA_FLAG is still set — real HW keeps
+    /// the data line asserted until the FIFO drains (all words
+    /// popped) or the next command issues. Model: DATA_FLAG&&!BUSY
+    /// asserts the line regardless of the SDIO latch (SDIO stays as
+    /// the QEMU-parity status bit for the driver's intmask checks).
     pub fn sdh_pending2(&self) -> u32 {
-        if (self.sdh_status & (0x400 | 0x200 | 0x100)) != 0 && ((self.ic_en2 >> 24) & 1) != 0 {
+        let live_data = (self.sdh_status & 0x01) != 0 && (self.sdh_status & 0x400) == 0;
+        if ((self.sdh_status & (0x400 | 0x200 | 0x100)) != 0 || live_data)
+            && ((self.ic_en2 >> 24) & 1) != 0
+        {
             1 << 24
         } else {
             0
@@ -2313,10 +2851,16 @@ impl Bus {
 
     /// One DMA transfer (mirrors dma.js transfer() exactly, including
     /// page-chunking and the IGNORE fills).
+    /// M76k INC BITS (both conventions, execution-proven): real HW
+    /// S_INC=BIT(8)/D_INC=BIT(4) (upstream bcm2835-dma.c; the Linux
+    /// CB TI=0x419 uses them — with the old bit0/bit1 decode dst_inc
+    /// was FALSE and all 1021 words landed on dst+0, magic stayed 0,
+    /// partition reads failed), while the dma guest uses bit0/bit1
+    /// (programs/dma: "SRC_INC 0, DEST_INC 1"). Either bit means inc.
     fn dma_transfer(&mut self, ti: u32, src: u64, dst: u64, len: u64) {
         const PAGE: u64 = 4096;
-        let src_inc = ti & 1 != 0;
-        let dst_inc = ti & 2 != 0;
+        let src_inc = ti & 1 != 0 || ti & (1 << 8) != 0;
+        let dst_inc = ti & 2 != 0 || ti & (1 << 4) != 0;
         let src_ign = ti & (1 << 6) != 0;
         let dst_ign = ti & (1 << 7) != 0;
         let fill = if src_ign && self.in_ram(src, 1) {
@@ -2381,8 +2925,22 @@ impl Bus {
     /// device writes push FIFO words. Non-sdhost transfers use the
     /// plain RAM path below unchanged.
     fn dma_run_chain(&mut self, conblk: u64) -> bool {
-        let mut cb = conblk & !0x1f;
+        // M76 BUS-ADDRESS MASK (execution-proven): the dmaengine
+        // programs VC bus addresses (CONBLK=0xdc061000 observed) —
+        // mask 0x3FFFFFFF to the PA (same VC alias as the mailbox
+        // path; 0xdc061000 -> 0x1c061000, in RAM). Without this
+        // in_ram() fails and the chain silently runs zero CBs
+        // (dma_chains=0 across 8.8B despite ch4 ACTIVE+CONBLK).
+        // M76b BUS->PHYS (execution-proven): CB src/dst use the
+        // 0x7E000000 peripheral bus window (SRC=0x7e202040 for
+        // SDDATA), which masks to 0x3e202040 — NOT the VC-phys
+        // 0x3f202040 the SDDATA compare needs (bus^0x41000000 =
+        // phys; the sdhost-DMA CBs never routed, sdhost=0 with
+        // chains=9). bus_to_phys maps the 0x7E window to 0x3F
+        // first, then applies the VC-alias mask to the rest.
+        let mut cb = Self::bus_to_phys(conblk) & !0x1f;
         let mut inten = false;
+        self.dma_chains_run += 1;
         for _ in 0..64 {
             if cb == 0 || !self.in_ram(cb, 32) {
                 break;
@@ -2395,22 +2953,62 @@ impl Bus {
                 u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]])
             };
             let ti = rd(0);
-            let src = rd(4) as u64;
-            let dst = rd(8) as u64;
+            // CB src/dst are bus addresses too (dma_cfg uses
+            // phys_addr + SDDATA = 0x3F202040-class, but the CB
+            // observed on the wire carries 0x7e202040) — normalize.
+            let src = Self::bus_to_phys(rd(4) as u64);
+            let dst = Self::bus_to_phys(rd(8) as u64);
             let len = (rd(12) & 0xfffff) as u64;
             if len != 0 {
                 if src == SDHOST_BASE + 0x40 || dst == SDHOST_BASE + 0x40 {
+                    self.dma_sdhost_hits += 1;
                     self.dma_sdhost_transfer(ti, src, dst, len);
                 } else {
                     self.dma_transfer(ti, src, dst, len);
                 }
+                // M76i post-copy sample: first word at a RAM dst
+                // (proves the copy landed, not zeros).
+                for pa in [dst, src] {
+                    if self.in_ram(pa, 4) && pa != SDHOST_BASE + 0x40 {
+                        let b = self.mem_read_bytes(pa, 4);
+                        self.dma_last_dst_sample =
+                            u32::from_le_bytes(b[..4].try_into().unwrap());
+                        break;
+                    }
+                }
+                // M76j magic sample (DMATRACE triage): the CMD18
+                // block reads cover sectors 0-7, so dst+1080 must
+                // read the ext2 superblock magic (53EF) after a
+                // good copy; zeros = copy wrote nothing/wrong.
+                // (dst+0 is inconclusive: sector 0 IS zeros.)
+                if self.in_ram(dst, 1082) && dst != SDHOST_BASE + 0x40 {
+                    let m = self.mem_read_bytes(dst + 1080, 2);
+                    self.dma_last_dst_magic = (m[0] as u16) | ((m[1] as u16) << 8);
+                }
             }
-            if ti & (1 << 31) != 0 {
+            // M76d INT bit (both conventions): real HW INT_EN is TI
+            // bit 0 (BCM2835_DMA_INT_EN, upstream; the Linux CBs use
+            // it — proven: TI=0x419 chains ran with sdhost=9 but
+            // dma_p1 stayed 0), while the dma guest uses TI bit 31
+            // (host convention, programs/dma: "INTEN 31 is a host
+            // extension"). Either latches the channel INT.
+            if ti & 1 != 0 || ti & (1 << 31) != 0 {
                 inten = true;
             }
-            cb = rd(20) as u64 & !0x1f;
+            cb = Self::bus_to_phys(rd(20) as u64) & !0x1f;
         }
         inten
+    }
+
+    /// VC bus address -> PA (M76b): the 0x7E000000 peripheral window
+    /// maps to 0x3F000000 (bus^0x41000000); everything else takes
+    /// the VC-alias mask (RAM PAs pass through unchanged).
+    fn bus_to_phys(a: u64) -> u64 {
+        if (0x7E00_0000..0x7F00_0000).contains(&a) {
+            a - 0x7E00_0000 + 0x3F00_0000
+        } else {
+            a & 0x3FFF_FFFF
+        }
     }
 
     /// M75h sdhost-DMA transfer: one side of the CB is the sdhost
@@ -2426,8 +3024,10 @@ impl Bus {
     /// exists; QEMU wires the same channel.)
     fn dma_sdhost_transfer(&mut self, ti: u32, src: u64, dst: u64, len: u64) {
         const SDDATA: u64 = SDHOST_BASE + 0x40;
-        let src_inc = ti & 1 != 0;
-        let dst_inc = ti & 2 != 0;
+        // M76k INC BITS (both conventions — see dma_transfer): the
+        // Linux CBs use upstream S_INC=BIT(8)/D_INC=BIT(4).
+        let src_inc = ti & 1 != 0 || ti & (1 << 8) != 0;
+        let dst_inc = ti & 2 != 0 || ti & (1 << 4) != 0;
         let mut rem = len & !3; // word-multiple; trailing bytes ignored (PIO-aligned)
         if src == SDDATA && self.in_ram(dst, rem) {
             // Card read: FIFO -> RAM.
@@ -2464,6 +3064,18 @@ impl Bus {
         }
         // Data-phase completion (mirrors the PIO tail): the transfer
         // consumed the programmed blocks.
+        // M76v BLOCK_IRPT on PIO/DMA read completion (QEMU fifo_run
+        // write-tail parity + upstream bcm2835_irq: the threaded IRQ
+        // wakes on BUSY|BLOCK|SDIO; the DATA_FLAG+DATA_IRPT_EN path
+        // only fires when the driver enables DATA_IRPT_EN (PIO), but
+        // DMA-mode CFG (0x40e, bit4 clear — execution-proven dmatr12:
+        // CMD18+CMD12 completed yet the driver spammed 1911x CMD13
+        // because NO completion IRQ ever raised) needs the BLOCK
+        // beat. QEMU sets BLOCK_IRPT on transfer end when
+        // BLOCK_IRPT_EN (CFG bit8) is on — the driver enables it for
+        // DMA reads (CFG 0x40e has bit9? no: 0x40e = bits 1,9,10;
+        // bit8 BLOCK_IRPT_EN is CLEAR in 0x40e...). See M76v note in
+        // sdh_pending2: gate widened to DATA_FLAG&!BUSY instead.
         self.sdh_datacnt = 0;
         self.sdh_status |= 0x01; // DATA_FLAG
         if (self.sdh_cfg & (1 << 4)) != 0 {
@@ -3015,21 +3627,6 @@ impl Bus {
         if Self::is_clk(addr, size) || Self::is_i2s(addr, size) || Self::is_i2c0(addr, size) {
             return Ok(0); // untouched windows read zero, like the facade
         }
-        // (Second sdhost read arm — DELETED 2026-09-20: it duplicated
-        // the arm above line-for-line. Harmless while both agree, but
-        // any future fix applied to only one would fork the model
-        // silently. The single read arm lives ABOVE near the SMP arm.)
-        // M74d peripheral umbrella: any other touch inside
-        // 0x3f000000..0x3f200000 reads zero (unmodeled peripheral
-        // register file — MPHI, CPRMAN leftovers, reserved gaps).
-        // Placed AFTER every modeled window above so real devices
-        // keep priority; only the gaps land here.
-        if Self::is_periph(addr, size) {
-            if std::env::var("PERIPHTRACE").is_ok() {
-                eprintln!("PERIPHRD {:#x} sz={}", addr, size);
-            }
-            return Ok(0);
-        }
         if Self::is_uart25(addr, size) {
             let bases = [UART2_BASE, UART3_BASE, UART4_BASE, UART5_BASE];
             let mut k = 0usize;
@@ -3154,9 +3751,33 @@ impl Bus {
                 0x00 => self.sdh_cmd as u64,
                 0x10 | 0x14 | 0x18 | 0x1c => {
                     let i = ((off - 0x10) / 4) as usize;
+                    // M76q valued RSP reads (SDTRACE-gated): proves
+                    // WHAT the driver consumed (stale vs fresh).
+                    if std::env::var("SDTRACE").is_ok() {
+                        eprintln!("SDRSPV off=0x{:x} val=0x{:08x}", off, self.sdh_rsp[i]);
+                    }
                     self.sdh_rsp[i] as u64
                 }
-                0x20 => self.sdh_status as u64,
+                0x20 => {
+                    // M76m HSTS error tripwire (SDTRACE-gated): any
+                    // ERROR_MASK bit (TIME_OUT/CRC/FIFO) observed by
+                    // the driver proves a host-side error the I/O
+                    // errors come from (vs corrupt data with clean
+                    // status). Logs chunk_n for correlation with the
+                    // failing CMD18.
+                    // M76x HSTS VALUE log (SDTRACE-gated): every HSTS
+                    // read with its value — proves the DATA_FLAG
+                    // lifecycle (set at completion, W1C'd by the
+                    // handler, re-set by the next transfer) vs stuck
+                    // set/clear across the CMD12 + CMD13 storm.
+                    if std::env::var("SDTRACE").is_ok() {
+                        eprintln!("SDHSTSV status=0x{:x} n={}", self.sdh_status, self.sdh_chunk_n);
+                    }
+                    if std::env::var("SDTRACE").is_ok() && (self.sdh_status & (0x40 | 0x80 | 0x20 | 0x10 | 0x08)) != 0 {
+                        eprintln!("SDHSTS_ERR status=0x{:x} n={}", self.sdh_status, self.sdh_chunk_n);
+                    }
+                    self.sdh_status as u64
+                }
                 0x30 => self.sdh_vdd as u64,
                 // SDEDM+0x34: M75f PIO FIFO count + M75e FSM idle —
                 // see the sdhost read arm above (the live arm carries
@@ -3167,7 +3788,15 @@ impl Bus {
                 0x34 => ((self.sdh_edm & !0x1ff) | ((self.sdh_fifo_len as u32 & 0x1f) << 4) | 0x1) as u64,
                 0x38 => self.sdh_cfg as u64,
                 0x3c => self.sdh_hbct as u64,
-                0x40 => self.sdh_fifo_pop(),
+                0x40 => {
+                    // M76q valued FIFO reads (SDTRACE-gated): proves
+                    // WHAT the driver consumed (stale vs fresh).
+                    let w = self.sdh_fifo_pop();
+                    if std::env::var("SDTRACE").is_ok() {
+                        eprintln!("SDFIFOV val=0x{:08x} len={}", w as u32, self.sdh_fifo_len);
+                    }
+                    w
+                }
                 0x50 => self.sdh_hblc as u64,
                 // SDTOUT+0x08/SDCDIV+0x0C: write-only dividers, read 0.
                 _ => 0,
@@ -3181,7 +3810,12 @@ impl Bus {
         // here; bare-metal falls through to here). The sdhost arm
         // MUST stay above: it once sat AFTER the SMP arm, so the SMP
         // byte backing swallowed all 11k sdhost touches (0 SDHRD
-        // lines with SDTRACE on).
+        // lines with SDTRACE on). M76: the M74d periph umbrella sits
+        // BELOW (after DMA/MMU_CTL/sdhost/SMP/LOCAL) so modeled
+        // windows keep priority — umbrella placement is load-bearing
+        // (it once sat mid-chain and swallowed UART25/USB/DMA/
+        // MMU_CTL/sdhost/SMP reads as zeros, silently killing the
+        // smp guest; proven by execution).
         if !self.linux_mode && Self::is_smp(addr, size) {
             let mut w = 0u64;
             for i in 0..size {
@@ -3257,6 +3891,24 @@ impl Bus {
                 return Ok(self.local_mbox_ctl0 as u64 & mask(size));
             }
             return Ok(0); // unmodeled cells read zero, like the facade
+        }
+        // M74d peripheral umbrella READ (LAST modeled-window check
+        // before the fault): any other touch inside 0x3f000000..
+        // 0x3f300000 reads zero (unmodeled peripheral register file
+        // — MPHI, CPRMAN leftovers, reserved gaps). PLACEMENT IS
+        // LOAD-BEARING: this arm MUST sit after every modeled window
+        // above (UART25/USB/DMA/MMU_CTL/sdhost/SMP/MBOX/LOCAL) so
+        // real devices keep priority; only the gaps land here. It
+        // once sat mid-chain (after CLK/I2S/I2C0) and swallowed all
+        // of those as zeros — smp died silently (proven: stash the
+        // current diff, smp still FAILs on the committed tree with
+        // PERIPH_LEN=0x300000 covering 0x3f202000; umbrella-after
+        // modeled restores it).
+        if Self::is_periph(addr, size) {
+            if std::env::var("PERIPHTRACE").is_ok() {
+                eprintln!("PERIPHRD {:#x} sz={}", addr, size);
+            }
+            return Ok(0);
         }
         // Outside the default-mapped set: fault, like the unicorn core.
         // M57 Linux-track note: in linux_mode the translated kernel PA
@@ -3691,13 +4343,6 @@ impl Bus {
         if Self::is_clk(addr, size) || Self::is_i2s(addr, size) || Self::is_i2c0(addr, size) {
             return Ok(());
         }
-        // M74d peripheral umbrella (write side): absorb.
-        if Self::is_periph(addr, size) {
-            if std::env::var("PERIPHTRACE").is_ok() {
-                eprintln!("PERIPHWR {:#x} sz={} val={:#x}", addr, size, val & mask(size));
-            }
-            return Ok(());
-        }
         if Self::is_uart25(addr, size) {
             let bases = [UART2_BASE, UART3_BASE, UART4_BASE, UART5_BASE];
             let mut k = 0usize;
@@ -3936,7 +4581,9 @@ impl Bus {
         }
         // DMA ch0 + ENABLE page: window backing with RMW (the facade
         // windows are RAM). No immediate action — the edge logic runs
-        // in sync_in, mirroring the facade.
+        // in sync_in, mirroring the facade. M76: covers all 16
+        // channels (0x100 stride) + ENABLE page; DMATRACE logs CS
+        // (off%0x100==0), CONBLK_AD (+0x04) and ENABLE writes.
         if Self::is_dma(addr, size) {
             let base = if addr >= DMA_ENABLE_PAGE {
                 DMA_ENABLE_PAGE
@@ -3955,6 +4602,42 @@ impl Bus {
                 } else if let Some(cell) = self.dma_back.get_mut(idx) {
                     *cell = (*cell & !(0xff << sh)) | (b << sh);
                 }
+            }
+            if self.dma_trace
+                && std::env::var("DMATRACE").is_ok()
+                && (addr - base) % 0x100 <= 0x04 + size
+                && addr < DMA_ENABLE_PAGE
+            {
+                let off = addr - base;
+                eprintln!("DMAWR ch={} off=0x{:x} val=0x{:x}", off / 0x100, off % 0x100, val & mask(size));
+            }
+            if self.dma_trace
+                && std::env::var("DMATRACE").is_ok()
+                && addr >= DMA_ENABLE_PAGE
+                && addr - DMA_ENABLE_PAGE < 0x60
+            {
+                eprintln!("DMAEN off=0x{:x} val=0x{:x}", addr - DMA_ENABLE_PAGE, val & mask(size));
+            }
+            // M76s ACK write-event: guest CS write with INT bit
+            // acks this channel (the publish's INT must not).
+            if addr < DMA_ENABLE_PAGE {
+                let off = addr - base;
+                if off % 0x100 == 0 && (val & 4) != 0 {
+                    let ch = (off / 0x100) as usize;
+                    if ch < 16 {
+                        self.dma_ack_ch[ch] = true;
+                    }
+                }
+            }
+            // M76: the real per-channel ENABLE register lives at
+            // DMA_BASE+0xFF0 (not the facade page) — log it too.
+            if self.dma_trace
+                && std::env::var("DMATRACE").is_ok()
+                && addr < DMA_ENABLE_PAGE
+                && addr - base >= 0xFF0
+                && addr - base < 0x1000
+            {
+                eprintln!("DMAENR val=0x{:x}", val & mask(size));
             }
             return Ok(());
         }
@@ -4037,6 +4720,15 @@ impl Bus {
                 self.local_mbox_ctl0 = (val & mask(size)) as u32;
             }
             return Ok(()); // unmodeled cells absorb writes, like the facade
+        }
+        // M74d peripheral umbrella WRITE (LAST check before the
+        // fault): absorb. Same placement rule as the read side —
+        // after every modeled window, only gaps land here.
+        if Self::is_periph(addr, size) {
+            if std::env::var("PERIPHTRACE").is_ok() {
+                eprintln!("PERIPHWR {:#x} sz={} val={:#x}", addr, size, val & mask(size));
+            }
+            return Ok(());
         }
         Err(Fault::UnmappedData(addr))
     }
@@ -4153,15 +4845,33 @@ impl Bus {
             }
         }
         // DMA publish (mirrors syncDmaOut): CS shows END|INT only.
+        // M76: publish per channel (each channel's CS at ch*64:
+        // BCM2835 DMA channels are 0x100 bytes apart, 16 channels
+        // in the 0x1000 range; ch0 keeps the legacy dma_back[0]
+        // cell (the dma guest + dma_pending1 read it). last_cs_ch
+        // tracks the published word per channel for the
+        // ACTIVE-rising edge. M76c: END|INT per channel (a shared
+        // publish set INT on idle channels too, and the dmaengine
+        // callback checks the INT bit to claim its IRQ).
+        for ch in 0..16usize {
+            let mut dcs = 0u32;
+            if self.dma_end_ch[ch] {
+                dcs |= 2;
+            }
+            if self.dma_int_ch[ch] {
+                dcs |= 4;
+            }
+            self.dma_back[ch * 64] = dcs;
+            self.dma_last_cs_ch[ch] = dcs;
+        }
+        // Shared ORs for legacy readers (dma guest checks dma_back[0]
+        // bits; dma_pending1 now reads dma_int_ch directly).
         let mut dcs = 0u32;
         if self.dma_end {
             dcs |= 2;
         }
         if self.dma_int {
             dcs |= 4;
-        }
-        if !self.dma_back.is_empty() {
-            self.dma_back[0] = dcs;
         }
         self.dma_last_cs = dcs;
     }
@@ -4208,26 +4918,111 @@ impl Bus {
         // INT unlatches (the same-slice ACTIVE write carries no INT bit,
         // so it can't wipe a fresh latch — only an explicit clear does).
         // ENABLE lives at +0x50 of the ENABLE page (index 20).
-        let cs = self.dma_back[0];
-        let conblk = self.dma_back[1];
-        let enable = self.dma_en_back[(0x50 / 4) as usize];
-        if cs & (1 << 31) != 0 {
-            self.dma_end = false;
-            self.dma_int = false;
-        } else {
-            if (cs & 1) != 0
-                && (self.dma_last_cs & 1) == 0
-                && conblk != 0
-                && (enable & 1) != 0
-            {
-                let inten = self.dma_run_chain(conblk as u64);
-                self.dma_end = true;
-                if inten {
-                    self.dma_int = true;
+        // M76 ALL-CHANNEL (execution-proven need): the old code watched
+        // ch0 only (dma_back[0/1], enable bit 0). The dmaengine
+        // allocates ANY free channel (sdhost DTB asks by DREQ, not
+        // channel number), so the driver's chain usually lands on a
+        // nonzero channel and the transfer never ran ('timeout waiting
+        // for hardware interrupt' on every CMD18, 8.8B). Loop all 16
+        // channels (stride 0x100 bytes = 64 words; CS at base, CONBLK
+        // at base+1). dma_end/dma_int stay shared OR-flags (the dma
+        // guest uses ch0; dma_pending1 reads INT + enable bit 0 —
+        // unchanged for ch0).
+        // M76b NO-ENABLE-GATE (upstream-grounded): the bcm2835-dma
+        // engine has NO per-channel enable gate on the data path —
+        // start_desc writes CONBLK_AD + ACTIVE and the transfer runs;
+        // the 0xFF0 ENABLE register only routes the channel's IRQ
+        // (bcm2835-dma.c never writes ENABLE on the start path;
+        // DMATRACE proves zero ENABLE writes across 8.8B while ch4
+        // ACTIVE+CONBLK land). Gating on enable starved every
+        // dmaengine chain (dma_chains=0). ACTIVE-rising + CONBLK is
+        // the only start condition; the dma guest's facade-page
+        // ENABLE write is absorbed (compat, no gate).
+        // M76e NO-RERUN (execution-proven: chains=49900 storm): the
+        // dmaengine callback acks with INT|ACTIVE rewritten. The
+        // CONBLK-consume below (M76g) is what prevents restart (the
+        // ack sees CONBLK==0 = exhausted chain, like real HW's NULL
+        // ADDR — "will remain idle despite the ACTIVE flag"). The
+        // ran_cb guard is REMOVED (it blocked legitimate same-CB
+        // restarts: the driver reuses one CB address for every
+        // transfer, so chains stuck at 5/9 with I/O errors on the
+        // skipped partition reads).
+        {
+            for ch in 0..16usize {
+                // BCM2835 DMA channel stride is 0x100 bytes (64
+                // words): CS at base, CONBLK_AD at base+1.
+                let base = ch * 64;
+                let cs = self.dma_back[base];
+                let conblk = self.dma_back[base + 1];
+                let last = self.dma_last_cs_ch[ch];
+                if cs & (1 << 31) != 0 {
+                    // ABORT clears this channel's latches only
+                    // (the old shared clear wiped a live sibling
+                    // channel's INT — the driver aborts ch4
+                    // between retries while ch0 idles).
+                    self.dma_end_ch[ch] = false;
+                    self.dma_int_ch[ch] = false;
+                    self.dma_end = self.dma_end_ch.iter().any(|&b| b);
+                    self.dma_int = self.dma_int_ch.iter().any(|&b| b);
+                } else {
+                    // M76g START = ACTIVE with INT clear (execution-
+                    // proven: the dmaengine callback acks with
+                    // INT|ACTIVE rewritten 600K times; treating
+                    // level-ACTIVE as start re-ran or blocked
+                    // forever). Real HW: writing 1 to INT
+                    // acknowledges the IRQ (clears it); ACTIVE in
+                    // the same write keeps the channel alive for
+                    // cyclic/next, and an idle-exhausted channel
+                    // stays idle. So: INT-set-in-WRITE = ack (clear
+                    // the latch, never start); ACTIVE-with-INT-
+                    // clear + programmed CONBLK = start. The dma
+                    // guest writes ACTIVE-only to start and 0 to
+                    // clear — both compatible (0 has INT clear but
+                    // ACTIVE clear too, so no start).
+                    // M76s ACK WRITE-EVENT (execution-proven: the
+                    // publish writes INT into the backing CS to SHOW
+                    // the guest, and the old level-check read our own
+                    // publish as a guest ack — unlatching the INT in
+                    // the very next sync_in, before any delivery edge
+                    // ever saw it; 9 CMD18 chains, ZERO dma_p1
+                    // deliveries across 8.8B). Only a guest CS write
+                    // with INT set acks (write-event flag, set in the
+                    // write arm; the publish never sets it).
+                    if self.dma_ack_ch[ch] {
+                        // Ack: clear this channel's INT latch.
+                        self.dma_int_ch[ch] = false;
+                        self.dma_int = self.dma_int_ch.iter().any(|&b| b);
+                        self.dma_ack_ch[ch] = false;
+                    }
+                    if (cs & 1) != 0 && (cs & 4) == 0 && conblk != 0 {
+                        if self.dma_trace && std::env::var("DMATRACE").is_ok() {
+                            eprintln!("DMRUN ch={} cb=0x{:x}", ch, conblk);
+                        }
+                        let inten = self.dma_run_chain(conblk as u64);
+                        // M76i post-copy sample (DMATRACE-gated): first
+                        // word at the CB dst AFTER the copy, so a
+                        // routing bug (zeros) vs card-data bug shows.
+                        if self.dma_trace && std::env::var("DMATRACE").is_ok() {
+                            eprintln!("DMDST {:08x} magic={:04x}", self.dma_last_dst_sample, self.dma_last_dst_magic);
+                        }
+                        self.dma_end_ch[ch] = true;
+                        self.dma_end = true;
+                        if inten {
+                            self.dma_int_ch[ch] = true;
+                            self.dma_int = true;
+                        }
+                        // M76g CONBLK consume (upstream: ADDR
+                        // advances to NEXT, 0 at chain end — the
+                        // callback completes the cookie only when
+                        // ADDR reads 0). Without this the callback
+                        // sees a stale ADDR, never completes, and
+                        // acks INT|ACTIVE forever (607748 acks,
+                        // chains stuck at 1).
+                        self.dma_back[base + 1] = 0;
+                    }
                 }
-            }
-            if self.dma_int && (self.dma_last_cs & 4) != 0 && (cs & 4) == 0 {
-                self.dma_int = false;
+                // NOTE: last published below overwrites; kept per-ch.
+                self.dma_last_cs_ch[ch] = self.dma_back[base];
             }
         }
         if self.vt_ips != 0 {

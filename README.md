@@ -1275,3 +1275,16 @@ dist/                 production bundle
   GONE; card clean-enumerates (`new SD card at address 1234`) but no
   `mmcblk0` yet (zero CMD17/18 READs — card-reg phase incomplete).
   Smoke 25/25, fuzzer 882/882.
+- M76 -- sdhost block path (UNCOMMITTED): conductor enumerated, first
+  CMD18 works end-to-end (ch4 DMA CB → 38 dma_p1 deliveries → CMD12 →
+  drain), then a 1909x CMD13 poll loop + VFS `mmcblk0` panic. Fixes:
+  umbrella LAST (smp died silently mid-chain), CID/CSD LSB-first,
+  full v2.0 CSD (C_SIZE=7 → `4.00 MiB`), CMD1/CMD5 fall-through,
+  ACMD41 latch-aware OCR, CMD55 sticky-TIME_OUT clear, SCR LE,
+  CMD6 arg-decoded payloads, ACMD6 R1-only, CMD12 plain TRAN+READY,
+  refill-on-pop + cursor advance + FIFO reset, DMA all-16-channel +
+  bus→phys + INT/INC both conventions + CONBLK-consume + write-event
+  ACK, sdh IRQ as live DATA_FLAG level. Open edge: sdh_p2 deliveries
+  stop after CMD12 (level dies on W1C) — next dual trace must prove
+  the resumed level collapses the CMD13 count. Smoke 25/25, fuzzer
+  882/882.

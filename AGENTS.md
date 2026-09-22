@@ -2394,6 +2394,74 @@ SMP arms are `!linux_mode`-gated; bare-metal green proves the split):
   Next: CMD17/18 + partition-scan path to `mmcblk0`.
 - Battery: smoke 25/25 + fuzzer 882/882.
 
+### M76 — sdhost block path: CMD18/DMA deliver, CMD13-storm diagnosed (DONE, uncommitted)
+
+State at commit: conductor fully enumerated (CID/CSD/SCR/SSR/switch/
+bus-width all green, HS timing set), the first multi-block read works
+end-to-end (CMD18 arg 0x0 → ch4 DMA CB → 38 dma_p1 deliveries → CMD12
+→ drain), then the driver stalls in a 1909x bare-CMD13 poll loop and
+the boot still ends at the VFS `mmcblk0` panic (`b300 4096 mmcblk0`,
+error -6). Every slice below verified by execution (SDTRACE/DMATRACE
+dual traces + `dmaunit`/`scrunit` unit probes + battery after each).
+
+- **Periph umbrella placement (load-bearing):** M74d's umbrella once
+  sat mid-chain and swallowed UART25/USB/DMA/MMU_CTL/sdhost/SMP reads
+  as zeros (smp died silently); moved to LAST check before the fault
+  on both read and write paths. Rule: modeled windows keep priority.
+- **Card model completions:** CID/CSD LSB-first wire order (MSB-first
+  parsed CSD_STRUCTURE=0 → 'lacks mandatory' + half-init card); full
+  v2.0 CSD assembly (C_SIZE=7 → kernel reports `4.00 MiB`, was 512
+  KiB at C_SIZE 0); CMD1 OCR_BUSY / CMD5 R4-no-BUSY (attach paths fall
+  through instead of parking); ACMD41 latch-aware OCR; CMD55 clears
+  sticky TIME_OUT (stale FAIL bit failed every later mrq); SCR LE
+  words (BE detour tried, reverted — driver's be32_to_cpu needs LE);
+  CMD6 SWITCH_FUNC arg-decoded payloads (mode-0 CHECK needs
+  status[13]&HS; mode-1 SET echoes value at status[16]; single HS=1
+  payload failed the SET verify → 'Problem switching...' + default
+  speed); ACMD6 bus-width = R1-only NO data phase (a 64B payload here
+  poisoned the next CMD18's datacnt); CMD12 STOP = plain TRAN+READY
+  R1 (a DATA-state beat was tried first — it wedged the post-STOP
+  poll into the 1909x storm; STOP-after-read needs no busy wait).
+- **FIFO lifecycle:** refill-on-pop streaming (16-word FIFO vs 4096B
+  transfers — without it the drain got 16 words then underflow
+  zeros); cursor advance past the inline fill (else 64B duplication
+  shifted the stream, superblock magic missed); FIFO reset at each
+  new data latch incl. synthetic arms (stale SSR words served as SCR
+  → 'invalid bus width' -22 every cycle, valued reads proved
+  len=15/14 zeros at pop time).
+- **DMA (ch4, all fixes execution-proven):** backing grown 256→1024
+  words (ch4+ CONBLK writes vanished out-of-range → chains=0);
+  all-16-channel scan (dmaengine allocates any channel, not ch0);
+  NO enable gate on data or IRQ path (bcm2835-dma.c never writes
+  ENABLE — DMATRACE proves zero writes across 8.8B); VC bus→phys
+  mapping (CONBLK 0xdc…, SDDATA 0x7e202040 → 0x3f202040; unmapped
+  CBs ran zero transfers); TI INT_EN bit0 + guest bit31; INC bits
+  both conventions (old bit0/bit1-only decode left dst_inc FALSE —
+  all 1021 words landed on dst+0, magic stayed 0); CONBLK-consume on
+  completion (stale ADDR + INT|ACTIVE ack = 607748-ack livelock,
+  chains stuck at 1); INT ack as guest write-event only (our own
+  publish's INT unlatched the latch before any delivery edge — 9
+  chains, ZERO dma_p1 deliveries); per-channel END/INT latches +
+  ABORT clears only its channel; rerun = ACTIVE&&!INT&&CONBLK!=0
+  (ran_cb same-address guard tried, removed — it blocked legitimate
+  same-CB restarts, chains stuck at 5/9).
+- **sdh IRQ lifecycle (M76w, the current edge):** 118 sdh_p2
+  deliveries 6.771B–6.875B then ZERO after the CMD12 although status
+  stays DATA_FLAG and the enable stays set — the driver's per-IRQ
+  0x7f8/0x701 W1C clears the latched SDIO bit and nothing re-raises
+  it. Fix in tree: the IRQ is now a LEVEL from live transfer state
+  (DATA_FLAG&&!BUSY asserts regardless of the SDIO latch). Effect
+  still to verify on the next dual trace (dmatr16 showed identical
+  1875x storm — the lifecycle fix landed after it; next: prove
+  sdh_p2 deliveries resume post-CMD12 and the CMD13 count collapses).
+- **Trace infra kept (all env-gated, zero-cost off):** SDTRACE
+  (SDHCMD+n-stamp/SDHRD/SDHWR/SDRSPV/SDFIFOV/SDHSTSV/SDHSTS_ERR),
+  DMATRACE (DMAWR/DMAEN/DMAENR/DMRUN/DMDST+magic/DMADLV),
+  `sdh_storm_watch` + runner chunk tags, DMA/CB counters +
+  `dma_ch4_pub`/`dma_enable_pub`/`sd_disk0_64`/`sdh_fifo_len_pub`
+  probe helpers. Temp `cpu/examples/zz*.rs` probes all deleted.
+- Battery: smoke 25/25 + fuzzer 882/882 (after every slice).
+
 
 ## Key risks (M49: unicorn retired — the first two risks below are closed)
 
