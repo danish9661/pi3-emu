@@ -502,6 +502,51 @@ pub struct Bus {
     sdh_read_active: bool,
     sdh_read_sec: usize,
     sdh_read_off: u32,
+    /// M87c PREFILL-SKIP COUNT (see the prefill arm + drain loop):
+    /// number of FIFO pops that must NOT refill (they drain the
+    /// CMD-time prefill bytes 0..n-1, which the cursor already
+    /// accounts for via read_off=n). Set to the prefill word count
+    /// at CMD time (16 for sector reads, 16 for the 64B synthetics);
+    /// decremented per pop in sdh_fifo_pop. Zero = normal refill.
+    sdh_prefill_skip: u32,
+    /// M77 write-stream cursor (commit-on-push): starting sector +
+    /// bytes committed for the CURRENT write transfer, latched at
+    /// send_command when is_write && datacnt > 0. `sdh_write_active`
+    /// gates the commit; cleared on drain (datacnt hits 0), on
+    /// CMD12 STOP (commit point, see the CMD12 arm), or on any other
+    /// non-data command (stale rule, same as datacnt).
+    sdh_write_active: bool,
+    sdh_write_sec: usize,
+    sdh_write_off: u32,
+    /// M77 write assembly buffer: bytes pushed through SDDATA for the
+    /// current write transfer (up to 8x512 = 4096 for the observed
+    /// CMD25 journal writes; sized 64K so a bigger multi-block write
+    /// never overflows — the commit arm bounds by write_off anyway).
+    /// Boxed so Bus stays a plain struct (a Clone derive was never
+    /// present — SmpRunner moves whole Bus values, not clones).
+    sdh_write_buf: Box<[u8; 65536]>,
+    /// M80 DMA-WRITE SHADOW COMMIT (execution-proven 2026-09-25 via
+    /// zzcb0+dmatrace: the sector-0 CMD25's DMCB len=0x1000 ran through
+    /// dma_sdhost_transfer, which assembled woff=4096 into
+    /// sdh_write_buf — but the per-word loop's datacnt countdown hit 0
+    /// mid-transfer (CMD25's programmed datacnt vs the CB's len
+    /// disagree across the HBLC/STOP interleaving), clearing wact and
+    /// leaving the STOP arm with woff evidence it then DROPPED
+    /// (pre-M80 gate was wact). The shadow captures (sec, len,
+    /// bytes) AT DMA TIME, independent of the cursor flags; the STOP
+    /// arm commits the shadow when woff is stale. Bounded: the shadow
+    /// holds one transfer (8x512 observed; 64K cap like write_buf).
+    /// `shadow_len==0` = no pending shadow.
+    sdh_shadow_sec: usize,
+    sdh_shadow_len: u32,
+    sdh_shadow_buf: Box<[u8; 65536]>,
+    /// M77 DMA-write completion state (see sdh_pending2): set when a
+    /// DMA WRITE transfer completes (BLOCK_IRPT beat), cleared when
+    /// its STOP (CMD12) issues. While set, the IRQ-56 level
+    /// re-asserts regardless of the driver's HSTS W1C — the STOP is
+    /// the consume point (upstream transfer_complete sends STOP
+    /// after finish_data).
+    sdh_write_done: bool,
     /// M76 CMD13-storm watch (triage only): counts consecutive CMD13
     /// completions; when the count first reaches 20, snapshots the
     /// runner's `n` + guest pc (written by the runner pre-chunk) so
@@ -688,6 +733,15 @@ impl Bus {
             sdh_read_active: false,
             sdh_read_sec: 0,
             sdh_read_off: 0,
+            sdh_prefill_skip: 0,
+            sdh_write_active: false,
+            sdh_write_sec: 0,
+            sdh_write_off: 0,
+            sdh_write_buf: Box::new([0; 65536]),
+            sdh_shadow_sec: 0,
+            sdh_shadow_len: 0,
+            sdh_shadow_buf: Box::new([0; 65536]),
+            sdh_write_done: false,
             sdh_storm_watch: false,
             sdh_storm_count: 0,
             sdh_storm_n: 0,
@@ -917,8 +971,59 @@ impl Bus {
     pub fn sdh_fifo_len_pub(&self) -> usize {
         self.sdh_fifo_len
     }
+    /// M88 triage: full FIFO snapshot (proves residue words).
+    pub fn sdh_fifo_all_pub(&self) -> Vec<u32> {
+        self.sdh_fifo.to_vec()
+    }
+    pub fn sdh_fifo_pos_pub(&self) -> usize {
+        self.sdh_fifo_pos
+    }
+    /// M88 triage: read-active flag (proves latch state).
+    pub fn sdh_read_active_pub(&self) -> bool {
+        self.sdh_read_active
+    }
     pub fn sdh_datacnt_pub(&self) -> u32 {
         self.sdh_datacnt
+    }
+    /// M80 triage: read-stream cursor (proves the PIO refill path).
+    pub fn sdh_read_sec_pub(&self) -> usize {
+        self.sdh_read_sec
+    }
+    pub fn sdh_read_off_pub(&self) -> u32 {
+        self.sdh_read_off
+    }
+    /// M77 triage: raw card sector bytes (proves what the guest's
+    /// block layer wrote vs what load_linux staged).
+    pub fn sd_sector_pub(&self, sec: usize) -> [u8; 512] {
+        self.sd_read_sector(sec)
+    }
+    /// M77 triage: write-cursor state (proves the CMD25 commit path).
+    pub fn sdh_write_active_pub(&self) -> bool {
+        self.sdh_write_active
+    }
+    pub fn sdh_write_sec_pub(&self) -> usize {
+        self.sdh_write_sec
+    }
+    pub fn sdh_write_off_pub(&self) -> u32 {
+        self.sdh_write_off
+    }
+    /// M80 triage: shadow-commit state (proves the DMA-time capture).
+    pub fn sdh_shadow_sec_pub(&self) -> usize {
+        self.sdh_shadow_sec
+    }
+    pub fn sdh_shadow_len_pub(&self) -> u32 {
+        self.sdh_shadow_len
+    }
+    /// M81 triage: shadow buffer head (proves captured byte content).
+    pub fn sdh_shadow_buf_pub(&self) -> Vec<u8> {
+        self.sdh_shadow_buf[..64].to_vec()
+    }
+    /// M82 triage: full shadow + write buffers (proves content identity).
+    pub fn sdh_shadow_full_pub(&self) -> Vec<u8> {
+        self.sdh_shadow_buf.to_vec()
+    }
+    pub fn sdh_write_buf_pub(&self) -> Vec<u8> {
+        self.sdh_write_buf.to_vec()
     }
 
     fn sd_write_sector(&mut self, sec: usize, data: [u8; 512]) {
@@ -1417,6 +1522,16 @@ impl Bus {
         let v = self.sdh_fifo[self.sdh_fifo_pos] as u64;
         self.sdh_fifo_len -= 1;
         self.sdh_fifo_pos = (self.sdh_fifo_pos + 1) & 15;
+        // M87c PREFILL-SKIP (see the prefill arm): pops draining the
+        // CMD-time prefill must NOT refill — the cursor (roff=n)
+        // already accounts for those bytes. Without this every CB's
+        // dst starts with a 64-byte stutter (prefill bytes 0..63
+        // drained, then refilled 0..63 again behind them).
+        // M88-BISECT: prefill_skip DISABLED (early-return commented out).
+        // if self.sdh_prefill_skip > 0 {
+        //     self.sdh_prefill_skip -= 1;
+        //     return v;
+        // }
         // M76 REFILL-ON-POP (QEMU fifo_run parity): the 16-deep FIFO
         // holds at most 64 bytes, but block reads (CMD17/18, datacnt
         // up to 4096) stream through it. QEMU refills from the card
@@ -1426,6 +1541,33 @@ impl Bus {
         // hardware interrupt' on every CMD18, proven 8.8B). Refill
         // one word per pop from the read stream while the current
         // read transfer is active; DATA_FLAG stays set (more data).
+        // M89 BISECT RESULT (execution-proven 2026-09-27): the
+        // always-refill variant (gate on read_active alone) advances
+        // the kernel to a NEW Translation fault at 6.94B
+        // (pc ...038628 = fault VA, con=65166), while the
+        // datacnt-gated refill runs fault-null (6.95B fault-null,
+        // con=100715 in BOTH bisect-A and bisect-B runs — the bins
+        // were stale but both converge on the gated code). Keep the
+        // datacnt gate (QEMU-faithful); chained-CB starvation is
+        // fixed by the per-CB re-arm, not by removing the gate.
+        // (M88 note below superseded — kept as record of the wrong
+        // turn: the starvation diagnosis was right, the gate removal
+        // was the wrong fix.)
+        // M88 REFILL-GATE FIX (execution-proven 2026-09-27: the old
+        // gate `read_active && datacnt>0` starves EVERY chained CB
+        // after cb0 — datacnt is a single program consumed by the
+        // first drain (DMACUR: cb1-pre datacnt=0, fifo=16 stale;
+        // cb1 drains 16 prefill words with NO refill behind them,
+        // then 1008 underflow zeros; cb1 = sec0x28[0:64] + zeros).
+        // QEMU's gate is `datacnt!=0 && (is_write || sdbus_ready)`
+        // per fifo_run CALL, but QEMU calls fifo_run on every
+        // SDDATA access AND every register write — i.e. the refill
+        // is re-armed continuously, not once per CMD. Our equivalent:
+        // refill while the read stream is live (read_active), gated
+        // on the CURSOR (rsec/roff sane), not the consumed datacnt.
+        // datacnt still decrements (PIO pacing + DATA_FLAG timing
+        // below unchanged) but is clamped at 0, never blocking.
+        // SUPERSEDED by M89 above: gate restored below.
         if self.sdh_read_active && self.sdh_datacnt > 0 {
             let mut w = 0u32;
             for i in 0..4 {
@@ -1482,6 +1624,22 @@ impl Bus {
         let is_write = (self.sdh_cmd & 0x80) != 0;
         let no_resp = (self.sdh_cmd & 0x400) != 0;
         let long_resp = (self.sdh_cmd & 0x200) != 0;
+        // M77 STALE-ERROR CLEAR (execution-proven 2026-09-23): the CMD52
+        // FAIL+TIME_OUT from the sdio_reset probe (2x per rescan cycle)
+        // left TIME_OUT set across every later CMD — and the driver
+        // only W1C-clears errors it SEES (its HSTS poll reads our live
+        // DATA_FLAG word, which hides the stored error bits, so the
+        // W1C never fires). bcm2835_finish_command then fails EVERY
+        // mrq on the stale bit: the CMD18 at 0x1290 (8x512, DMA,
+        // dst 0x1564 — a VALID in-RAM page) completed its data (DMDST
+        // magic 0x015b GOOD) yet reported err -110 (TIME_OUT).
+        // Upstream QEMU models this via fresh status per send_command;
+        // real HW clears status on the next command issue. Clear the
+        // error latches on every NEW command (the illegal/illegal arm
+        // below sets them AFTER, so its own FAIL+TIME_OUT survives).
+        // (Was CMD55-only; widened — CMD55's clear was already proven
+        // harmless across the whole battery.)
+        self.sdh_status &= !(0x40 | 0x80 | 0x20 | 0x10 | 0x08);
         // M76 CMD completion log (SDTRACE-gated, zero-cost off): the
         // model state sampled at chunk edges always shows CMD=0/RSP=0
         // (NEW_FLAG self-clears + RSP consumed intra-chunk), so the
@@ -1561,6 +1719,35 @@ impl Bus {
                     // (sd_exec ignores blockLen the same way).
                     self.sdh_rsp = [R1_TRAN_READY, 0, 0, 0];
                 }
+                22 => {
+                    // CMD22 SEND_NUM_WR_BLOCKS (R1 + 4-byte data: the
+                    // count of successfully written blocks — upstream
+                    // mmc_send_num_wr_blocks, ADTC single-block read).
+                    // This run PROVES the driver issues it after every
+                    // CMD25 journal write (line 931: `cmd op 22 ...
+                    // data blocks 1 blksz 4`, right after the STOP of
+                    // the CMD25 at line 909) and treats a missing
+                    // data beat as a transfer failure (the STOP dump
+                    // at line 933 shows SDCMD 0x56 = STOP-after-CMD22
+                    // still in flight; the "got command busy
+                    // interrupt 0x501 even though no command operation
+                    // was in progress" WARN + `devtmpfs: error
+                    // mounting -117` follow). Serve one 4-byte word:
+                    // the write cursor's committed sector count
+                    // (nsec = write_off/512 — the STOP arm commits the
+                    // same units, so the count agrees with the card).
+                    let nsec = (self.sdh_write_off / 512) as u32;
+                    self.sdh_rsp = [R1_TRAN_READY, 0, 0, 0];
+                    self.sdh_fifo_len = 0;
+                    self.sdh_fifo_pos = 0;
+                    self.sdh_fifo_push(nsec);
+                    self.sdh_status |= 0x01; // DATA_FLAG
+                    if (self.sdh_cfg & (1 << 4)) != 0 {
+                        self.sdh_status |= 0x100; // SDIO_IRPT
+                    }
+                    self.sdh_datacnt = 0;
+                    sdh_log!();
+                }
                 52 | 53 | 54 | 58 | 59 => {
                     // ILLEGAL in SD mode (QEMU sd_proto_sd: sd_r0 =
                     // no response): SDIO CMD52 probe, CMD53/54/58/59.
@@ -1636,22 +1823,11 @@ impl Bus {
                     }
                 }
                 55 => {
-                    // CMD55 APP_CMD prefix: latch + CLEAR STICKY ERROR
-                    // BITS (QEMU send_command error path is per-command:
-                    // FAIL_FLAG lives in sdh_cmd and is overwritten by
-                    // the next CMD write, but CMD_TIME_OUT lives in
-                    // sdh_status until W1C-cleared — and the driver only
-                    // clears errors it SEES. Our CMD52 FAIL+TIME_OUT
-                    // from the sdio_reset probe (2x per rescan cycle)
-                    // left TIME_OUT set across the CMD8/CMD5/CMD55
-                    // that followed; bcm2835_finish_command checks
-                    // SDCMD_FAIL_FLAG first and fails the mrq on the
-                    // STALE bit. Real HW clears status on the next
-                    // command issue (QEMU models this via fresh status
-                    // per send_command). Clear error bits on every NEW
-                    // command (except the FAIL-setting illegal arm
-                    // below, which sets them after).
-                    self.sdh_status &= !(0x40 | 0x80 | 0x20 | 0x10 | 0x08);
+                    // CMD55 APP_CMD prefix: latch (the stale-error
+                    // clear now happens for EVERY new command at
+                    // send_command entry — see the M77 clear above;
+                    // CMD52 FAIL+TIME_OUT used to leak across CMD8/
+                    // CMD5/CMD55 here, failing mrqs on the stale bit).
                     self.sdh_app_cmd = true;
                     self.sdh_rsp = [R1_TRAN_READY | 0x20, 0, 0, 0];
                     sdh_log!();
@@ -1732,11 +1908,100 @@ impl Bus {
                     // TRAN (data done, bytes_xfered set by the DMA
                     // completion). Real HW answers plain TRAN+READY
                     // R1 (0x900) — exactly like every other R1 here.
-                    // (A DATA-state beat 0x500 was tried first: it
-                    // made the post-STOP status poll observe busy and
-                    // never exit — 1909x storm. The DATA beat is
-                    // correct only for R1b BUSY waits (CMD6-switch
-                    // polling), never for STOP-after-read.)
+                    // STOP-resp: all four words, like every R1 here.
+                    // BUSY-clear: this run PROVES the driver treats
+                    // the STOP response register as the error source
+                    // for the transfer (the CMD22 single-word read at
+                    // line 931 dumped SDCMD 0x56 = STOP-after-CMD22
+                    // with stale BUSY latched from the STOP — the
+                    // "got command busy interrupt 0x501 even though no
+                    // command operation was in progress" WARN fired,
+                    // then the block layer retried and re-read).
+                    // Real HW raises BUSY_IRPT only when a command is
+                    // issued WITH BUSYWAIT set (QEMU send_command
+                    // verbatim — checked there, not carried across
+                    // commands); a stale BUSY latch from an earlier
+                    // STOP must not survive into the next command's
+                    // completion handshake. Clear it on STOP.
+                    self.sdh_status &= !0x400; // BUSY_IRPT
+                    // M77 WRITE-COMMIT POINT (execution-proven: the
+                    // journal replay's CMD25 multi-block writes push
+                    // their bytes through the DMA RAM->SDDATA path
+                    // into the FIFO but never commit them — the old
+                    // code had no write cursor at all, so written
+                    // bytes sat in the FIFO and the replay re-read
+                    // stale blocks). STOP after a WRITE is where the
+                    // card latches the programmed blocks: commit any
+                    // whole sectors assembled so far, then answer
+                    // TRAN+READY like the read path.
+                    // M80 STALE-WOFF COMMIT (execution-proven
+                    // 2026-09-25 via zzpost12: the sector-0 CMD25 at
+                    // 6.788B assembled woff=4096 then the DMA tail
+                    // cleared wact (datacnt hit 0) WITHOUT committing,
+                    // so STOP saw wact=false and committed NOTHING —
+                    // sec0 stayed zeros while woff=4096 proved the
+                    // bytes arrived. Gate the commit on woff>0, not
+                    // wact: woff is the bytes-assembled proof, wact
+                    // is just the drain-in-progress flag).
+                    // M80 SHADOW COMMIT (execution-proven 2026-09-25:
+                    // the woff evidence itself can go stale — a later
+                    // non-data CMD's stale-clear zeroes woff before
+                    // the STOP arrives (zzsec0: woff STILL 4096 at the
+                    // STOP budget, yet sec0 zeros — the commit loop
+                    // ran against a write_sec the stale rule had
+                    // already abandoned). Prefer the DMA-time shadow
+                    // (sec+len+bytes captured in dma_sdhost_transfer,
+                    // immune to cursor churn); fall back to the
+                    // legacy woff buffer when no shadow is pending.
+                    if self.sdh_shadow_len > 0 {
+                        let nsec = (self.sdh_shadow_len as usize) / 512;
+                        // M82 STOP-COMMIT TRACE (SDTRACE-gated): proves
+                        // which sectors the commit actually writes
+                        // (the shfull probe shows shadow/writebuf/RAM
+                        // identical yet sec0 zeros — the commit must be
+                        // writing the wrong sectors or not running).
+                        if std::env::var("SDTRACE").is_ok() {
+                            eprintln!("SDHSTOPCOMMIT shsec={} shlen={} nsec={}",
+                                self.sdh_shadow_sec, self.sdh_shadow_len, nsec);
+                        }
+                        for i in 0..nsec {
+                            let mut sec = self.sd_read_sector(self.sdh_shadow_sec + i);
+                            let base = i * 512;
+                            for j in 0..512 {
+                                sec[j] = self.sdh_shadow_buf[base + j];
+                            }
+                            self.sd_write_sector(self.sdh_shadow_sec + i, sec);
+                        }
+                        self.sdh_shadow_len = 0;
+                        self.sdh_write_active = false;
+                        self.sdh_write_off = 0;
+                        self.sdh_datacnt = 0;
+                        self.sdh_fifo_len = 0;
+                        self.sdh_fifo_pos = 0;
+                    } else if self.sdh_write_off > 0 {
+                        let nsec = (self.sdh_write_off as usize) / 512;
+                        for i in 0..nsec {
+                            let mut sec = self.sd_read_sector(self.sdh_write_sec + i);
+                            let base = i * 512;
+                            let end = ((base + 512) as u32).min(self.sdh_write_off);
+                            for j in (base as u32)..end {
+                                sec[(j - base as u32) as usize] =
+                                    self.sdh_write_buf[(j) as usize];
+                            }
+                            self.sd_write_sector(self.sdh_write_sec + i, sec);
+                        }
+                        self.sdh_write_active = false;
+                        self.sdh_write_off = 0;
+                        self.sdh_datacnt = 0;
+                        self.sdh_fifo_len = 0;
+                        self.sdh_fifo_pos = 0;
+                    }
+                    // M77 write-done consume (see sdh_pending2): STOP
+                    // is the transfer's consume point — clear the
+                    // completion state so the level drops after the
+                    // STOP completes (upstream: STOP sent after
+                    // finish_data, then finish_request).
+                    self.sdh_write_done = false;
                     self.sdh_rsp = [R1_TRAN_READY, 0, 0, 0];
                     sdh_log!();
                 }
@@ -1755,9 +2020,12 @@ impl Bus {
                     // in __mmc_poll_for_busy 'Card stuck being busy';
                     // without READY+TRAN the switch-status poll
                     // (CMD13 x1928 storm, 8.8B run) never exits).
-                    // Covers CMD6 (SWITCH_FUNC, R1 here + 64B status
-                    // via the data phase below when the driver
-                    // programs HBLC/HBCT) and CMD13 (SEND_STATUS).
+                    // Covers CMD13 (SEND_STATUS, R1/AC per upstream
+                    // __mmc_send_status: MMC_RSP_R1|MMC_CMD_AC) and
+                    // any other R1 command. NOTE: CMD6 (SWITCH_FUNC)
+                    // does NOT reach here — it has its own arm above
+                    // (R1 + arg-decoded 64B status via the data phase
+                    // when the driver programs HBLC/HBCT).
                     self.sdh_rsp = [R1_TRAN_READY, 0, 0, 0];
                     sdh_log!();
                 }
@@ -1811,6 +2079,74 @@ impl Bus {
         // UHS switch and keeps the card at the current timing).
         // Sector reads (CMD17/18, 512-byte multiples) keep the
         // PIO sector path below.
+        // M77 CARD-WRITE LATCH (execution-proven 2026-09-23): the
+        // pure-SD boot runs the journal replay through CMD25
+        // multi-block WRITEs (arg 0x0, 8x512, DMA-fed, console lines
+        // 891/1439/1541/1709/1811 — every mount + every ext4_lookup
+        // retry writes the card, then re-reads it). The old data
+        // phase only LATCHED reads (`is_read` gate): write transfers
+        // never set `sdh_write_active`, so the DMA RAM->SDDATA path
+        // pushed words into the FIFO and they sat there unread —
+        // written bytes never reached `sd_disk`, so the journal
+        // replay re-read its own stale blocks and every lookup after
+        // the mount failed with ESTRUCTFAIL (deleted inode refs).
+        // Latch writes here (start sector + byte cursor, FIFO owned
+        // from empty like the read side); the commit happens on the
+        // SDDATA-write + CMD12-STOP paths below (sector assembly is
+        // incremental — pops never fire for a write, only pushes).
+        // M77b DMA-WRITE RACE (execution-proven 2026-09-23): the
+        // driver's CMD25 programs HBLC/HBCT then issues CMD with
+        // 0x8099 (bit7 SET = is_write) — but the DMA engine runs at
+        // sync_in time, AFTER send_command returns. The latch MUST
+        // be armed here at CMD-issue (before the DMA runs), NOT
+        // deferred: the dmat3 CMD25 at 6.779B showed DMDST=0 because
+        // the latch check `sdh_datacnt != 0` failed — the STALE-CLEAR
+        // rule below (`!is_read && !is_write` clears datacnt) ran on
+        // the PRECEDING non-data command and zeroed the programmed
+        // count before CMD25's own data phase. Order here: latch
+        // FIRST (this arm), stale-clear LAST (below) — a data CMD
+        // never clears its own count.
+        // M77c CMD-WORD PARITY (upstream bcm2835_send_command +
+        // core.h BIT(8)/BIT(9), execution-proven 2026-09-23): the
+        // SDCMD word's bit7 (0x80 = SDCMD_WRITE_CMD) is NOT the
+        // data-direction bit the latch must use — upstream derives
+        // is_write from the MMC DATA FLAGS (BIT(8) = WRITE), and the
+        // SDCMD word carries them at a different position. The
+        // sector-0 CMD25 trace PROVES it: the CMD word 0x8099 HAS
+        // bit7 set, yet NO DMA chain ran and NO SDDATA words came —
+        // the transfer is PIO-mode (no dma_desc: prepare_dma never
+        // ran for it), so the driver's transfer_pio loop should have
+        // pushed the words — but it never polled EDM either. The
+        // write latch armed on bit7, the DMA never consumed it (no
+        // chain), the PIO loop never ran (no EDM polls), and the
+        // STOP committed zero bytes.
+        // M77d CORRECTION (2026-09-24, oracle-verified): the above
+        // M77c theory is WRONG. QEMU fifo_run (in-repo oracle,
+        // bcm2835_sdhost.c:189-190) derives direction from the SDCMD
+        // word itself: is_write = cmd & SDCMD_WRITE_CMD (0x80 = bit7),
+        // NOT from any MMC_DATA flag position. Upstream driver
+        // send_command programs SDCMD bit7 from the data direction
+        // (see bcm2835_send_command: WRITE_CMD iff data is write).
+        // The 0x8099 word HAS bit7 set, so hardware treats it as a
+        // write; there is no bit8 direction encoding on this bus.
+        // The sector-0 mystery is therefore NOT the latch bit — it is
+        // that the transfer ran in PIO mode (no DMA chain: prepare_dma
+        // only runs when blocks > PIO_THRESHOLD=1... but this CMD25
+        // has 8 blocks, so DMA *should* have run) or that the DMA ran
+        // with a stale/empty CB. The latch bit returns to upstream
+        // parity: bit7 (SDCMD_WRITE_CMD), matching fifo_run verbatim.
+        let cmd_is_write = is_write;
+        if self.sdh_datacnt != 0 && cmd_is_write {
+            self.sdh_write_active = true;
+            self.sdh_write_sec = arg as usize;
+            // M80 STALE-WOFF RESET (companion to the STOP commit fix:
+            // woff is now commit evidence, so a new write must start
+            // from zero — otherwise a previous transfer's assembled
+            // bytes would commit to the new transfer's sectors).
+            self.sdh_write_off = 0;
+            self.sdh_fifo_len = 0;
+            self.sdh_fifo_pos = 0;
+        }
         if self.sdh_datacnt != 0 && is_read {
             // M76 read-stream latch (refill-on-pop cursor): the FIFO
             // holds 16 words but the transfer streams datacnt bytes;
@@ -1820,6 +2156,12 @@ impl Bus {
             // inline and is NOT part of the stream (read_active
             // stays clear so pops don't refill garbage after it).
             self.sdh_read_active = false;
+            // (M87c: prefill_skip reset per latch — a new transfer's
+            // prefill owns the FIFO from empty; stale skip counts die
+            // with the old transfer. Set to the fresh prefill word
+            // count in the sector arm below; synthetics leave it 0
+            // since read_active=false already suppresses refill.)
+            self.sdh_prefill_skip = 0;
             if idx != 6 && idx != 13 {
                 self.sdh_read_active = true;
                 self.sdh_read_sec = arg as usize;
@@ -1949,14 +2291,28 @@ impl Bus {
                 // (datacnt hits 0 in the loop above for the programmed
                 // 1x64); read_active stays clear so later pops of
                 // these words don't refill (see the latch above).
+                // (M87c: prefill_skip untouched here — read_active
+                // false already suppresses refill for synthetics.)
             } else {
                 // Sector index = arg (block address; the driver uses
                 // block addressing after ACMD41/OCR negotiation).
+                // M77 SECTOR STRIDE (execution-proven 2026-09-23):
+                // the old index `sec + n/128` treated n as a WORD
+                // count (128 words = 512 bytes) while n counts BYTES
+                // (n%4 packs the LE word) — so bytes 128..511 of
+                // every sector came from sector+1, bytes 512..1023
+                // from sector+2, etc. The dmat5 CMD18 at 0x1290
+                // PROVES it: FIFO words 0..31 were sector 0x1290's
+                // bytes 0..127, then word 32 jumped to sector 0x1291
+                // (SDFIFOV stream), so the DMA dst assembled a
+                // sector-shifted image and every post-mount lookup
+                // failed ESTRUCTFAIL. Byte cursor: sector =
+                // sec + n/512, offset = n%512.
                 let sec = arg as usize;
                 let mut n = 0u32;
                 let mut value = 0u32;
                 while self.sdh_datacnt > 0 && self.sdh_fifo_len < 16 {
-                    let blk = self.sd_read_sector(sec + (n as usize) / 128);
+                    let blk = self.sd_read_sector(sec + (n as usize) / 512);
                     let b = blk[((n as usize) % 512)];
                     value |= (b as u32) << ((n % 4) * 8);
                     self.sdh_datacnt -= 1;
@@ -1985,7 +2341,55 @@ impl Bus {
                 // partition scan failed; unit probe: magic 0000).
                 // The fill above served n bytes from the stream start;
                 // the refill cursor continues after them.
+                // M77h PREFILL/REFILL DOUBLE-COUNT (execution-proven
+                // 2026-09-24): the fill loop above consumed datacnt
+                // for bytes 0..n-1 AND set read_off=n; the refill arm
+                // in sdh_fifo_pop then serves (read_sec + read_off/512)
+                // — but ONLY if read_off was left at n. The old code
+                // is correct here; the ACTUAL duplication is subtler:
+                // dma_sdhost_transfer ALSO drains via sdh_fifo_pop,
+                // which refills from the same cursor — so the DMA
+                // path is consistent. The prefill serves the FIRST 64
+                // bytes into the FIFO; pops 0..15 drain them while
+                // refilling bytes 64... The cursor math is right; the
+                // M77g cross-CB advance (below in dma_sdhost_transfer)
+                // handles chained CBs. No change — documented because
+                // the duplication theory was disproven by the FIFO
+                // word trace (words 0..31 matched card bytes
+                // exactly).
                 self.sdh_read_off = n;
+                // M87c PREFILL-SKIP ARM (see sdh_fifo_pop): the prefill
+                // consumed bytes 0..n-1 into the FIFO and roff=n points
+                // refill AFTER them — so the first n/4 pops (draining
+                // the prefill) must not refill. n is always 64 here
+                // (16-word window) except short tails; skip count is
+                // words, i.e. n/4 rounded up.
+                self.sdh_prefill_skip = (n + 3) / 4;
+                // M87c PREFILL RESIDUE ACCOUNTING (execution-proven
+                // 2026-09-27: the prefill loop above ALWAYS stops at
+                // 16 words / 64 bytes (fifo_len<16 gate) while the
+                // refill-on-pop arm serves from (rsec + roff/512).
+                // roff=n therefore DOUBLE-serves bytes 0..63: the
+                // prefill already placed them in the FIFO AND the
+                // cursor still points at them, so the first 16 pops
+                // drain prefill bytes 0..63 while refilling bytes
+                // 0..63 again behind them — every CB's dst starts
+                // with a 64-byte stutter (chainfull cb1 bad_off=128:
+                // first 128 bytes = sec0x28[0:64] twice, then stream
+                // continues correctly). The M87 chained-CB resync
+                // (drop+refill at CB start) papers over this for
+                // chained CBs but single-CB reads keep the stutter.
+                // Fix at the source: the prefill CONSUMED bytes
+                // 0..n-1 into the FIFO, so the refill cursor starts
+                // AFTER them — which is exactly what roff=n says.
+                // The drain loop below must therefore SKIP the
+                // prefilled words, not re-drain them: pops 0..15 must
+                // come from the FIFO WITHOUT refill (refill would
+                // re-serve bytes 0..63), and refill resumes at pop 16.
+                // Implement: suspend refill while draining the
+                // prefill count (read_active=false for the first
+                // min(fifo_len_at_entry, ...) pops — see the drain
+                // loop in dma_sdhost_transfer).
             }
         }
         // M76 STALE-DATACNT CLEAR (QEMU send_command parity): the
@@ -1999,13 +2403,37 @@ impl Bus {
         // (wrong FIFO fill length, wrong DATA_FLAG timing). QEMU
         // recomputes per-command state in send_command; here the
         // equivalent is: non-data commands (no is_read, no is_write)
-        // clear a leftover datacnt.
+        // clear a leftover datacnt. (M77d: direction is SDCMD bit7
+        // WRITE_CMD / bit6 READ_CMD, QEMU fifo_run parity — 0x800 is
+        // BUSYWAIT, never the direction test.)
         if !is_read && !is_write {
             self.sdh_datacnt = 0;
             self.sdh_read_active = false;
+            // (M77: the write latch dies with the same stale rule —
+            // a non-data CMD12 STOP commits first (see the CMD12 arm),
+            // anything else just abandons the partial write.)
+            self.sdh_write_active = false;
         }
         if ((self.sdh_cmd & 0x800) != 0) && ((self.sdh_cfg & (1 << 10)) != 0) {
+            // M77 BUSY LIFECYCLE (upstream bcm2835.c send_command
+            // parity, execution-proven 2026-09-23): BUSY_IRPT fires
+            // ONLY when the CURRENT command is issued WITH BUSYWAIT
+            // set (R1b responses) AND the driver enabled BUSY_IRPT_EN
+            // — QEMU's send_command checks this per command, it is
+            // never carried across commands. The old code OR'd the
+            // latch and never cleared it, so the CMD25's BUSY (R1b,
+            // bit 0x800 set in 0x8099) was still latched when CMD22
+            // completed — the driver's busy_irq handler fired with
+            // host->use_busy already false ("got command busy
+            // interrupt 0x501 even though no command operation was
+            // in progress" WARN) and every post-mount exec failed
+            // ESTRUCTFAIL downstream of the wedged request state.
+            // Clear-then-set per command: a non-BUSYWAIT command
+            // leaves BUSY_IRPT clear even if a previous command set
+            // it (the driver's busy_irq consumes it exactly once).
             self.sdh_status |= 0x400; // BUSY_IRPT (QEMU verbatim)
+        } else {
+            self.sdh_status &= !0x400; // BUSY_IRPT
         }
         // M75e DATA IRQ on data-ready (driver bcm2835_irq needs it:
         // the IRQ handler checks (DATA_FLAG && DATA_IRPT_EN) and wakes
@@ -2044,26 +2472,30 @@ impl Bus {
     /// BASIC bit 18 mirrors it via irq_dups[] index 8).
     /// (First cut gated bank-1 bit 24 = GPU IRQ 24/DMA — wrong bank,
     /// so the line never delivered and every data CMD timed out.)
-    /// M76w IRQ LIFECYCLE (execution-proven dmatr14: 118 sdh_p2
-    /// deliveries 6.771B-6.875B, then ZERO after the CMD12 at
-    /// n=6875013120 although status stayed 0x101/DATA_FLAG and the
-    /// enable stayed set — the driver's per-IRQ 0x7f8/0x701 W1C
-    /// clears the latched SDIO bit and nothing re-raises it, so the
-    /// level dies mid-transfer and the waiter polls 1875x CMD13):
-    /// the IRQ must be a LEVEL derived from live transfer state,
-    /// not just latched status bits. Live condition = DATA_FLAG set
-    /// (a transfer completed and its data is/was available) with no
-    /// BUSY error latched. The handler's W1C of SDIO alone must not
-    /// kill the level while DATA_FLAG is still set — real HW keeps
-    /// the data line asserted until the FIFO drains (all words
-    /// popped) or the next command issues. Model: DATA_FLAG&&!BUSY
-    /// asserts the line regardless of the SDIO latch (SDIO stays as
-    /// the QEMU-parity status bit for the driver's intmask checks).
+    /// M76z LIVE-DATA LIFECYCLE (execution-proven, with the HSTS
+    /// live DATA_FLAG above): the line follows the LATCHED status
+    /// bits only (BUSY/BLOCK/SDIO, all W1C'd by the handler) —
+    /// exactly QEMU's update_irq. The M76w DATA_FLAG-level detour
+    /// (firing on DATA_FLAG regardless of SDIO) is REVERTED: with a
+    /// live DATA_FLAG the level died correctly after the drain, and
+    /// the detour's extra firing risked the spurious second-delivery
+    /// PIO-timeout path. DMA-mode transfers (CFG bit4 clear, no
+    /// SDIO) complete via the DMA channel IRQ, never here — matching
+    /// upstream, whose data- whisker requires DATA_IRPT_EN.
+    /// M77f LEVEL-LIVE REVERT (execution-proven 2026-09-24): the
+    /// write_done level-live extension (re-assert BLOCK after the
+    /// driver's HSTS W1C until STOP) is REVERTED — it floods IRQ 98
+    /// with hundreds of unclaimed edges ("irq 98: nobody cared ...
+    /// Disabling IRQ #98"), after which the line is dead and later
+    /// transfers wedge. Root cause of the wedge it was papering
+    /// over: the driver's block_irq completes a DMA WRITE the moment
+    /// BLOCK_IRPT fires, but our sync DMA completion ran at sync_in
+    /// while the HSTS W1C + chunk-edge delivery race meant the edge
+    /// never surfaced. The correct fix is edge timing (deliver the
+    /// BLOCK edge exactly once, synchronously with completion), not
+    /// a sticky level. QEMU parity: pure latched bits.
     pub fn sdh_pending2(&self) -> u32 {
-        let live_data = (self.sdh_status & 0x01) != 0 && (self.sdh_status & 0x400) == 0;
-        if ((self.sdh_status & (0x400 | 0x200 | 0x100)) != 0 || live_data)
-            && ((self.ic_en2 >> 24) & 1) != 0
-        {
+        if (self.sdh_status & (0x400 | 0x200 | 0x100)) != 0 && ((self.ic_en2 >> 24) & 1) != 0 {
             1 << 24
         } else {
             0
@@ -3029,8 +3461,51 @@ impl Bus {
         let src_inc = ti & 1 != 0 || ti & (1 << 8) != 0;
         let dst_inc = ti & 2 != 0 || ti & (1 << 4) != 0;
         let mut rem = len & !3; // word-multiple; trailing bytes ignored (PIO-aligned)
+        // M77 DMA-WRITE direction flag (hoisted: the completion tail
+        // below needs it after the borrow ends — the write arm is the
+        // only one that sets BLOCK_IRPT).
+        // M77g MULTI-CB READ CURSOR (execution-proven 2026-09-24):
+        // the 8-sector CMD18 arrives as TWO chained CBs (0xff4 +
+        // 0x1000-style splits observed: first CB len 0xff4 at
+        // 6.766B, second CB at next=0xdc061020 never ran). The old
+        // code consumed read bytes ONLY from sdh_fifo_pop, which
+        // refills from (sdh_read_sec, sdh_read_off) — but NOTHING
+        // ever advanced sdh_read_sec between chained CBs, so the
+        // second CB re-read the FIRST CB's sectors (stale page
+        // cache -> ESTRUCTFAIL on every post-mount lookup). Fix:
+        // track the READ cursor across CBs — advance sdh_read_sec
+        // by whole sectors consumed when a read CB drains.
+        let mut wrote_any = false;
+        // Bytes consumed from the card stream by THIS transfer (read
+        // path advances the cross-CB cursor below).
+        let mut read_bytes: u64 = 0;
+        // M84 CURSOR TRACE (DMATRACE-gated, zero-cost off): proves the
+        // per-CB read-cursor state around each chained transfer (the
+        // 0x28 chain's cb1 dst re-serves sec0x28 bytes — the cursor the
+        // second CB drains from must be proven, not assumed).
+        if self.dma_trace && std::env::var("DMATRACE").is_ok() && src == SDDATA {
+            eprintln!("DMACUR pre dst=0x{:x} len=0x{:x} rsec=0x{:x} roff={} datacnt={} fifo={} ract={}",
+                dst, len, self.sdh_read_sec, self.sdh_read_off, self.sdh_datacnt,
+                self.sdh_fifo_len, self.sdh_read_active as u8);
+        }
         if src == SDDATA && self.in_ram(dst, rem) {
             // Card read: FIFO -> RAM.
+            // M89 RE-ARM (execution-proven 2026-09-27: with the
+            // datacnt gate restored (fault-null to 6.95B, con=100715)
+            // chained CBs after cb0 starve (cb1 bad_off=128, cb2+
+            // bad_off=0) because datacnt is a per-CMD program consumed
+            // by the first CB's drain, while the DMA runs per-CB.
+            // Fix WITHOUT touching the gate: re-arm datacnt at CB
+            // start from the CB's own remaining length (rem). The CB
+            // knows exactly how many bytes IT moves; the cursor
+            // (rsec/roff, advanced per-CB below) knows WHERE from.
+            // Together they bound each CB's refill precisely — no
+            // over-stream (the 6.94B Translation fault came from
+            // unbounded refill, not from re-arming), no starvation.
+            // (M87e removal note superseded — kept as record: NEVER
+            // drop+refill the FIFO at CB start; it zeroes cb0. The
+            // re-arm below is the correct half of that attempt.)
+            self.sdh_datacnt = rem as u32;
             let mut d = dst;
             while rem >= 4 {
                 let w = self.sdh_fifo_pop() as u32;
@@ -3043,18 +3518,95 @@ impl Bus {
                     d += 4;
                 }
                 rem -= 4;
+                read_bytes += 4;
+            }
+            // Advance the cross-CB read cursor by whole sectors so a
+            // chained second CB continues where this one stopped
+            // (M77g: without this the second CB re-reads sector 0x28
+            // instead of continuing at 0x28+len/512).
+            if read_bytes >= 512 {
+                self.sdh_read_sec += (read_bytes / 512) as usize;
+                self.sdh_read_off %= 512;
+            }
+            if self.dma_trace && std::env::var("DMATRACE").is_ok() {
+                eprintln!("DMACUR post dst=0x{:x} read_bytes={} rsec=0x{:x} roff={} datacnt={} fifo={}",
+                    dst, read_bytes, self.sdh_read_sec, self.sdh_read_off,
+                    self.sdh_datacnt, self.sdh_fifo_len);
             }
         } else if dst == SDDATA && self.in_ram(src, rem) {
-            // Card write: RAM -> FIFO.
+            // Card write: RAM -> SDDATA. Route through the SAME
+            // commit-on-push path as PIO SDDATA writes (M77 write arm
+            // above): assemble into the write buffer + consume
+            // datacnt, so the CMD12 STOP commits whole sectors to
+            // sd_disk. Direct FIFO pushes (old code) never committed.
+            // M80 SHADOW CAPTURE (companion to the shadow-commit
+            // fields): snapshot the RAM source words in order, GATED
+            // on the wact/datacnt live-transfer flag — the shadow is
+            // the transfer's commit evidence, so it must contain
+            // exactly the transfer's bytes, not whatever the FIFO
+            // path pushed while no transfer was latched (stale
+            // residue words would commit to the wrong sectors —
+            // proven 2026-09-25: an ungated shadow committed 4096
+            // stale/fifo bytes and sec0 stayed zeros). Keyed on the
+            // latched write_sec (the transfer's start sector, set at
+            // CMD issue).
+            let shadow_sec = self.sdh_write_sec;
+            let mut shadow_off: u32 = 0;
+            let shadow_take = self.sdh_write_active && self.sdh_datacnt > 0;
             let mut s = src;
             while rem >= 4 {
                 let a = s as usize;
                 let w = u32::from_le_bytes([self.mem[a], self.mem[a + 1], self.mem[a + 2], self.mem[a + 3]]);
-                self.sdh_fifo_push(w);
+                if self.sdh_write_active && self.sdh_datacnt > 0 {
+                    wrote_any = true;
+                    let mut ww = w;
+                    for _ in 0..4 {
+                        if self.sdh_datacnt == 0 {
+                            break;
+                        }
+                        if (self.sdh_write_off as usize) < self.sdh_write_buf.len() {
+                            self.sdh_write_buf[self.sdh_write_off as usize] =
+                                (ww & 0xff) as u8;
+                        }
+                        self.sdh_write_off += 1;
+                        self.sdh_datacnt -= 1;
+                        ww >>= 8;
+                    }
+                    if self.sdh_datacnt == 0 {
+                        self.sdh_write_active = false;
+                    }
+                } else {
+                    self.sdh_fifo_push(w);
+                }
                 if src_inc {
                     s += 4;
                 }
                 rem -= 4;
+                // M80 shadow: the transfer's source words in order,
+                // gated on the live-transfer flag sampled at entry
+                // (shadow_take): only a latched transfer's bytes are
+                // commit evidence. Publishing an ungated shadow would
+                // commit stale FIFO-residue words to live sectors.
+                if shadow_take {
+                    let mut ww2 = w;
+                    for _ in 0..4 {
+                        if (shadow_off as usize) < self.sdh_shadow_buf.len() {
+                            self.sdh_shadow_buf[shadow_off as usize] = (ww2 & 0xff) as u8;
+                        }
+                        shadow_off += 1;
+                        ww2 >>= 8;
+                    }
+                }
+            }
+            // Publish the shadow IFF this transfer was a latched write
+            // (shadow_take): a non-write DMA transfer (e.g. a CMD18
+            // read landing on this arm via address aliasing) must not
+            // publish — its bytes would commit to write_sec at STOP.
+            // One pending transfer at a time (STOP consumes before the
+            // next CMD25 issues), so overwrite is correct.
+            if shadow_take {
+                self.sdh_shadow_sec = shadow_sec;
+                self.sdh_shadow_len = shadow_off;
             }
         } else {
             // Neither side is RAM-reachable: fall back to plain copy
@@ -3076,10 +3628,54 @@ impl Bus {
         // DMA reads (CFG 0x40e has bit9? no: 0x40e = bits 1,9,10;
         // bit8 BLOCK_IRPT_EN is CLEAR in 0x40e...). See M76v note in
         // sdh_pending2: gate widened to DATA_FLAG&!BUSY instead.
+        // M77 DMA-WRITE BLOCK_IRPT (upstream bcm2835_data_irq parity,
+        // execution-proven 2026-09-23): the data_irq handler switches
+        // a WRITE to BLOCK_IRPT_EN after the first block and the
+        // block_irq handler completes DMA writes (`else if
+        // (host->data->flags & MMC_DATA_WRITE)
+        // bcm2835_finish_data(host)`) — NO data_irq beat needed. Our
+        // synchronous DMA completion never runs the data_irq switch
+        // (no per-block IRQs in a sync model), so set BLOCK_IRPT here
+        // when the transfer was a WRITE and BLOCK_IRPT_EN will be on
+        // (the driver enables it for every DMA write; the dmat5 CMD25
+        // trace PROVES the enable lands: CFG 0x40e at STOP time of
+        // every CMD25). Without this the CMD25 data times out
+        // (err -110) even though the bytes committed correctly.
         self.sdh_datacnt = 0;
         self.sdh_status |= 0x01; // DATA_FLAG
         if (self.sdh_cfg & (1 << 4)) != 0 {
             self.sdh_status |= 0x100; // SDIO_IRPT
+        }
+        // (BLOCK_IRPT for DMA writes is set by the caller — the CARD
+        // write path above knows the direction; the PIO SDDATA-write
+        // arm sets it too. See those sites.)
+        // M77 DMA-WRITE BLOCK_IRPT (continued): the direction is
+        // known only in the write arm above (wrote_any) — set the
+        // latch here where self is free again. Gated on
+        // BLOCK_IRPT_EN (CFG bit8) like QEMU's fifo_run write tail:
+        // the driver enables it for DMA writes (dmat5 STOP-time CFG
+        // 0x40e... see the note above — the enable the data_irq
+        // switch programs; our sync model sets the beat directly).
+        if wrote_any && (self.sdh_cfg & (1 << 8)) != 0 {
+            self.sdh_status |= 0x200; // BLOCK_IRPT
+        }
+        // M77 write-done state (see sdh_pending2): the STOP is the
+        // consume point — set on DMA-write completion, cleared by
+        // the CMD12 arm. (PIO SDDATA-write completion sets it too —
+        // see that arm.)
+        // M77e DMA-NOT-STARTED (execution-proven 2026-09-24 via the
+        // CSF trace: the sector-0 CMD25 at 6.779B ran ZERO DMRUN —
+        // the DMA engine never started because its CB programs the
+        // transfer but the channel CS never goes ACTIVE for this
+        // PIO-mode write; the driver falls back to transfer_pio
+        // SDDATA words, which never arrive either since the guest
+        // polls EDM/FIFO state we serve as empty). write_done must
+        // therefore ALSO cover the case where the DMA never runs:
+        // gate it on the latched write transfer having DATA (datacnt
+        // programmed + write_active), not on wrote_any. The STOP arm
+        // still consumes it; a non-write transfer never sets it.
+        if wrote_any || (self.sdh_write_active && self.sdh_datacnt > 0) {
+            self.sdh_write_done = true;
         }
     }
 
@@ -3493,27 +4089,36 @@ impl Bus {
             // inferred) and vice versa.
             let v: u64 = match off {
                 // PENDING2 (GPIO bit 17 + UART bit 25 + SDIO bit 24)
-                // + BASIC mirrors (bit 9 GPIO, bit 19 UART shortcut,
-                // bit 18 SDIO via irq_dups[8]) + bank-0 bit 1 MAILBOX
-                // (M61 IRQ path, DTB-proven) + bank-1 bit 9 USB (M67:
-                // INTERRUPT_USB = GPU IRQ 9, served in PENDING1; BASIC
-                // bit 8 mirrors any non-shortcut bank-1 line incl.
-                // USB, like timer/DMA).
+                // + BASIC mirrors (QEMU bcm2835_ic.c verbatim:
+                // BASIC bit 8 = any low-32 GPU IRQ pending, bit 9 =
+                // any high-32 GPU IRQ pending (NOT per-IRQ lines —
+                // verified 2026-09-23 against the in-repo oracle
+                // hw/intc/bcm2835_ic.c: `res |= (gpu_pending != 0)
+                // << 8; res |= ((gpu_pending >> 32) != 0) << 9`),
+                // bits 10-20 = irq_dups[]
+                // {7,9,10,18,19,53,54,55,56,57,62}: sdhost/USB land
+                // ONLY at bit 18 (56->index 8->bit 18) and UART at
+                // bit 19 (57->index 9->bit 19).
+                // + bank-0 bit 1 MAILBOX (M61 IRQ path, DTB-proven)
+                // + bank-1 bit 9 USB (M67: INTERRUPT_USB = GPU IRQ 9,
+                // served in PENDING1; BASIC bit 8 mirrors any
+                // non-shortcut bank-1 line incl. USB, like
+                // timer/DMA).
                 0x08 => (self.gpio_pending2() | self.uart_pending2() | self.sdh_pending2()) as u64,
                 0x04 => (self.timer_pending1() | self.dma_pending1() | self.usb_pending1()) as u64,
                 0x00 => {
                     let mut b = 0u64;
                     if self.timer_pending1() | self.dma_pending1() | self.usb_pending1() != 0 {
-                        b |= 1 << 8; // any non-shortcut bank-1 line
+                        b |= 1 << 8; // any low-32 GPU IRQ (QEMU verbatim)
                     }
                     if self.sdh_pending2() != 0 {
                         b |= 1 << 18; // IRQ 56 via irq_dups[8] (QEMU verbatim)
                     }
-                    if self.gpio_pending2() != 0 {
-                        b |= 1 << 9;
+                    if self.gpio_pending2() | self.uart_pending2() | self.sdh_pending2() != 0 {
+                        b |= 1 << 9; // any high-32 GPU IRQ (QEMU verbatim)
                     }
                     if self.uart_pending2() != 0 {
-                        b |= 1 << 19;
+                        b |= 1 << 19; // IRQ 57 via irq_dups[9] (QEMU verbatim)
                     }
                     if self.mbox_pending0() != 0 {
                         b |= 1 << 1; // ARM_MAILBOX (bank-0 bit 1, DTB-proven)
@@ -3748,7 +4353,19 @@ impl Bus {
                 eprintln!("SDHRD off=0x{:x} sz={}", off, size);
             }
             let v: u64 = match off {
-                0x00 => self.sdh_cmd as u64,
+                // SDCMD READ = fail-flag state (upstream
+                // bcm2835_finish_command: `sdcmd =
+                // bcm2835_read_wait_sdcmd(host, 100)` then
+                // NEW_FLAG->EIO / FAIL_FLAG->TIME_OUT-or-EILSEQ).
+                // Our send_command completes synchronously (real HW
+                // clears NEW synchronously too — QEMU's
+                // `s->cmd &= ~SDCMD_NEW_FLAG` at write time), so a
+                // read here must NEVER see NEW (else EIO) and must
+                // see FAIL only when this command actually failed
+                // (the illegal arm sets sdh_cmd FAIL; the stale
+                // TIME_OUT backstop lives in sdh_status, checked via
+                // HSTS — NOT here). Serve the latched fail bit only.
+                0x00 => (self.sdh_cmd & 0x4000) as u64,
                 0x10 | 0x14 | 0x18 | 0x1c => {
                     let i = ((off - 0x10) / 4) as usize;
                     // M76q valued RSP reads (SDTRACE-gated): proves
@@ -3770,13 +4387,25 @@ impl Bus {
                     // lifecycle (set at completion, W1C'd by the
                     // handler, re-set by the next transfer) vs stuck
                     // set/clear across the CMD12 + CMD13 storm.
+                    // M76z LIVE DATA_FLAG (execution-proven: the SSR
+                    // PIO transfer completed (driver read all 16
+                    // words, W1C'd) yet TIMED OUT 10s later — the
+                    // stored DATA_FLAG latch stayed set, the level
+                    // re-fired into an EMPTY FIFO, transfer_pio hit
+                    // its 500ms PIO-timeout path and errored the
+                    // mrq; real HW derives DATA_FLAG from FIFO
+                    // occupancy). Served bit0 = fifo non-empty;
+                    // the stored latch is still W1C'd/set for the
+                    // intmask checks but never keeps the line live
+                    // past the drain.
+                    let live = if self.sdh_fifo_len > 0 { 0x01 } else { 0x00 };
                     if std::env::var("SDTRACE").is_ok() {
-                        eprintln!("SDHSTSV status=0x{:x} n={}", self.sdh_status, self.sdh_chunk_n);
+                        eprintln!("SDHSTSV status=0x{:x} n={}", (self.sdh_status & !0x01) | live, self.sdh_chunk_n);
                     }
                     if std::env::var("SDTRACE").is_ok() && (self.sdh_status & (0x40 | 0x80 | 0x20 | 0x10 | 0x08)) != 0 {
                         eprintln!("SDHSTS_ERR status=0x{:x} n={}", self.sdh_status, self.sdh_chunk_n);
                     }
-                    self.sdh_status as u64
+                    ((self.sdh_status & !0x01) | live) as u64
                 }
                 0x30 => self.sdh_vdd as u64,
                 // SDEDM+0x34: M75f PIO FIFO count + M75e FSM idle —
@@ -3785,6 +4414,19 @@ impl Bus {
                 // the STALE raw edm until 2026-09-20). Live fifo_len
                 // in bits[8:4] + FSM DATAMODE in bits[3:0]; upper
                 // bits preserved.
+                // M77 WRITE-SPACE (execution-proven 2026-09-23): the
+                // driver's PIO write loop computes space as
+                // 16 - fifo_count and spins while space < 8 (8-word
+                // PIO burst). During a latched WRITE the FIFO is
+                // always drained by our commit-on-push path, so the
+                // count is genuinely 0 — but count==0 ALSO reads as
+                // "16 words of space", which is CORRECT for a write
+                // (the commit path never fills the FIFO on writes).
+                // The dmat3 CMD25 regression (DMDST=0) is NOT this
+                // cell — it is the CMD word's direction bit (M77c:
+                // bit8, not bit7 — 0x8099 has bit7 SET for R1b
+                // BUSYWAIT but bit8 CLEAR, so no write latch fires;
+                // verify via the latch trace, not here).
                 0x34 => ((self.sdh_edm & !0x1ff) | ((self.sdh_fifo_len as u32 & 0x1f) << 4) | 0x1) as u64,
                 0x38 => self.sdh_cfg as u64,
                 0x3c => self.sdh_hbct as u64,
@@ -4129,6 +4771,14 @@ impl Bus {
             if std::env::var("MBOXTAG").is_ok() && (off == 0x18 || off == 0x10 || off == 0x14 || off == 0x24 || off == 0x1c || off == 0x20 || off == 0x00) {
                 eprintln!("ICWR off=0x{:x} val=0x{:08x}", off, v);
             }
+            // M77 IC enable write log (ICTRACE-gated, zero-cost off):
+            // proves exactly when each bank enable lands (the sdhost
+            // IRQ enable timing decides whether early PIO data wins
+            // or times out — execution-proven: en2-bit24 lands ~6.8B
+            // while the first DATA timeouts fire ~6.7B).
+            if std::env::var("ICTRACE").is_ok() && (off == 0x18 || off == 0x10 || off == 0x14 || off == 0x24 || off == 0x1c || off == 0x20) {
+                eprintln!("ICENW n={} off=0x{:x} val=0x{:08x}", self.sdh_chunk_n, off, v);
+            }
             match off {
                 // Upstream layout (reg_enable[] = {0x18, 0x10, 0x14},
                 // reg_disable[] = {0x24, 0x1C, 0x20}): bank-0 enable at
@@ -4172,6 +4822,17 @@ impl Bus {
                 }
                 0x04 => self.sdh_cmdarg = v,
                 0x20 => {
+                    // HSTS WRITE = W1C (QEMU SDHSTS arm verbatim):
+                    // the driver clears exactly the error bits it
+                    // observed (its HSTS poll reads our served word,
+                    // so the W1C mask matches what it saw). The M77
+                    // stale-error clear at send_command entry is the
+                    // backstop for errors the driver never sees (its
+                    // poll reads the live-DATA_FLAG word, which hides
+                    // stored error bits); this W1C is the live path
+                    // the dmat trace PROVES fires (line ~672:
+                    // `SDHWR off=0x20 val=0xf8` right after the
+                    // SDHSTS_ERR 0x40 tripwire at 6.657B).
                     self.sdh_status &= !v; // W1C (QEMU SDHSTS arm)
                 }
                 0x30 => self.sdh_vdd = v,
@@ -4198,7 +4859,107 @@ impl Bus {
                 }
                 0x3c => self.sdh_hbct = v,
                 0x40 => {
-                    self.sdh_fifo_push(v);
+                    // M80 SDDATA WRITE TRACE (SDTRACE-gated): proves
+                    // whether the DMA/PIO write path moved any bytes
+                    // (the sector-0 CMD25 at 6.788B assembled woff=4096
+                    // with ZERO SDDATA writes in the trace — the bytes
+                    // came from the DMA path, not this arm).
+                    if std::env::var("SDTRACE").is_ok() {
+                        eprintln!("SDHWDAT v=0x{:08x} wact={} wsec={} woff={} datacnt={}",
+                            v, self.sdh_write_active as u8, self.sdh_write_sec,
+                            self.sdh_write_off, self.sdh_datacnt);
+                    }
+                    // M77 WRITE COMMIT (commit-on-push): when a write
+                    // transfer is latched, every SDDATA word is card
+                    // data — assemble it into the write buffer and
+                    // consume datacnt (mirrors the read fill pacing).
+                    // The CMD12 STOP arm commits whole sectors to
+                    // sd_disk. When no write is latched (PIO reads
+                    // never write SDDATA, stray pushes), keep the old
+                    // FIFO behavior.
+                    // M77 PIO-WRITE COMPLETE (execution-proven
+                    // 2026-09-23): single-block PIO writes (the
+                    // sector-0 superblock write: CMD16 blksz=4 +
+                    // no-DMA PIO words, NO STOP — transfer_pio's
+                    // PIO loop, not the DMA path) drain datacnt to 0
+                    // right here with NO STOP to commit them. When
+                    // the last byte lands (datacnt hits 0 AND the
+                    // write was latched), commit whole sectors
+                    // immediately (same whole-sector loop as the
+                    // STOP arm) + set the DMA-write completion
+                    // state (write_done + BLOCK beat — the driver's
+                    // block_irq completes the write the same way).
+                    // Multi-block DMA writes keep their STOP commit
+                    // (their datacnt drains via the DMA path, not
+                    // here — this arm only fires on PIO SDDATA
+                    // writes, and the STOP arm re-commits
+                    // idempotently if both fire).
+                    // M77 PIO-MODE SPACE (execution-proven 2026-09-23,
+                    // upstream transfer_pio parity): the PIO write
+                    // loop computes space as 16 - fifo_count and
+                    // spins while space < 8 — it NEVER writes SDDATA
+                    // unless space is available. Our commit-on-push
+                    // path DRAINS every pushed word into the write
+                    // buffer immediately, so the FIFO stays empty and
+                    // space always reads 16 — but the sector-0 CMD25
+                    // trace PROVES zero SDDATA writes: the driver
+                    // spun on space because our EDM count (fifo_len)
+                    // was read at a moment the FIFO still held the
+                    // DMA-residue words (the write latch resets the
+                    // FIFO at CMD issue, but the driver's PIO loop
+                    // reads EDM BEFORE the first SDDATA write of the
+                    // transfer — residue from the previous transfer
+                    // made space read < 8 and the loop spun until
+                    // its 500ms timeout). The write-latch FIFO reset
+                    // (see the latch arm) already handles this for
+                    // DMA writes; PIO-mode CMD25 (no DMA chain, no
+                    // DMRUN) needs the same: the latch reset above
+                    // covers it (fifo_len=0 at CMD25 issue), so space
+                    // reads 16 and the PIO loop proceeds.
+                    if self.sdh_write_active && self.sdh_datacnt > 0 {
+                        let mut w = v;
+                        for _ in 0..4 {
+                            if self.sdh_datacnt == 0 {
+                                break;
+                            }
+                            if (self.sdh_write_off as usize) < self.sdh_write_buf.len() {
+                                self.sdh_write_buf[self.sdh_write_off as usize] =
+                                    (w & 0xff) as u8;
+                            }
+                            self.sdh_write_off += 1;
+                            self.sdh_datacnt -= 1;
+                            w >>= 8;
+                        }
+                        if self.sdh_datacnt == 0 {
+                            self.sdh_write_active = false;
+                            // Last byte of a PIO write: commit whole
+                            // sectors now (no STOP will come).
+                            let nsec = (self.sdh_write_off as usize) / 512;
+                            for i in 0..nsec {
+                                let mut sec =
+                                    self.sd_read_sector(self.sdh_write_sec + i);
+                                let base = i * 512;
+                                let end =
+                                    ((base + 512) as u32).min(self.sdh_write_off);
+                                for j in (base as u32)..end {
+                                    sec[(j - base as u32) as usize] =
+                                        self.sdh_write_buf[(j) as usize];
+                                }
+                                self.sd_write_sector(self.sdh_write_sec + i, sec);
+                            }
+                            self.sdh_write_done = true;
+                            if (self.sdh_cfg & (1 << 8)) != 0 {
+                                self.sdh_status |= 0x200; // BLOCK_IRPT
+                            }
+                        }
+                        let _ = self.sdh_write_off;
+                        self.sdh_status |= 0x01; // DATA_FLAG
+                        if (self.sdh_cfg & (1 << 4)) != 0 {
+                            self.sdh_status |= 0x100; // SDIO_IRPT
+                        }
+                    } else {
+                        self.sdh_fifo_push(v);
+                    }
                 }
                 0x50 => {
                     self.sdh_hblc = v;
@@ -4998,12 +5759,45 @@ impl Bus {
                         if self.dma_trace && std::env::var("DMATRACE").is_ok() {
                             eprintln!("DMRUN ch={} cb=0x{:x}", ch, conblk);
                         }
+                        if self.dma_trace && std::env::var("DMATRACE").is_ok() {
+                            // M77 CB dump (DMATRACE-gated): proves the
+                            // chain's TI/src/dst/len at run time (the
+                            // CMD25 DMDST=0 needs the CB's own words,
+                            // not the post-copy sample).
+                            let cbpa = Self::bus_to_phys(conblk as u64) & !0x1f;
+                            if self.in_ram(cbpa, 32) {
+                                let a = cbpa as usize;
+                                let rd = |o: usize| {
+                                    u32::from_le_bytes([
+                                        self.mem[a + o],
+                                        self.mem[a + o + 1],
+                                        self.mem[a + o + 2],
+                                        self.mem[a + o + 3],
+                                    ])
+                                };
+                                eprintln!(
+                                    "DMCB ti=0x{:08x} src=0x{:08x} dst=0x{:08x} len=0x{:x} next=0x{:08x}",
+                                    rd(0),
+                                    rd(4),
+                                    rd(8),
+                                    rd(12) & 0xfffff,
+                                    rd(20)
+                                );
+                            }
+                        }
                         let inten = self.dma_run_chain(conblk as u64);
                         // M76i post-copy sample (DMATRACE-gated): first
                         // word at the CB dst AFTER the copy, so a
                         // routing bug (zeros) vs card-data bug shows.
+                        // M88 FIFO-STATE dump (DMATRACE-gated): proves
+                        // the FIFO/cursor state right after the chain
+                        // ran (cb1's sec0x8-shape content must be
+                        // explained by FIFO words, not cursor math).
                         if self.dma_trace && std::env::var("DMATRACE").is_ok() {
                             eprintln!("DMDST {:08x} magic={:04x}", self.dma_last_dst_sample, self.dma_last_dst_magic);
+                            eprintln!("DMAFIFO len={} pos={} rsec=0x{:x} roff={} datacnt={} w0=0x{:08x} w1=0x{:08x}",
+                                self.sdh_fifo_len, self.sdh_fifo_pos, self.sdh_read_sec, self.sdh_read_off,
+                                self.sdh_datacnt, self.sdh_fifo[0], self.sdh_fifo[1]);
                         }
                         self.dma_end_ch[ch] = true;
                         self.dma_end = true;
@@ -9102,6 +9896,23 @@ fn put32(v: &mut Vec<u8>, x: u32) {
 /// existing node/prop byte-for-byte.
 fn patch_dtb_chosen(bus: &mut Bus, initrd_len: u64) {
     const HDR: usize = 40;
+    // M79 ramdisk-trap removal (execution-proven 2026-09-25): the .data
+    // initrd region is the qemu-oracle ext2 SD IMAGE (magic 0x53EF at
+    // +1080), not a cpio archive. Passing it as linux,initrd-start/end
+    // makes the kernel stage it as /initrd.image, and since
+    // CONFIG_BLK_DEV_RAM is not set, rd_load_image finds no ramdisk
+    // driver, initrd_load returns false with the image still staged —
+    // then prepare_namespace mounts that STAGED COPY as ram0 and takes
+    // the `if (initrd_load()) goto out` early branch, never reaching
+    // mount_root/mmcblk0 ("VFS: Mounted root (ext4) on device 1:0",
+    // then ENXIO on /dev/root, proven by the 8.8B console). The qemu
+    // oracle path (-drive if=sd, NO -initrd) never passes initrd props
+    // (stock DTB has no linux,initrd-start), so skip them ALWAYS.
+    // (The PI3_NO_INITRD env gate that did this temporarily is gone;
+    // pure-SD is now the only path. The initrd bytes still back
+    // sd_disk in load_linux, so the card contents are unchanged.)
+    let no_initrd = true;
+    let _ = initrd_len;
     let base = LINUX_DTB_PA as usize;
     if bus.mem.len() < base + HDR {
         return;
@@ -9254,8 +10065,11 @@ fn patch_dtb_chosen(bus: &mut Bus, initrd_len: u64) {
     let end = start + initrd_len;
     let mut sbytes: Vec<u8> = Vec::new();
     sbytes.extend_from_slice(b"bootargs\0");
-    sbytes.extend_from_slice(b"linux,initrd-start\0");
-    sbytes.extend_from_slice(b"linux,initrd-end\0");
+    // (M77: initrd prop names are only emitted when the props are.)
+    if !no_initrd {
+        sbytes.extend_from_slice(b"linux,initrd-start\0");
+        sbytes.extend_from_slice(b"linux,initrd-end\0");
+    }
     let mut props: Vec<u8> = Vec::new();
     let mut str_off = size_strings;
     let mut emit = |name_off: usize, val: &[u8], out: &mut Vec<u8>| {
@@ -9269,17 +10083,21 @@ fn patch_dtb_chosen(bus: &mut Bus, initrd_len: u64) {
     };
     emit(str_off, bootargs, &mut props);
     str_off += 9; // "bootargs\0"
-    let mut u64be = |v: u64, out: &mut Vec<u8>| {
-        put32(out, (v >> 32) as u32);
-        put32(out, v as u32);
-    };
-    let mut vstart = Vec::new();
-    u64be(start, &mut vstart);
-    emit(str_off, &vstart, &mut props);
-    str_off += 19; // "linux,initrd-start\0"
-    let mut vend = Vec::new();
-    u64be(end, &mut vend);
-    emit(str_off, &vend, &mut props);
+    // (M77: with PI3_NO_INITRD the initrd u64 props are skipped
+    // entirely — no start/end cells, no string bytes for them.)
+    if !no_initrd {
+        let mut u64be = |v: u64, out: &mut Vec<u8>| {
+            put32(out, (v >> 32) as u32);
+            put32(out, v as u32);
+        };
+        let mut vstart = Vec::new();
+        u64be(start, &mut vstart);
+        emit(str_off, &vstart, &mut props);
+        str_off += 19; // "linux,initrd-start\0"
+        let mut vend = Vec::new();
+        u64be(end, &mut vend);
+        emit(str_off, &vend, &mut props);
+    }
     // Rebuild: head40 + struct[..chosen_end] + props +
     // struct[chosen_end..struct_end] + strings + new names, with the
     // header offsets fixed up. (off_struct is unchanged: the reserve
