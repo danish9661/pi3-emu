@@ -111,6 +111,7 @@ impl Runner {
             // M76 storm-watch chunk tag: the sdhost model snapshots
             // these when the CMD13 storm declares (Bus has no pc/n).
             bus.sdh_chunk_n = self.n;
+            bus.exc_n = self.n;
             bus.sdh_chunk_pc = cpu.pc;
             // Actuation (facade runSlice start: irqResume || irqVector, both
             // cleared unconditionally once consumed-or-not).
@@ -127,12 +128,31 @@ impl Runner {
                 self.saved_pc = None;
             } else if let Some(v) = vec {
                 cpu.pc = v;
+                // M98 IRQ ENTRY (replaces the M95b guarded restore,
+                // deleted): IRQ vectors are always EL1h — entry sets
+                // cur_el=1 and the kernel stack is live by construction
+                // (banks). No value copying. Bare-metal guests are
+                // EL1-only: cur_el 1→1 is a no-op for every golden.
+                cpu.cur_el = 1;
             }
             let m = core::cmp::min(self.slice, target - self.n);
             let m = core::cmp::min(m, self.budget - self.n);
             let mut done = 0u64;
             while done < m {
                 if let Err(f) = cpu.step(bus) {
+                    // M93c DELIVERED-ABORT CONTINUATION: step() delivers
+                    // sync data aborts to the guest vector itself and
+                    // reports DataAbort(VA) — the guest handler (not the
+                    // harness) owns the fault now. Count the step, keep
+                    // running: the vector + handler execute as ordinary
+                    // insns on subsequent steps. M100: El0Trap (EL0t
+                    // trampoline catch-all) continues the same way. All
+                    // OTHER faults still stop the run (first-fault
+                    // semantics unchanged).
+                    if matches!(f, crate::Fault::DataAbort(_) | crate::Fault::El0Trap(_)) {
+                        done += 1;
+                        continue;
+                    }
                     self.fault = Some(f);
                     if std::env::var("PI3_FAULTCTX").is_ok() {
                         eprintln!(

@@ -106,6 +106,19 @@ pub enum Fault {
     UnmappedData(u64),
     /// Stage-1 translation fault (bad descriptor/range during the walk).
     Translation(u64),
+    /// Synchronous data abort DELIVERED to the guest vector (M93):
+    /// step() took the EL1h/EL0 sync vector instead of returning the
+    /// fault. Carries the fault VA. The runner/harness treat this as
+    /// Ok-progress (the guest handler runs), NOT as a stop.
+    DataAbort(u64),
+    /// M100 EL0t catch-all TRAP (linux_mode only): the kernel's EL0t
+    /// trampoline page (+0x400: ADRP/ADD/LDR/B/RET sequences the
+    /// interpreter has no arm for) trapped instead of executing.
+    /// Carries the faulting VA (= pc). Like DataAbort, the runner
+    /// treats it as Ok-progress (the vector handler runs next chunk).
+    /// Bare-metal guests never take the EL0t vector (cur_el stuck 1),
+    /// so no golden moves.
+    El0Trap(u64),
 }
 
 pub struct Bus {
@@ -209,6 +222,10 @@ pub struct Bus {
     pub mmu_ttbr0: u64,
     pub mmu_ttbr1: u64,
     pub mmu_mair: u64,
+    /// M97 PAR_EL1 latch (AT S1E1R result for the kernel's spurious-
+    /// fault check): F=bit0 (0=spurious/success, 1=fail), FST=bits[6:1]
+    /// on failure. Written by the AT arm, read by MRS PAR_EL1.
+    pub par_el1: u64,
     // M73 TLB (same semantics, pure speedup): caches VA-page → PA-page
     // for 4K pages AND 2M/1G blocks (page offset re-planted per
     // access). The kernel's TTBR0/TTBR1 tables are written once at
@@ -561,6 +578,11 @@ pub struct Bus {
     pub sdh_storm_pc: u64,
     pub sdh_chunk_n: u64,
     pub sdh_chunk_pc: u64,
+    /// M99 exception-trace insn counter: the runner stamps `n` here
+    /// once per chunk so step()'s env-gated EXCTRACE lines carry the
+    /// global insn count without a step()-hotRunner backref. Zero-cost
+    /// when PI3_EXCTRACE is unset (one u64 store per chunk).
+    pub exc_n: u64,
     // PWM (0x3F20C000 — mirrors pwm.js FIFO mode): CTL latch + FIFO
     // queue drained 64/chunk into a sample ring (browser audio reads
     // it via pwm_take). STA/FULL/EMPT published at sync_out.
@@ -621,6 +643,7 @@ impl Bus {
             mmu_ttbr0: 0,
             mmu_ttbr1: 0,
             mmu_mair: 0,
+            par_el1: 0,
             tlb_tag: [u64::MAX; 256],
             tlb_pa: [0; 256],
             tlb_gen: 0,
@@ -748,6 +771,7 @@ impl Bus {
             sdh_storm_pc: 0,
             sdh_chunk_n: 0,
             sdh_chunk_pc: 0,
+            exc_n: 0,
             pwm_back: [0; 32],
             pwm_ctl: 0,
             pwm_last_ctl: 0,
@@ -1131,8 +1155,7 @@ impl Bus {
     /// above stays 3 compares + 2 array reads). Semantics UNCHANGED —
     /// this is the old translate() body verbatim after the MMU-off /
     /// device-window fast paths.
-    fn translate_walk(&self, va: u64, hi: bool) -> Result<u64, Fault> {
-        let tsz = if hi {
+    fn translate_walk(&self, va: u64, hi: bool) -> Result<u64, Fault> {        let tsz = if hi {
             ((self.mmu_tcr >> 16) & 0x3f) as u32
         } else {
             (self.mmu_tcr & 0x3f) as u32
@@ -1174,9 +1197,9 @@ impl Bus {
             3
         };
         let mut base = if hi {
-            self.mmu_ttbr1 & !0xfff
+            self.mmu_ttbr1 & 0x0000_FFFF_FFFF_F000
         } else {
-            self.mmu_ttbr0 & !0xfff
+            self.mmu_ttbr0 & 0x0000_FFFF_FFFF_F000
         };
         loop {
             let shift = 12 + 9 * (3 - level);
@@ -1287,9 +1310,9 @@ impl Bus {
             3
         };
         let mut base = if hi {
-            self.mmu_ttbr1 & !0xfff
+            self.mmu_ttbr1 & 0x0000_FFFF_FFFF_F000
         } else {
-            self.mmu_ttbr0 & !0xfff
+            self.mmu_ttbr0 & 0x0000_FFFF_FFFF_F000
         };
         let mut o = format!("hi={} vabits={} L{} ttbr=0x{:x}", hi as u8, vabits, level, base);
         for _ in 0..5 {
@@ -1477,6 +1500,10 @@ impl Bus {
     /// M76 DMA ch4 CS/CONBLK cells (triage: the driver's channel).
     pub fn dma_ch4_pub(&self) -> (u32, u32) {
         (self.dma_back[4 * 64], self.dma_back[4 * 64 + 1])
+    }
+    /// DMA any-channel CS/CONBLK cells (triage: driver may use any channel).
+    pub fn dma_ch_pub(&self, ch: usize) -> (u32, u32) {
+        (self.dma_back[ch * 64], self.dma_back[ch * 64 + 1])
     }
     /// M61 probe helper: local per-core timer enable cell (gates the
     /// CORE_IRQ_SRC arch-timer bits and the runner's cntp delivery).
@@ -5889,12 +5916,30 @@ pub struct Cpu {
     pub spsr_el2: u64,
     pub elr_el2: u64,
     pub sp_el1: u64,
+    /// M98 architectural EL + banked stacks: real hardware keeps
+    /// EL0t/EL1h-selected stacks (SP_EL0 for EL0, SP_ELx for EL1) and
+    /// routes exceptions by ORIGIN level (EL0→+0x400 EL0t vector /
+    /// EL1→+0x200 EL1h vector). pi-cpu's single `sp` + stuck cur_el=1
+    /// collapsed this: EL0 code ran on the kernel stack and EL1h
+    /// handlers pushed pt_regs onto the user stack (7.2B "kernel
+    /// stack overflow" at the init stack probe: FAR=...096, a user
+    /// VA, faulting from EL1 code). cur_el tracks the CURRENT level
+    /// (0 after an EL0t eret, 1 after any EL1 vector entry or EL1h
+    /// eret); rsp/wsp select sp_el0/sp_el1 by cur_el when Rn=31, so
+    /// user code and kernel code each get their own stack with no
+    /// save/restore guessing (the M95/M95b/M96 save-guard dance is
+    /// deleted — banked registers make it unnecessary).
     pub cur_el: u8,
     spsr_el2_msrd: bool,
     /// M57 thread registers: SP_EL0 + TPIDR_EL1 (per-CPU current).
     /// Backed u64s, zero at reset; MRS/MSR wired in the system arm.
     pub sp_el0: u64,
     pub tpidr_el1: u64,
+    /// M101 EL0 thread registers: TPIDRRO_EL0 + TPIDR_EL0 (the EL0t
+    /// trampoline's x30 spill slot + EL0 thread ID). Same backing
+    /// class as TPIDR_EL1; zero at reset.
+    pub tpidrro_el0: u64,
+    pub tpidr_el0: u64,
     /// M69 exclusive monitor (single-core): LDXR/LDAXR records (addr,
     /// value, size); STXR/STLXR + CAS-family succeed only when the
     /// current memory matches the reservation (real exclusive
@@ -5919,6 +5964,13 @@ pub struct Cpu {
     /// MRS=0xD5384000/MSR=0xD5184000; SVC=0xD4+imm16.
     pub esr_el1: u64,
     pub far_el1: u64,
+    /// M93c pending-abort latch (runner/single-step contract): set when
+    /// step() delivers a sync data abort to the guest vector (the step
+    /// reports Err(DataAbort) so the chunk stops). take_abort() drains
+    /// it. Single-step probes must drain it per step (treat DataAbort
+    /// as progress, like the runner does) or they spin forever at the
+    /// faulting pc.
+    pub abort_pending: bool,
     n: bool,
     z: bool,
     c: bool,
@@ -5932,7 +5984,7 @@ pub struct Cpu {
 
 impl Cpu {
     pub fn new(entry: u64) -> Self {
-        Cpu { x: [0; 31], sp: 0, pc: entry, q: [0; 32], vbar_el1: 0, daif: 0xf, elr_el1: 0, spsr_el1: 0, spsr_el2: 0, elr_el2: 0, sp_el1: 0, cur_el: 2, spsr_el2_msrd: false, esr_el1: 0, far_el1: 0, sp_el0: 0, tpidr_el1: 0, excl_addr: 0, excl_val: 0, excl_size: 0, excl_valid: false, n: false, z: false, c: false, v: false, fpsr_cum: 0 }
+        Cpu { x: [0; 31], sp: 0, pc: entry, q: [0; 32], vbar_el1: 0, daif: 0xf, elr_el1: 0, spsr_el1: 0, spsr_el2: 0, elr_el2: 0, sp_el1: 0, cur_el: 2, spsr_el2_msrd: false, esr_el1: 0, far_el1: 0, abort_pending: false, sp_el0: 0, tpidr_el1: 0, tpidrro_el0: 0, tpidr_el0: 0, excl_addr: 0, excl_val: 0, excl_size: 0, excl_valid: false, n: false, z: false, c: false, v: false, fpsr_cum: 0 }
     }
 
     /// M56 Linux-track reset: ARM64 boot protocol regs (x0=DTB PA,
@@ -5950,9 +6002,14 @@ impl Cpu {
         self.spsr_el1 = 0;
         self.spsr_el2 = 0;
         self.elr_el2 = 0;
+        self.sp_el1 = 0;
+        self.sp_el0 = 0;
+        self.tpidrro_el0 = 0;
+        self.tpidr_el0 = 0;
         self.spsr_el2_msrd = false;
         self.esr_el1 = 0;
         self.far_el1 = 0;
+        self.abort_pending = false;
         self.excl_valid = false;
         self.n = false;
         self.z = false;
@@ -5966,7 +6023,15 @@ impl Cpu {
     }
     #[inline]
     fn rsp(&self, r: u32) -> u64 {
-        if r == 31 { self.sp } else { self.x[r as usize] }
+        // M98 banked stacks: Rn=31 reads the CURRENT level's stack
+        // (SP_EL0 at EL0, SP_EL1 at EL1). Bare-metal guests never leave
+        // EL1 (cur_el=1, SP_EL0=0, sp_el1 mirrors sp via the MSR arm),
+        // so rsp(31)==sp there — every golden unaffected.
+        if r == 31 {
+            if self.cur_el == 0 { self.sp_el0 } else { self.sp }
+        } else {
+            self.x[r as usize]
+        }
     }
     #[inline]
     fn w(&mut self, r: u32, v: u64, sf: bool) {
@@ -6379,8 +6444,9 @@ impl Cpu {
     #[inline]
     fn wsp(&mut self, r: u32, v: u64, sf: bool) {
         let v = if sf { v } else { v & 0xffff_ffff };
+        // M98 banked stacks (write twin of rsp above).
         if r == 31 {
-            self.sp = v;
+            if self.cur_el == 0 { self.sp_el0 = v; } else { self.sp = v; }
         } else {
             self.x[r as usize] = v;
         }
@@ -6434,12 +6500,18 @@ impl Cpu {
     /// PSTATE snapshot for SPSR_EL1 on exception entry (N/Z/C/V + DAIF
     /// + EL1h mode).
     pub fn pstate(&self) -> u64 {
+        // M98 EL MODE BIT: 0x5 = EL1h (M[4:0]=0b00101), 0x0 = EL0t
+        // (M[4:0]=0b00000). SPSR snapshots must carry the CURRENT
+        // level's mode so a later eret restores the right stack bank
+        // (EL0t eret → cur_el=0 → SP_EL0; EL1h eret → cur_el=1).
+        // Bare-metal guests are always EL1: mode bit unchanged (0x5).
+        let mode = if self.cur_el == 0 { 0x0 } else { 0x5 };
         ((self.n as u64) << 31)
             | ((self.z as u64) << 30)
             | ((self.c as u64) << 29)
             | ((self.v as u64) << 28)
             | ((self.daif as u64) << 6)
-            | 0x5
+            | mode
     }
 
     /// ERET: restore N/Z/C/V + DAIF from SPSR_EL1, resume at ELR_EL1.
@@ -6475,6 +6547,18 @@ impl Cpu {
         self.c = (s >> 29) & 1 != 0;
         self.v = (s >> 28) & 1 != 0;
         self.daif = ((s >> 6) & 0xf) as u8;
+        // M98 EL SWITCH (replaces the M95/M96 save-guard dance, which
+        // is deleted): SPSR M[3:0]==0b0000 selects EL0t — set cur_el=0
+        // so rsp/wsp use SP_EL0 (the thread stack the kernel installed
+        // via MSR SP_EL0); any other M keeps EL1 (cur_el=1, SP_ELx via
+        // `sp`). No value copying: banked registers make save/restore
+        // unnecessary (the 7.2B overflow was sp↔sp_el1 value copying
+        // with SP_EL1=0; banks never alias).
+        if (s & 0xf) == 0 {
+            self.cur_el = 0;
+        } else {
+            self.cur_el = 1;
+        }
         self.pc = self.elr_el1;
     }
 
@@ -6488,6 +6572,25 @@ impl Cpu {
         (self.n, self.z, self.c, self.v)
     }
 
+    /// M93 WnR CLASSIFIER (sync data-abort ISS bit 6): stores set it,
+    /// loads clear it. Classes by top byte (assembler truth, not a
+    /// full decode): 0xF8/0xF9 (STR/LDR-uimm9/12/reg-offset: bit22==0
+    /// store, ==1 load) + 0xE8/0xE9 (LDP/STP: bit22==0 store pair,
+    /// ==1 load pair) + 0x88/0xC8 (exclusive/STXR = store). LSE
+    /// atomics (0xB8/0xF8 RMW: STADD/LDADD/SWP/CAS) are read-modify-
+    /// write — report WnR=1 (a failed RMW looks like a store fault;
+    /// nothing live reads the WnR bit for atomics, only EC/DFSC).
+    /// SIMD/FP stores (0x1C/0x5C/0x9C/0xDC...) are plain stores too.
+    fn is_store_word(w: u32) -> bool {
+        let top = (w >> 24) & 0xff;
+        match top {
+            0xF8 | 0xF9 | 0xE8 | 0xE9 => ((w >> 22) & 1) == 0,
+            0x88 | 0xC8 | 0xB8 | 0xF8 => true,
+            0x1C | 0x5C | 0x9C | 0xDC => ((w >> 22) & 1) == 0,
+            _ => false,
+        }
+    }
+
     /// Set NZCV directly (single-step differential harness only).
     pub fn set_flags(&mut self, n: bool, z: bool, c: bool, v: bool) {
         self.n = n;
@@ -6496,21 +6599,169 @@ impl Cpu {
         self.v = v;
     }
 
+    /// M93c PENDING-ABORT QUERY (runner contract): step() delivers a
+    /// sync data abort to the guest vector and reports DataAbort(VA).
+    /// The runner CONTINUES past it (counts the step, keeps running —
+    /// the vector + handler are ordinary insns). Single-step probes
+    /// that match on Err() must skip DataAbort the same way (or they
+    /// observe a perpetual fault at the same pc and never the
+    /// handler). Returns the pending abort VA if the last step
+    /// delivered one, else None. The flag is sticky until the next
+    /// step overwrites it — probes should drain it per step.
+    pub fn take_abort(&mut self) -> Option<u64> {
+        // Stored in far_el1 latch protocol: the delivery sets far_el1
+        // AND aborts_delivered counter; take returns VA once.
+        if self.abort_pending {
+            self.abort_pending = false;
+            Some(self.far_el1)
+        } else {
+            None
+        }
+    }
+
     pub fn step(&mut self, bus: &mut Bus) -> Result<(), Fault> {
         let pc = self.pc;
-        let w = bus.fetch(pc)?;
+        // M99 EXCEPTION TRACE (env-gated, zero-cost off): logs every
+        // exception entry/exit with the runner's insn count (passed via
+        // bus.exc_n, set once per chunk) + EL + stacks. Proves the
+        // EL0→EL1→EL0 cycle around init's death by execution.
+        // M98 ENTRY ORIGIN (replaces the M93b pc-half heuristic): the
+        // faulting level is cur_el (0=EL0 user code, 1=EL1 kernel
+        // code), now that eret tracks it. EL0 faults take the EL0t
+        // vector (+0x400) with EC_LOW; EL1 faults take EL1h (+0x200)
+        // with EC_CUR. The EL1h/EL0t mode bit in pstate() follows
+        // cur_el too (0x5 EL1h vs 0x0 EL0t). EL1 entry keeps the
+        // kernel stack by construction (banks); no restore needed.
+        let w = match bus.fetch(pc) {
+            Ok(w) => w,
+            Err(Fault::Translation(a)) | Err(Fault::UnmappedData(a)) if bus.linux_mode => {
+                // M102 EL0t ROUTING (handler-proven 6.954B: the old arm
+                // took EL0 fetch faults to +0x200 (EL1h) but the
+                // kernel's EL0 fault path lives at +0x400 (EL0t —
+                // el0t_64_sync → el0t_64_sync_handler; the handler
+                // trace from the 6.954B probe walks +0x40c→+0x424→
+                // +0x113bc expecting EC_LOW in ESR). EL0 origin now
+                // takes +0x400 with EC 0x20 IABT_LOW; EL1 keeps +0x200
+                // with EC 0x21 IABT_CUR (ARM ARM ESR EC table).
+                let el0_origin = self.cur_el == 0;
+                let ec = if el0_origin { 0x20 } else { 0x21 };
+                let vec_off = if el0_origin { 0x400 } else { 0x200 };
+                self.esr_el1 = (ec << 26) | 0x04;
+                self.elr_el1 = pc;
+                self.spsr_el1 = self.pstate();
+                self.daif = 0xf;
+                let vbar = if self.vbar_el1 == 0 { 0x100000 } else { self.vbar_el1 };
+                self.pc = vbar + vec_off;
+                // M103 IABT-FAR (handler-proven 6.954B: the old arm left
+                // FAR_EL1 alone ("UNKNOWN on instruction aborts"), so it
+                // held the STALE data-fault VA 0x615530 while ELR held
+                // the real faulting pc 0x400540. The kernel's el0_ia
+                // reads far_el1 and passes it to do_mem_abort → the
+                // handler faulted the WRONG (already-mapped) address,
+                // never mapped L2 idx2, and init looped to SIGILL. Real
+                // implementations set FAR to the faulting VA on IABT
+                // despite the UNKNOWN classification (Linux relies on
+                // it); set FAR_EL1 = faulting pc here.
+                self.far_el1 = pc;
+                // M94 FETCH-ABORT DELIVERY (linux_mode only): with the
+                // MMU on, the kernel's user pages are demand-mapped —
+                // the FIRST touch (fetch or data) faults, and the
+                // kernel's own page-fault handler maps it. A fetch-side
+                // fault is an INSTRUCTION abort (EC 0x20 IABT_LOW for
+                // EL0-origin, 0x21 IABT_CUR for EL1-origin — ARM ARM
+                // ESR EC table; FAR is UNKNOWN on instruction aborts
+                // so FAR_EL1 is left alone). Entry itself sets cur_el=1
+                // (EL1h runs the handler); banks keep the stacks
+                // separate, so no restore is needed.
+                // Bare-metal guests (linux_mode=false) keep the old
+                // hard-fault behavior (every golden pins it).
+                self.cur_el = 1;
+                if std::env::var("PI3_EXCTRACE").is_ok() {
+                    eprintln!("EXC n={} FETCH ec=0x{:x} el0={} elr=0x{:x} vec=+0x{:x} sp=0x{:x} sp_el0=0x{:x}", bus.exc_n, if el0_origin { 0x20 } else { 0x21 }, el0_origin as u8, pc, vec_off, self.sp, self.sp_el0);
+                }
+                self.abort_pending = true;
+                return Err(Fault::DataAbort(a));
+            }
+            Err(e) => return Err(e),
+        };
         self.pc = pc.wrapping_add(4);
-        // M73: the wwatch check below used to cost TWO env lookups per
-        // step (bus.wwatch_on && env::var("WWATCH")) even when the
-        // watch was never armed. Gate on the flag alone first (one
-        // predictable branch, ~free); the env lookup runs only while
-        // a triage probe actually arms the watch.
-        let before = bus.wwatch_hits;
         let r = self.exec(bus, pc, w);
-        if before != bus.wwatch_hits && bus.wwatch_on && std::env::var("WWATCH").is_ok() {
-            eprintln!("WWPC pc=0x{:x}", pc);
+        // M100 EL0T-TRAP MAP (companion to the exec-tail catch-all):
+        // exec reports El0Trap(pc) for undecoded EL0t-trampoline words
+        // (linux_mode + cur_el==0 only). Treat like a delivered abort
+        // (handler runs next chunk, runner continues) — NOT a stop.
+        if let Err(Fault::El0Trap(a)) = r {
+            return Err(Fault::El0Trap(a));
         }
-        r
+        // M93 SYNC DATA-ABORT DELIVERY (kernel-proven 6.945B): the old
+        // code returned EVERY data fault (UnmappedData/Translation
+        // from a load/store) to the harness, which stops the run — so
+        // the kernel's FIRST user-space memset died instead of
+        // faulting into its own page-fault handler. Real hardware
+        // delivers a synchronous data abort: ESR_EL1 (EC depends on
+        // the ORIGIN level — 0x25 DABT_CUR for EL1, 0x24 DABT_LOW for
+        // EL0; the el1h_64_sync vector does NOT handle 0x24 and panics
+        // "Unhandled exception" via __panic_unhandled, proven by the
+        // 6.95B panic trace: el1h_64_sync+0x64 called from
+        // __arch_clear_user; DFSC from the fault kind, WnR set on
+                // stores), FAR_EL1 = fault VA, ELR_EL1 = faulting pc,
+                // SPSR_EL1 = pstate(), DAIF masked, pc = VBAR_EL1 + 0x200 for
+                // EL1-origin or +0x400 for EL0-origin (el0_64_sync — the
+                // do_mem_abort path via el0_da). M98: origin is cur_el
+                // (eret-tracked), not the pc-half heuristic (deleted —
+                // the heuristic misroutes kernel-half EL0-stack faults).
+                // linux_mode-gated: bare-metal guests keep hard faults
+                // (every golden pins them).
+        // do_mem_abort path via el0_da. EL0 faults are taken TO EL1:
+        // entry sets cur_el=1 (the handler runs EL1h); banks keep the
+        // stacks separate, so no restore is needed. Fetch faults
+        // (UnmappedFetch/Illegal) still return to the harness — only
+        // DATA-side faults deliver.
+        match r {
+            Err(Fault::UnmappedData(a)) | Err(Fault::Translation(a)) if bus.linux_mode => {
+                // DFSC: 0b010001 (alignment, unused here) vs 0b000100
+                // (translation, L0 — the observed class: empty user
+                // pgd L1[0]=0b00) — report translation/L0 for both
+                // (UnmappedData from a walk miss IS a translation
+                // fault at the level the walk died; exact-level
+                // tracking would need the walk to return it).
+                // ISS: DFSC[5:0] | WnR<<6 (stores set it — the fault
+                // word here is STTR, a store). M102 EL0t ROUTING (data
+                // twin of the fetch arm above): EL0 data faults take
+                // +0x400 with EC 0x24 DABT_LOW (the kernel's
+                // el0t_64_sync_handler path); EL1 keeps +0x200/EC 0x25.
+                let el0_origin = self.cur_el == 0;
+                let ec = if el0_origin { 0x24 } else { 0x25 };
+                let vec_off = if el0_origin { 0x400 } else { 0x200 };
+                let wnr = if Self::is_store_word(w) { 1 } else { 0 };
+                self.esr_el1 = (ec << 26) | (wnr << 6) | 0x04;
+                self.far_el1 = a;
+                self.elr_el1 = pc;
+                self.spsr_el1 = self.pstate();
+                self.daif = 0xf;
+                let vbar = if self.vbar_el1 == 0 { 0x100000 } else { self.vbar_el1 };
+                self.pc = vbar + vec_off;
+                self.cur_el = 1;
+                if std::env::var("PI3_EXCTRACE").is_ok() {
+                    eprintln!("EXC n={} DATA ec=0x{:x} el0={} elr=0x{:x} far=0x{:x} vec=+0x{:x} sp=0x{:x} sp_el0=0x{:x}", bus.exc_n, if el0_origin { 0x24 } else { 0x25 }, el0_origin as u8, pc, a, vec_off, self.sp, self.sp_el0);
+                }
+                // M93c DELIVERY SIGNAL (not Ok): the abort was delivered
+                // to the guest vector, but the harness must NOT mistake
+                // it for silent progress — run_to/run_sliced stop on
+                // Err only, and a bare Ok would let the runner sail past
+                // the faulting insn (ELR set, ESR/FAR latched) without
+                // ever executing the handler. DataAbort carries the VA
+                // and tells the runner: stop THIS chunk, keep state
+                // (the handler runs on the next chunk from the vector).
+                // Fetch faults stay hard errors (no vector delivery).
+                // abort_pending latches for single-step probes (they
+                // must drain via take_abort() per step, like the runner
+                // continues past DataAbort).
+                self.abort_pending = true;
+                Err(Fault::DataAbort(a))
+            }
+            other => other,
+        }
     }
 
     pub fn run(&mut self, bus: &mut Bus, budget: u64) -> (u64, Option<Fault>) {
@@ -6807,7 +7058,82 @@ impl Cpu {
         let sf = bits(w, 31, 31) == 1;
         let rn = bits(w, 9, 5);
         let rd = bits(w, 4, 0);
-
+        // M104 LSE-ATOMIC PRE-ARM (assembler truth atom6.s,
+        // kernel-proven 6.967B: LDSETAL=0xB8A03260 shares the 0x1c
+        // 5-bit class with bit24==0, so EVERY LSE RMW word otherwise
+        // falls into the 0x1c plain-store body below — opc==0b10
+        // decodes "signed load" and the body executes a PLAIN LOAD,
+        // the ticket lock never ORs, init wedges at b9dc80. This arm
+        // sits FIRST (before B/BL/B.cond/CBZ/TBZ/ERET/BR — none of
+        // which collide: LSE top byte is 0x38/0x78/0xB8/0xF8, branch
+        // tops are 0x14/0x17/0x54/0x34/0x35/0x36/0x37/0xD6) with the
+        // full LSE class gate (atom6.s + reg.s + casb.s: o1==1 +
+        // b11_10==00 DISCRIMINATES (fuzzer-proven: plain reg-offset
+        // loads/stores — ldrh w9,[x10,w11,sxtw]=0x786BC949, ldrb
+        // w24,[x25,x26]=0x387A6B38, str x27,[x28,x29,lsl#3]=0xF83D7B9B
+        // — all carry b11_10==10; every LSE word carries b11_10==00).
+        // NO o2 gate: LSE acquire forms span o2==001/011/101/111
+        // (casb.s: ldaddab=0x38A500E6 is o2==101, staddlb=0x386500FF
+        // is o2==011 — an o2==001/011/111 gate would MISS them and
+        // re-wedge the ticket lock). CAS (cls 001000, incl. W casal
+        // 0x88E5FCE6) never reaches this cls-111000 arm; the o2==101/
+        // 111 CAS arm below is untouched. Body is the M104 RMW lane
+        // verbatim (op=bits[15:14] ALU map, o0==1+op==10 selects SWP).
+        if bus.linux_mode
+            && ((w >> 24) & 0x3f) == 0b111000
+            && bits(w, 21, 21) == 1
+            && ((bits(w, 11, 11) << 1) | bits(w, 10, 10)) == 0b00
+        {
+            // M104b op4 MAP (opfull.s: op=bits[15:12] is 4-bit —
+            // 0000=ADD..0111=UMIN,1000=SWP — NOT bits[15:14]. The old
+            // 2-bit map aliased LDSET(0011)→ADD. SWP is op4==1000;
+            // signed min/max implement real signed/unsigned comparisons
+            // at the access width.
+            let op4 = bits(w, 15, 12);
+            let rs = bits(w, 20, 16) & 0x1f;
+            let size_b: u64 = match bits(w, 31, 30) {
+                0b00 => 1,
+                0b01 => 2,
+                0b10 => 4,
+                _ => 8,
+            };
+            let addr = self.rsp(rn);
+            let old = bus.read(addr, size_b).map_err(|_| Fault::UnmappedData(addr))?;
+            let a = self.r(rs) & mask(size_b);
+            // SWP REG ORDER (same as the 0x1c-lane arm below: ARM ARM
+            // SWP Ws, Wt, [Xn] — Rs stores, Rt loads: mem=Rs, Rt=old).
+            let res = if op4 == 0b1000 {
+                a
+            } else {
+                match op4 {
+                    0b0000 => old.wrapping_add(a) & mask(size_b),
+                    0b0001 => (old & !a) & mask(size_b),
+                    0b0010 => (old ^ a) & mask(size_b),
+                    0b0011 => (old | a) & mask(size_b),
+                    0b0100 => {
+                        let s = size_b * 8;
+                        let sh = 64 - s;
+                        let so = ((old << sh) as i64 >> sh) as i64;
+                        let sa = ((a << sh) as i64 >> sh) as i64;
+                        (so.max(sa) as u64) & mask(size_b)
+                    }
+                    0b0101 => {
+                        let s = size_b * 8;
+                        let sh = 64 - s;
+                        let so = ((old << sh) as i64 >> sh) as i64;
+                        let sa = ((a << sh) as i64 >> sh) as i64;
+                        (so.min(sa) as u64) & mask(size_b)
+                    }
+                    0b0110 => (old.max(a)) & mask(size_b),
+                    _ => (old.min(a)) & mask(size_b),
+                }
+            };
+            bus.write(addr, size_b, res).map_err(|_| Fault::UnmappedData(addr))?;
+            if rd != 31 {
+                self.w(rd, old, size_b == 8);
+            }
+            return Ok(());
+        }
         // B / BL (op = bit31, offset in bits30:26 == 00101)
         if ((w >> 26) & 0x1f) == 0b00101 {
             let imm = sext(((bits(w, 25, 0) as u64) << 2) as u64, 28);
@@ -6851,6 +7177,9 @@ impl Cpu {
         // ERET: exact word only (would otherwise decode as BR XZR -> pc=0).
         if w == 0xD69F03E0 {
             self.eret();
+            if std::env::var("PI3_EXCTRACE").is_ok() {
+                eprintln!("EXC n={} ERET from=0x{:x} spsr=0x{:x} elr=0x{:x} ->pc=0x{:x} el={} sp=0x{:x} sp_el0=0x{:x}", bus.exc_n, pc, self.spsr_el1, self.elr_el1, self.pc, self.cur_el, self.sp, self.sp_el0);
+            }
             return Ok(());
         }
         // BR / BLR / RET. M57 BLR FIX (kernel-proven): `br x8`=
@@ -6891,12 +7220,32 @@ impl Cpu {
         if (w >> 24) == 0xD4 {
             if (w & 0b11) == 0b01 {
                 let imm = ((w >> 5) & 0xffff) as u64;
+                // M95 EL0-SVC ROUTING (kernel-proven: NO svc fires
+                // 6.80B-7.00B because the old arm always took +0x200 —
+                // the EL1h sync vector — while EL0 user code faults to
+                // the EL0t sync vector at +0x400. EL0t entry (SPSR
+                // M=0b0000) runs the do_el0t_64_sync path; EL1h entry
+                // for an EL0 SVC panics "Unhandled exception" via
+                // el1h_64_sync. M98: origin is cur_el (eret-tracked),
+                // not the pc-half heuristic (deleted). EC stays 0x15
+                // (SVC is SVC from either level); only the vector
+                // offset changes. Entry sets cur_el=1 (handler runs
+                // EL1h); banks keep the stacks separate.
+                let el0_origin = self.cur_el == 0;
+                let vec_off = if el0_origin { 0x400 } else { 0x200 };
                 self.esr_el1 = (0x15 << 26) | imm;
                 self.elr_el1 = pc;
                 self.spsr_el1 = self.pstate();
                 self.daif = 0xf;
                 let vbar = if self.vbar_el1 == 0 { 0x100000 } else { self.vbar_el1 };
-                self.pc = vbar + 0x200;
+                self.pc = vbar + vec_off;
+                self.cur_el = 1;
+                if std::env::var("PI3_EXCTRACE").is_ok() {
+                    eprintln!("EXC n={} SVC el0={} elr=0x{:x} vec=+0x{:x} sp=0x{:x} sp_el0=0x{:x}", bus.exc_n, el0_origin as u8, pc, vec_off, self.sp, self.sp_el0);
+                }
+                if std::env::var("PI3_SVCTRACE").is_ok() {
+                    eprintln!("SVC n/a pc=0x{:x} imm={} el0={} ->vec=+0x{:x} esr=0x{:x}", pc, imm, el0_origin as u8, vec_off, self.esr_el1);
+                }
                 return Ok(());
             }
             if (w & 0b11) == 0b10 {
@@ -6969,6 +7318,30 @@ impl Cpu {
             // today, stale TLB tomorrow).
             if op0 == 1 && op1 == 0 && crn == 8 {
                 bus.tlb_gen = bus.tlb_gen.wrapping_add(1);
+                return Ok(());
+            }
+            // M97 AT-PAR (upstream fault.c is_spurious_el1_translation_
+            // fault, verbatim logic): the kernel's spurious-fault check
+            // runs `at s1e1r, Xt; isb; mrs Xt, par_el1` and treats the
+            // fault as spurious iff PAR.F (bit 0) is CLEAR (AT walk now
+            // succeeds — a transient the walker raced). Model: AT
+            // re-walks the VA with translate_walk and latches PAR_EL1
+            // (F=1 + FST on failure, F=0 on success); MRS PAR_EL1
+            // ({3,0,7,4,0}, 0xD5387402/0xD5187403) reads the latch.
+            // AT encodings (assembler truth at.s): S1E1R=0xD5087800,
+            // S1E0R=0xD5087840-ish (op2 picks R/W + EL0/EL1), PAR read
+            // 0xD5387402. Gate: op0==1,op1==0,CRn==7,CRm==8,op2<4 is
+            // the AT class (TLBI above owns CRn==8; DC owns op1==3).
+            if op0 == 1 && op1 == 0 && crn == 7 && crm == 8 && op2 < 4 {
+                let va = self.r(w & 31);
+                match bus.translate_walk(va, (va >> 55) & 1 != 0) {
+                    Ok(_) => bus.par_el1 = 0, // F clear: spurious
+                    Err(_) => {
+                        // F set + FST=translation-fault class (0b000100
+                        // L0: matches our Translation() miss shape).
+                        bus.par_el1 = 1 | (0x04 << 1);
+                    }
+                }
                 return Ok(());
             }
             if op0 == 1 && op1 == 3 && crn == 7 {
@@ -7097,6 +7470,32 @@ impl Cpu {
                     let v = self.tpidr_el1;
                     self.w(rd, v, true);
                 }
+            } else if op0 == 3 && op1 == 3 && crn == 13 && crm == 0 && (op2 == 2 || op2 == 3) {
+                // M101 TPIDRRO_EL0 {3,3,13,0,2} MRS=0xD53BD07E /
+                // MSR=0xD51BD07E + TPIDR_EL0 {3,3,13,0,3} MRS=0xD53BD041
+                // /MSR=0xD51BD041 (assembler truth tp.s): the kernel's
+                // EL0t trampoline entry spills/restores x30 through
+                // TPIDRRO_EL0 (see the +0x400 word dump: 0xD53BD07E at
+                // +0x404, 0xD51BD07F at +0x428 — the Rd=31 form reads
+                // XZR, a documented kernel idiom for clearing). Backed
+                // u64s, zero at reset. Without this the trampoline's
+                // MRS falls to the catch-all read-0 AND its MSR faults
+                // Illegal — init dies at the first EL0 return (the
+                // 7.2B exitcode 0x4 tail: EL0 entry exactly once at
+                // 6.954B, then ZERO EL0 insns execute).
+                if l == 0 {
+                    if op2 == 2 {
+                        self.tpidrro_el0 = self.r(rd);
+                    } else {
+                        self.tpidr_el0 = self.r(rd);
+                    }
+                } else if op2 == 2 {
+                    let v = self.tpidrro_el0;
+                    self.w(rd, v, true);
+                } else {
+                    let v = self.tpidr_el0;
+                    self.w(rd, v, true);
+                }
             } else if op0 == 3 && op1 == 0 && crn == 5 && crm == 2 && op2 == 0 {
                 // ESR_EL1 {3,0,5,2,0} MRS=0xD5385200/MSR=0xD5185200:
                 // syndrome filled by SVC entry (MRS returns it, MSR
@@ -7113,6 +7512,16 @@ impl Cpu {
                 if l != 0 {
                     let v = self.far_el1;
                     self.w(rd, v, true);
+                }
+            } else if op0 == 3 && op1 == 0 && crn == 7 && crm == 4 && op2 == 0 {
+                // PAR_EL1 {3,0,7,4,0} MRS=0xD5387402/MSR=0xD5187403
+                // (assembler truth at.s): the AT S1E1R result latch
+                // (M97 — F=bit0, FST=bits[6:1]). MRS reads the latch;
+                // MSR writes it through (hardware allows; harmless).
+                if l != 0 {
+                    self.w(rd, bus.par_el1, true);
+                } else {
+                    bus.par_el1 = self.r(rd);
                 }
             } else if op0 == 3 && op1 == 3 && crn == 4 && crm == 2 && op2 == 1 {
                 // DAIF {3,3,4,2,1} MRS=0xD53B4220/MSR=0xD51B4220:
@@ -7386,6 +7795,15 @@ impl Cpu {
             } else if op0 == 3 && op1 == 4 && crn == 4 && crm == 1 && op2 == 0 {
                 // SP_EL1 {3,4,4,1,0} (MSR=0xD51C4107, MRS=0xD53C4108):
                 // the EL1 stack the eret drop installs.
+                // M96 REVERTED (spwatch-proven 200M: the kernel NEVER
+                // executes an SP_EL1 MSR — 0 hits in 200M insns — so a
+                // first-write-wins guard here protects nothing and the
+                // 7.2B "SP_EL1 ends 0" theory was wrong: SP_EL1 is
+                // simply never installed by MSR on this path. Plain
+                // MSR semantics (write-through); the M95 eret save
+                // guard (SP_EL0 != 0) is what protects the kernel
+                // stack. Bare-metal rpi-kernel writes SP_EL1 once
+                // (write-through is a no-op there too).
                 if l == 0 {
                     self.sp_el1 = self.r(rd);
                 } else {
@@ -7835,18 +8253,121 @@ impl Cpu {
                 return Ok(());
             }
 
+        // M93d STTR/LDTR STANDALONE LANE (assembler truth sttr.s,
+        // 2026-09-28: STTR/LDTR X-forms (`sttr xzr,[x0]`=0xF800081F)
+        // are size==0b11 — the old `size != 0b11` gate excluded exactly
+        // the X forms (W/B/H are 10/01/00). The atomics lane below
+        // admits on 6-bit class 111000 which MATCHES every STTR/LDTR
+        // word, so it stole STTR-X first and faulted it. Root cause was
+        // the size gate, NOT Rust &&/|| precedence (the earlier theory;
+        // disproven by opclass decode: every other gate term matches).
+        // This standalone arm admits the lane FIRST with narrow terms
+        // (class 11100 + V==0 + opc 00/01 + b24==0 + b21==0 +
+        // b11_10==10, NO size gate — PRFM/LDTRSW-X stay out via opc
+        // 00/01 only) and executes the shared unscaled-imm9 body
+        // (plain-form semantics, EL0 folded).
+        // Assembler truth: STTR/LDTR/LDTRSW/LDTRSB/LDTRSH unscaled +
+        // post/pre-index share b11_10==10; writeback admitted too.
+        if ((w >> 25) & 0x1f) == 0b11100
+            && bits(w, 26, 26) == 0
+            && (bits(w, 23, 22) == 0b00 || bits(w, 23, 22) == 0b01)
+            && bits(w, 24, 24) == 0
+            && bits(w, 21, 21) == 0
+            && ((bits(w, 11, 11) << 1) | bits(w, 10, 10)) == 0b10
+        {
+            let size = bits(w, 31, 30);
+            let nbytes = 1u64 << size;
+            let opc = bits(w, 23, 22);
+            let is_load = opc != 0b00;
+            let sext_to: u32 = match opc {
+                0b10 => 64,
+                0b11 => 32,
+                _ => 0,
+            };
+            // is_load/opc decoding mirrors the base arm: opc==0b11 +
+            // size>=2 unallocated; signed widths per opc.
+            if opc == 0b11 && size >= 2 {
+                return Err(ill);
+            }
+            let (addr, wb) = match (bits(w, 11, 11) << 1) | bits(w, 10, 10) {
+                0b10 => {
+                    let off = sext(bits(w, 20, 12) as u64, 9);
+                    (self.rsp(rn).wrapping_add(off), None)
+                }
+                0b01 => {
+                    let off = sext(bits(w, 20, 12) as u64, 9);
+                    let b = self.rsp(rn);
+                    (b, Some(b.wrapping_add(off)))
+                }
+                0b11 => {
+                    let off = sext(bits(w, 20, 12) as u64, 9);
+                    let a = self.rsp(rn).wrapping_add(off);
+                    (a, Some(a))
+                }
+                _ => return Err(ill),
+            };
+            if is_load {
+                let v = bus.read(addr, nbytes).map_err(|_| Fault::UnmappedData(addr))?;
+                let v = if sext_to != 0 { sext(v, (nbytes * 8) as u32) } else { v };
+                self.w(rd, v, sext_to == 64 || size == 3);
+            } else {
+                let v = if size == 3 { self.r(rd) } else { self.r(rd) & mask(nbytes) };
+                bus.write(addr, nbytes, v).map_err(|_| Fault::UnmappedData(addr))?;
+            }
+            if let Some(b) = wb {
+                self.wsp(rn, b, true);
+            }
+            return Ok(());
+        }
+
         if ((w >> 25) & 0x1f) == 0x1c
+            // M104 LSE-ATOMIC EXCLUSION (assembler truth atom6.s,
+            // kernel-proven 6.967B: EVERY LSE RMW word — plain twins
+            // (ldadd/ldset/swp/stadd, o1==1+o2==001) AND acquire twins
+            // (ldaddal/ldsetal/swpal, o1==1+o2==101/111) — shares the
+            // 0x1c 5-bit class (bits[29:25]==11100) with bit24==0, so
+            // the 0x1c test FIRES on all of them. The old guards only
+            // excluded the b21==1 reg-offset path and the STTR/LDTR
+            // lane, so every LSE word fell into the 0x1c body: opc==
+            // 0b10 (all RMW: LDADD/LDSET/SWP carry opc==10) decoded as
+            // "signed load", size==0b10/W decoded 4 bytes, and the body
+            // executed a PLAIN LOAD (is_load = opc != 00) — the ticket
+            // lock's ldsetal became a load that never ORs, init wedged
+            // at b9dc80 with lock stuck 0x101. Exclude the whole LSE
+            // class here (o1==1 + b11_10==00, atom6.s + reg.s + casb.s:
+            // disjoint from every plain form — plain reg-offset carries
+            // b11_10==10, plain U12 is b24==1, STTR/LDTR is o1==0; NO o2
+            // gate — LSE acquire forms span o2==001/011/101/111) and
+            // let the atomic lane below own it.
+            && !(((w >> 24) & 0x3f) == 0b111000
+                && bits(w, 21, 21) == 1
+                && ((bits(w, 11, 11) << 1) | bits(w, 10, 10)) == 0b00)
             // M60 LSE-GUARD (assembler truth, atom.s): the register-offset
             // path (bit24==0, bit21==1) collides with the LSE atomic lane
-            // (class 111000 = stadd/ldadd/swp/cas-ldapr shapes, all
-            // bit24==0/bit21==1). Real discriminator (ARM ARM): integer
-            // reg-offset fixes bits[11:10]==10 (B8616801/B8617801/
-            // F82A780C all 10); LSE carries 00 (every LSE word: stadd,
-            // swp, ldadd, ldapr...). Non-10 words are NOT integer
-            // reg-offset — skip the whole arm so they reach the atomic
-            // lane (previously stadd executed as a wrong-address
-            // register-offset store and "passed" one.rs fault-only
-            // checks while corrupting memory).
+            // (class 111000 = stadd/ldadd/swp shapes, all bit24==0/
+            // bit21==1). Real discriminator (ARM ARM): integer reg-offset
+            // fixes bits[11:10]==10 (B8616801/B8617801/F82A780C all 10);
+            // LSE carries 00 (every LSE word: stadd, swp, ldadd...).
+            // Non-10 words are NOT integer reg-offset — skip the whole
+            // arm so they reach the atomic lane (previously stadd
+            // executed as a wrong-address register-offset store and
+            // "passed" one.rs fault-only checks while corrupting
+            // memory). M93e STTR/LDTR CARVE-OUT (assembler truth,
+            // kernel-proven 6.945B, corrected 2026-09-28: the size<3
+            // gate is WRONG — X forms (`sttr xzr,[x0]`=0xF800081F) are
+            // size==0b11 (sttr.s truth table). The carve-out admits opc
+            // 00/01 + b11_10==10 with NO size gate; signed opc==0b10/
+            // 0b11 stay on existing paths. LDTRSW-X (size==3/opc==0b10)
+            // is unreachable here (plain-form b11_10==00/01/11 never
+            // matches 0b10) so the PRFM-absorb note below is about the
+            // shared body, not this gate.
+            // shares the LSE 6-bit class 111000 (bit24==0) but has
+            // bit21==0, so the b21==1 guard above does NOT exclude it —
+            // yet the 0x1c arm's own (bit11,bit10) switch decodes
+            // b11_10==10 as UNALLOCATED and faults it Illegal. Admit
+            // the lane here FIRST (plain-form addressing + access
+            // semantics, EL0 folded): b11_10==10 + opc 00/01 only, no
+            // size gate (signed opc==0b10/0b11 stay on existing paths).
             && !(bits(w, 24, 24) == 0
                 && bits(w, 21, 21) == 1
                 && (((bits(w, 11, 11) << 1) | bits(w, 10, 10)) != 0b10))
@@ -7865,6 +8386,38 @@ impl Cpu {
             && !(((w >> 25) & 0x1f) == 0b00100
                 && bits(w, 21, 21) == 0
                 && bits(w, 14, 12) == 0b111)
+            // M92 STTR/LDTR LANE (assembler truth, corrected 2026-09-28:
+            // the size<3 gate is WRONG — X forms are size==0b11 (sttr.s
+            // truth table). Gate: opc==0b00/0b01 + bit24==0 + bit21==0
+            // + (bit11,bit10)==0b10, NO size gate. Signed opc==0b10/
+            // 0b11 (LDTRSW/SB/SH) keep their existing paths; plain
+            // unscaled (b11_10==00), post (01), pre (11) never match
+            // 0b10, so no plain-form word can enter. Selects the
+            // UNPRIVILEGED lane (STTR/LDTR — `sttr xzr,[x0]`=
+            // 0xF800081F; the kernel's memset uses it). The base arm
+            // below decodes (bit11,bit10)==0b10 as UNALLOCATED
+            // (`_ => return Err(ill)`), so admit the lane FIRST: same
+            // addressing (unscaled imm9) + same data semantics as the
+            // plain forms (EL0-checked, folded since pi-cpu is
+            // single-regime), with writeback forms admitted too (STTR
+            // post/pre-index exist in the encoding space).
+            // M93d LANE-ADMIT (superseded 2026-09-28: the standalone
+            // arm above owns the lane now; this || term is kept as a
+            // belt-and-braces twin with identical terms. The old "Rust
+            // &&/|| precedence" theory was WRONG — opclass decode
+            // proved the size gate was the killer, not precedence.)
+            // M93e ATOMICS-LANE EXCLUSION (assembler truth, corrected
+            // 2026-09-28: no size gate — X forms are size==0b11.
+            // Exclude V==0 + b24==0 + b21==0 + b11_10==0b10 + opc
+            // 00/01: admits nothing a real LSE word carries (all LSE
+            // words have o1==1 i.e. b21==1 per excl.s; CAS is class
+            // 001000, not 111000). Narrow + disjoint by construction.)
+            || (((w >> 25) & 0x1f) == 0b11100
+                && bits(w, 26, 26) == 0
+                && (bits(w, 23, 22) == 0b00 || bits(w, 23, 22) == 0b01)
+                && bits(w, 24, 24) == 0
+                && bits(w, 21, 21) == 0
+                && ((bits(w, 11, 11) << 1) | bits(w, 10, 10)) == 0b10)
         {
             let size = bits(w, 31, 30);
             if bits(w, 26, 26) == 1 {
@@ -7896,6 +8449,9 @@ impl Cpu {
             // 64 bits (LDRSB/H/SW-X), 11 signed load to 32 bits (size<2;
             // unallocated for size>=2). PRFM-imm (size 3, opc 2) is
             // absorbed above (all PRFM forms are NOPs).
+            // (M92 STTR/LDTR: admitted by the lane gate on the arm
+            // condition above; they execute through this shared body
+            // with plain-form semantics — no separate code needed.)
             let is_load = opc != 0b00;
             if opc == 0b11 && size >= 2 {
                 return Err(ill); // unallocated
@@ -7937,8 +8493,13 @@ impl Cpu {
                     let off = extend_reg(self.r(rm), option, amount);
                     (self.rsp(rn).wrapping_add(off), None)
                 } else {
+                    // (M92 STTR/LDTR: the lane gate on the arm condition
+                    // admits b11_10==0b10 here with unscaled-imm9
+                    // addressing — the unprivileged alias of 0b00.
+                    // Writeback variants (post/pre-index) share the same
+                    // alias encoding and execute identically.)
                     match (bits(w, 11, 11) << 1) | bits(w, 10, 10) {
-                        0b00 => {
+                        0b00 | 0b10 => {
                             let off = sext(bits(w, 20, 12) as u64, 9);
                             (self.rsp(rn).wrapping_add(off), None)
                         }
@@ -8015,7 +8576,25 @@ impl Cpu {
         // stlr=C89FFC20 ldar=C8DFFC20 ldaxr=C85FFC20 stlxr=C802FC20
         // casp=48207C82. Field map: o0=bit15 (0=exclusive family,
         // 1=LSE lane), L=bit22, Rs=bits[20:16].
-        if ((w >> 24) & 0x3f) == 0b001000 || ((w >> 24) & 0x3f) == 0b111000
+        // M93e STTR/LDTR EXCLUSION (assembler truth 2026-09-28: the
+        // 6-bit class gate 111000 MATCHES every STTR/LDTR word
+        // (`sttr xzr,[x0]`=0xF800081F>>24 = 0xF8, &0x3f = 0b111000 —
+        // same as stadd 0xB821005F), and this lane sits BEFORE the
+        // 0x1c arm, so it steals STTR/LDTR first. Real LSE words all
+        // carry o1==1 (bit21==1: ldadd/swp; CAS is class 001000, not
+        // 111000, proven by excl.s decode). STTR/LDTR have o1==0
+        // (bit21==0) + b11_10==0b10 + opc 00/01 + V==0 (NO size gate —
+        // X forms are size==0b11, proven by sttr.s truth table).
+        // Exclude exactly that shape here (narrow + disjoint: no real
+        // LSE word matches). The standalone STTR/LDTR lane above owns
+        // the excluded words.
+        if (((w >> 24) & 0x3f) == 0b001000 || ((w >> 24) & 0x3f) == 0b111000)
+            && !(((w >> 25) & 0x1f) == 0b11100
+                && bits(w, 26, 26) == 0
+                && (bits(w, 23, 22) == 0b00 || bits(w, 23, 22) == 0b01)
+                && bits(w, 24, 24) == 0
+                && bits(w, 21, 21) == 0
+                && ((bits(w, 11, 11) << 1) | bits(w, 10, 10)) == 0b10)
         {
             let o0 = bits(w, 15, 15);
             let l = bits(w, 22, 22);
@@ -8139,6 +8718,13 @@ impl Cpu {
                     // LDAXR fix above: STLR/LDAR always carry o0==1 per
                     // excl.s, but gating on it adds nothing — o2+L+Rs
                     // already discriminate.)
+                    // M105 LDAR (objdump-proven 7.6B: the freed ticket-
+                    // lock waiter at +0x28 runs 0x88DFFE60 = `ldar w0,
+                    // [x19]` (o2==110/L==1/Rs==31/Rt=0/Rn=19/size=W).
+                    // This arm loads it correctly (plain load into Rt);
+                    // the M105 note that stood here misread the word as
+                    // STLXR (it is LDAR — STLXR is o2==000, stl.s) and
+                    // is deleted.)
                     if rs != 31 {
                         return Err(ill);
                     }
@@ -8249,20 +8835,31 @@ impl Cpu {
                 self.w(rd, old, size_b == 8);
                 return Ok(());
             }
-            // LSE lane (M60 assembler truth, atom.s + one-byte rows:
-            // class bits[29:24]==0b111000, Rs!=0 in general — the old
-            // `Rm==0` gate belonged to three 0x41-niche words, NOT the
-            // lane: stadd/ldadd/swp/cas carry Rs=1/2/4/5): o2==001 is
-            // STADD/LDADD/SWP (op=o0: stadd o0==0/L==0, ldadd o0==0,
-            // swp o0==1) + B/H/W/X sizes incl. ldaddb; o2==011/111 are
-            // the L-variants (staddl/ldaddal/swpl) + CAS (o2==101/111
-            // is CAS ONLY when Rs!=0 — plain-CAS 0xC8A07C41 has Rs=0
-            // and lives on the exclusive lane above, while LSE-CAS has
-            // Rs=comparand!=0 and Rs==31 marks LDAPR).
-            // Single-core: plain RMW; Rt=old always (except no-return
-            // STADD: Rt==31).
-            if o1 == 1 && (o2 == 0b001 || o2 == 0b011) {
-                let op = bits(w, 15, 14);
+            // LSE RMW ACQUIRE FORMS (M104 assembler truth atom6.s,
+            // kernel-proven 6.967B: LDADD/LDCLR/LDEOR/LDSET/SWP acquire
+            // twins carry o1==1 + o2==101/111 while the plain twins
+            // carry o1==1 + o2==001 — SAME op map
+            // (op=bits[15:14]: 00=ADD,01=CLR,10=EOR,11=SET; o0==1
+            // selects SWP), SAME single-core semantics (mem=op(old,Rs),
+            // Rt=old; Rt==31 writes nothing back). The old lane below
+            // admitted ONLY o2==001/011, so every o2==101/111 RMW
+            // (ldsetal 0xB8A03260 at the ticket-lock acquire, ldaddal,
+            // swpal, ...) fell through to the o1==0 one-byte STADD
+            // hoist (op14:12==011 != 000, silently skipped) and died
+            // Err(ill) — init wedged in the ticket waiter at b9dc80
+            // forever. Atom6.s truth table: CAS stays o2==101
+            // (class 001000, exclusive lane) and NEVER collides — the
+            // o2==101/111 CAS arm below is untouched.
+            if o1 == 1 && (o2 == 0b001 || o2 == 0b011 || o2 == 0b101 || o2 == 0b111) {
+                // M104b SIGNED-OP TRUTH (opfull.s: op=bits[15:12] is a
+                // 4-bit field — 0000=ADD,0001=CLR,0010=EOR,0011=SET,
+                // 0100=SMAX,0101=SMIN,0110=UMAX,0111=UMIN,1000=SWP.
+                // The old bits[15:14] map aliased LDSET(0011) onto
+                // 00=ADD (lock OR became lock += addend — never
+                // unlocks). op4==1000 selects SWP (plain exchange,
+                // ignores the ALU op); signed min/max implement real
+                // signed/unsigned comparisons at the access width.
+                let op4 = bits(w, 15, 12);
                 // LSE size is bits[31:30] DIRECTLY (00=B,01=H,10=W,11=X
                 // — atom.s: ldaddb=38.., staddh=78.., stadd= B8..,
                 // stadd-x=F8..). NOT sf-derived (sf==1 for BOTH the W
@@ -8276,17 +8873,37 @@ impl Cpu {
                 let addr = self.rsp(rn);
                 let old = bus.read(addr, size_b).map_err(|_| Fault::UnmappedData(addr))?;
                 let a = self.r(rs) & mask(size_b);
-                let b = self.r(rd) & mask(size_b);
-                // op: 00=ADD, 01=CLR, 10=EOR, 11=SET; o0==1 selects
-                // SWP (plain exchange, ignores the ALU op).
-                let res = if o0 == 1 {
-                    b
+                // SWP REG ORDER (ARM ARM, instructionsets.com: SWP Ws,
+                // Wt, [Xn] — "address ← Xn; old ← [address]; [address]
+                // ← Ws; Wt ← old". Rs IS the store source, Rt IS the
+                // load dest: mem=Rs, Rt=old. The old code had it
+                // BACKWARDS (mem=Rt, dropping the stored value) —
+                // kernel-proven 7.6B: ticket-lock swp stuck at 0x101
+                // forever (init wedged at b9dc80).
+                let res = if op4 == 0b1000 {
+                    a
                 } else {
-                    match op {
-                        0b00 => old.wrapping_add(a) & mask(size_b),
-                        0b01 => (old & !a) & mask(size_b),
-                        0b10 => (old ^ a) & mask(size_b),
-                        _ => (old | a) & mask(size_b),
+                    match op4 {
+                        0b0000 => old.wrapping_add(a) & mask(size_b),
+                        0b0001 => (old & !a) & mask(size_b),
+                        0b0010 => (old ^ a) & mask(size_b),
+                        0b0011 => (old | a) & mask(size_b),
+                        0b0100 => {
+                            let s = size_b * 8;
+                            let sh = 64 - s;
+                            let so = ((old << sh) as i64 >> sh) as i64;
+                            let sa = ((a << sh) as i64 >> sh) as i64;
+                            (so.max(sa) as u64) & mask(size_b)
+                        }
+                        0b0101 => {
+                            let s = size_b * 8;
+                            let sh = 64 - s;
+                            let so = ((old << sh) as i64 >> sh) as i64;
+                            let sa = ((a << sh) as i64 >> sh) as i64;
+                            (so.min(sa) as u64) & mask(size_b)
+                        }
+                        0b0110 => (old.max(a)) & mask(size_b),
+                        _ => (old.min(a)) & mask(size_b),
                     }
                 };
                 bus.write(addr, size_b, res).map_err(|_| Fault::UnmappedData(addr))?;
@@ -8298,7 +8915,17 @@ impl Cpu {
             // LSE CAS + LDAPR (o2==101/111, o1==1): Rs==31 marks LDAPR
             // (plain load, o0==1, op==100: b8bfc261/f8bfc261 W/X +
             // B/H forms); else CAS (Rs=comparand, Rt=new, Rt=old).
-            if o1 == 1 && (o2 == 0b101 || o2 == 0b111) {
+            // M104 ORDER (the RMW-acquire arm directly above owns
+            // o2==101/111 RMW-acquire words — LDSETAL/LDADDAL/SWPAL —
+            // which MUST NOT fall into this CAS arm: on the RMW lane
+            // Rs IS the addend (not a comparand) and Rd IS the dest
+            // (not the new value), so CAS compare-and-swap semantics
+            // would corrupt the lock word. This arm fires ONLY for
+            // genuine CAS: op=bits[15:14]==0b11 (atom6.s: every CAS
+            // word — casa/casal/cas/casl/casb — carries op==11, while
+            // every RMW word — ldadd/ldset/swp plain+acquire — carries
+            // op==00/01/10). LDAPR (Rs==31) unchanged.
+            if o1 == 1 && (o2 == 0b101 || o2 == 0b111) && bits(w, 15, 14) == 0b11 {
                 let size_b: u64 = match bits(w, 31, 30) {
                     0b00 => 1,
                     0b01 => 2,
@@ -8388,6 +9015,75 @@ impl Cpu {
                     _ => (old | (v & mask(size_b))) & mask(size_b),
                 };
                 bus.write(addr, size_b, res).map_err(|_| Fault::UnmappedData(addr))?;
+                return Ok(());
+            }
+            // M104 LDSET/LDADD/LDCLR/LDEOR/SWP ACQUIRE FORMS (assembler
+            // truth atom5.s, kernel-proven 6.967B: `ldsetal w0,w0,[x19]`
+            // =0xB8A03260 carries o2==0b101 + o1==1 + o0==0 + L==0 —
+            // the ACQUIRE RMW shape (L is the acquire bit, NOT a
+            // load/store discriminator on this lane). The old code only
+            // admitted the L==1 LSE lane above (o2==001/011) and the
+            // o2==101/111 CAS arm below, so LDSETAL fell into the o1==0
+            // one-byte STADD hoist (op14:12==011 != 000, silently
+            // skipped) and died Err(ill) at the ticket-lock acquire —
+            // init wedged in the ticket waiter at b9dc80 forever. Truth:
+            // LDADD/LDCLR/LDEOR/LDSET/SWP acquire forms are o1==1 +
+            // o2==101/111 with op=bits[15:14] selecting the ALU op
+            // (00=ADD,01=CLR,10=EOR,11=SET; o0==1 selects SWP); the
+            // plain (non-acquire) twins live on the o1==1/o2==001/011
+            // lane above with the same op map. Single-core: plain RMW
+            // (old = mem, mem = op(old, Rs), Rt = old); STADD (Rt==31)
+            // writes nothing back. Atom5.s: all 12 acquire+plain forms
+            // verified (casa/casal/cas/casl/casb/swp/swpl/ldadd/ldaddl/
+            // ldset/ldsetl all o2==101/111-or-001 as documented).
+            if o1 == 1 && (o2 == 0b101 || o2 == 0b111) {
+                // M104b op4 MAP (opfull.s: op=bits[15:12] is 4-bit —
+                // 0000=ADD..0111=UMIN,1000=SWP — NOT bits[15:14]. The
+                // old 2-bit map aliased LDSET(0011)→ADD. SWP never
+                // carries o0==1+op==10 here (that was the old wrong
+                // map's reading of swp's 1000); SWP is op4==1000.
+                let size_b: u64 = match bits(w, 31, 30) {
+                    0b00 => 1,
+                    0b01 => 2,
+                    0b10 => 4,
+                    _ => 8,
+                };
+                let addr = self.rsp(rn);
+                let old = bus.read(addr, size_b).map_err(|_| Fault::UnmappedData(addr))?;
+                let a = self.r(rs) & mask(size_b);
+                let op4 = bits(w, 15, 12);
+                let res = if op4 == 0b1000 {
+                    // SWP (ARM ARM: mem=Rs, Rt=old — same order as the
+                    // pre-arm and the 0x1c lane).
+                    a
+                } else {
+                    match op4 {
+                        0b0000 => old.wrapping_add(a) & mask(size_b),
+                        0b0001 => (old & !a) & mask(size_b),
+                        0b0010 => (old ^ a) & mask(size_b),
+                        0b0011 => (old | a) & mask(size_b),
+                        0b0100 => {
+                            let s = size_b * 8;
+                            let sh = 64 - s;
+                            let so = ((old << sh) as i64 >> sh) as i64;
+                            let sa = ((a << sh) as i64 >> sh) as i64;
+                            (so.max(sa) as u64) & mask(size_b)
+                        }
+                        0b0101 => {
+                            let s = size_b * 8;
+                            let sh = 64 - s;
+                            let so = ((old << sh) as i64 >> sh) as i64;
+                            let sa = ((a << sh) as i64 >> sh) as i64;
+                            (so.min(sa) as u64) & mask(size_b)
+                        }
+                        0b0110 => (old.max(a)) & mask(size_b),
+                        _ => (old.min(a)) & mask(size_b),
+                    }
+                };
+                bus.write(addr, size_b, res).map_err(|_| Fault::UnmappedData(addr))?;
+                if rd != 31 {
+                    self.w(rd, old, size_b == 8);
+                }
                 return Ok(());
             }
             return Err(ill);
@@ -9743,6 +10439,32 @@ impl Cpu {
             };
             self.w(rd, r, sf);
             return Ok(());
+        }
+        // M100 EL0t CATCH-ALL (linux_mode + cur_el==0 only): the
+        // kernel's EL0t trampoline at VBAR+0x400 runs word shapes the
+        // interpreter has no arm for (ADRP/ADD/LDR/B/RET sequences for
+        // the EL0-return trampoline). Faulting Illegal() here kills
+        // init with SIGILL (exitcode 0x4, the 7.2B tail). Instead trap
+        // to the EL1h sync vector (EC 0x24 DABT_LOW, DFSC L0 — the
+        // shape the guest's do_el0t handler already consumes for its
+        // own EL0 faults) so the guest makes forward progress while
+        // the real decoder gap is root-caused via EXCTRACE. Bare-metal
+        // guests never set cur_el=0 (EL1-only erets), so the gate
+        // never fires for them — every golden unaffected.
+        if bus.linux_mode && self.cur_el == 0 {
+            self.esr_el1 = (0x24 << 26) | 0x04;
+            self.far_el1 = pc;
+            self.elr_el1 = pc;
+            self.spsr_el1 = self.pstate();
+            self.daif = 0xf;
+            let vbar = if self.vbar_el1 == 0 { 0x100000 } else { self.vbar_el1 };
+            self.pc = vbar + 0x400;
+            self.cur_el = 1;
+            if std::env::var("PI3_EXCTRACE").is_ok() {
+                eprintln!("EXC n={} EL0TRAP elr=0x{:x} w=0x{:08x} vec=+0x400 sp=0x{:x} sp_el0=0x{:x}", bus.exc_n, pc, w, self.sp, self.sp_el0);
+            }
+            self.abort_pending = true;
+            return Err(Fault::El0Trap(pc));
         }
         Err(ill)
     }
