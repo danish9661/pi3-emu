@@ -1064,7 +1064,12 @@ impl Bus {
     /// SDHCI command execution (mirrors sdhci.js exec(), PIO mode only —
     /// no DMA/ADMA paths; the firmware uses PIO throughout).
     fn sd_exec(&mut self, index: u32, arg: u32) {
-        eprintln!("SDCMD {} arg={:#x}", index, arg);
+        // M109: trace gated (was unconditional — every PIO command paid
+        // a format + syscall even with no listener; the sd guest issues
+        // dozens per boot).
+        if std::env::var("SDTRACE").is_ok() {
+            eprintln!("SDCMD {} arg={:#x}", index, arg);
+        }
         const CID: [u32; 4] = [0x12345678, 0x9abcdef0, 0x13579bdf, 0x2468ace0];
         match index {
             0 => self.sd_resp0 = 0,
@@ -1076,7 +1081,10 @@ impl Bus {
             17 => {
                 self.sd_resp0 = 0x900;
                 self.sd_stage = self.sd_read_sector(arg as usize);
-                eprintln!("SD17 sec={} st0={:#x} disk00={:#x}", arg & 0xffff, self.sd_stage[0], self.sd_disk[0][0]);
+                // M109: gated (was unconditional; fires per sector read).
+                if std::env::var("SDTRACE").is_ok() {
+                    eprintln!("SD17 sec={} st0={:#x} disk00={:#x}", arg & 0xffff, self.sd_stage[0], self.sd_disk[0][0]);
+                }
                 self.sd_irpt |= (1 << 5) | (1 << 1); // READ_READY|XFER
             }
             24 => {
@@ -3857,21 +3865,32 @@ impl Bus {
         // never pays for a page-table walk it bypasses anyway.
         if (self.mmu_sctlr & 1) == 0 {
             if self.in_ram(addr, size) {
+                // M110 size-specialized gather (was byte loop): identical
+                // value, one bounds check, constant-time per size.
+                // Reachable sizes are {1,2,4,8} (1<<size, sc, esz∈{4,8};
+                // 16-byte Q ops split into paired 8s at call sites); the
+                // `_` arm is dead-but-safe (low 8 bytes, no panic).
                 let a = addr as usize;
-                let mut v = 0u64;
-                for i in 0..size {
-                    v |= (self.mem[a + i as usize] as u64) << (8 * i);
-                }
+                let m = &self.mem[a..a + size as usize];
+                let v = match size {
+                    1 => m[0] as u64,
+                    2 => u16::from_le_bytes([m[0], m[1]]) as u64,
+                    4 => u32::from_le_bytes([m[0], m[1], m[2], m[3]]) as u64,
+                    _ => u64::from_le_bytes([m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]]),
+                };
                 return Ok(v);
             }
         } else {
             addr = self.translate(addr)?;
             if self.in_ram(addr, size) {
                 let a = addr as usize;
-                let mut v = 0u64;
-                for i in 0..size {
-                    v |= (self.mem[a + i as usize] as u64) << (8 * i);
-                }
+                let m = &self.mem[a..a + size as usize];
+                let v = match size {
+                    1 => m[0] as u64,
+                    2 => u16::from_le_bytes([m[0], m[1]]) as u64,
+                    4 => u32::from_le_bytes([m[0], m[1], m[2], m[3]]) as u64,
+                    _ => u64::from_le_bytes([m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]]),
+                };
                 return Ok(v);
             }
         }
@@ -4171,7 +4190,9 @@ impl Bus {
                 0x30 => self.sd_irpt as u64,
                 0x100..=0x2ff => {
                     // Staging buffer (little-endian word reads).
-                    if off == 0x100 {
+                    // M109: gated (was unconditional; fires on every
+                    // staging-buffer window read).
+                    if off == 0x100 && std::env::var("SDTRACE").is_ok() {
                         eprintln!("BLK0 {:02x}{:02x}{:02x}{:02x}...{:02x}{:02x}", self.sd_stage[0], self.sd_stage[1], self.sd_stage[2], self.sd_stage[3], self.sd_stage[510], self.sd_stage[511]);
                     }
                     let mut w = 0u64;
@@ -4615,9 +4636,15 @@ impl Bus {
                     self.wwatch_hits += 1;
                 }
                 let a = addr as usize;
-                for i in 0..size {
-                    self.mem[a + i as usize] = ((val >> (8 * i)) & 0xff) as u8;
-                }
+                // M110 size-specialized scatter (was byte loop). Same
+                // reachable-size argument as the gather above.
+                let m = &mut self.mem[a..a + size as usize];
+                match size {
+                    1 => m[0] = val as u8,
+                    2 => m.copy_from_slice(&(val as u16).to_le_bytes()),
+                    4 => m.copy_from_slice(&(val as u32).to_le_bytes()),
+                    _ => m[..8].copy_from_slice(&val.to_le_bytes()),
+                };
                 return Ok(());
             }
         } else {
@@ -4645,9 +4672,15 @@ impl Bus {
                     self.wwatch_hits += 1;
                 }
                 let a = addr as usize;
-                for i in 0..size {
-                    self.mem[a + i as usize] = ((val >> (8 * i)) & 0xff) as u8;
-                }
+                // M110 size-specialized scatter (was byte loop). Same
+                // reachable-size argument as the gather above.
+                let m = &mut self.mem[a..a + size as usize];
+                match size {
+                    1 => m[0] = val as u8,
+                    2 => m.copy_from_slice(&(val as u16).to_le_bytes()),
+                    4 => m.copy_from_slice(&(val as u32).to_le_bytes()),
+                    _ => m[..8].copy_from_slice(&val.to_le_bytes()),
+                };
                 return Ok(());
             }
         }
@@ -6686,6 +6719,15 @@ impl Cpu {
         };
         self.pc = pc.wrapping_add(4);
         let r = self.exec(bus, pc, w);
+        self.finish_op(bus, pc, w, r)
+    }
+
+    /// M114 shared fault-mapping tail (moved verbatim out of step()):
+    /// maps an op result through the El0Trap pass-through (M100) and
+    /// the sync data-abort delivery (M93/M102). Used by step() and by
+    /// TB op execution alike — single source of truth.
+    #[inline(always)]
+    fn finish_op(&mut self, bus: &mut Bus, pc: u64, w: u32, r: Result<(), Fault>) -> Result<(), Fault> {
         // M100 EL0T-TRAP MAP (companion to the exec-tail catch-all):
         // exec reports El0Trap(pc) for undecoded EL0t-trampoline words
         // (linux_mode + cur_el==0 only). Treat like a delivered abort
@@ -7053,6 +7095,633 @@ fn shift_reg(v: u64, kind: u32, amount: u32, sf: bool) -> u64 {
 }
 
 impl Cpu {
+    /// M114 shared predicate: DataImm top-byte class (pure word test).
+    /// Top-byte set proven disjoint from every earlier chain arm
+    /// (exhaustive 256-value enumeration) — safe to test first.
+    #[inline]
+    fn g_dataimm(w: u32) -> bool {
+        ((w >> 25) & 0xf) == 0x8 || ((w >> 25) & 0xf) == 0x9
+    }
+    /// M114 shared predicate: M104 LSE-atomic pre-arm class (pure word
+    /// test + mode). Moved verbatim out of the exec() chain; the chain
+    /// and the TB classifier share it (zero drift by construction).
+    #[inline]
+    fn g_lse_pre(w: u32, linux_mode: bool) -> bool {
+        linux_mode
+            && ((w >> 24) & 0x3f) == 0b111000
+            && bits(w, 21, 21) == 1
+            && ((bits(w, 11, 11) << 1) | bits(w, 10, 10)) == 0b00
+    }
+    /// M114 shared predicate: M93d STTR/LDTR standalone lane (pure
+    /// word test, assembler truth sttr.s). Same sharing rationale as
+    /// g_lse_pre. Chain priority (lane before LDST-0x1c) is preserved
+    /// in the TB classifier by checking this first.
+    #[inline]
+    fn g_sttrlane(w: u32) -> bool {
+        ((w >> 25) & 0x1f) == 0b11100
+            && bits(w, 26, 26) == 0
+            && (bits(w, 23, 22) == 0b00 || bits(w, 23, 22) == 0b01)
+            && bits(w, 24, 24) == 0
+            && bits(w, 21, 21) == 0
+            && ((bits(w, 11, 11) << 1) | bits(w, 10, 10)) == 0b10
+    }
+
+    /// M114 shared body: DataImm (moved verbatim out of the exec() chain).
+    /// Self-contained given (bus, pc, w); reconstructs sf/rn/rd/ill.
+    /// Pure ALU (bus unused) — safe for TB reuse.
+    #[inline(always)]
+    fn b_dataimm(&mut self, _bus: &mut Bus, pc: u64, w: u32) -> Result<(), Fault> {
+        let ill = Fault::Illegal(w);
+        let sf = bits(w, 31, 31) == 1;
+        let rn = bits(w, 9, 5);
+        let rd = bits(w, 4, 0);
+            let op0 = bits(w, 28, 25);
+            let op1t = bits(w, 24, 23);
+            // PC-relative (bit24 == 0) vs ADD/SUB-immediate (bit24 == 1).
+            // (sh/imm12 live below bit24, so this split is stable.)
+            if op0 == 0b1000 && bits(w, 24, 24) == 0 {
+                let op = bits(w, 31, 31);
+                // M57 ADRP FIX (spec-correct, kernel-proven): the offset
+                // is a SIGNED 21-bit imm (immhi:immlo) scaled by 4K —
+                // sign-extend BEFORE the <<12, in i64 space. The old
+                // code sext()ed to u64 then wrapping_shl(12), which
+                // re-interprets bit63 of the extended value as a NEW
+                // sign (0xF...F44F -> 0x2780...000): every negative
+                // ADRP landed ~0x2780_0000_0000_0000 too high. The
+                // 4M-guest goldens never caught it (their adrp offsets
+                // are all positive). ADR (unscaled) was always correct.
+                let raw = (((bits(w, 23, 5) << 2) | bits(w, 30, 29)) as u64) as i64;
+                let simm = ((raw << 43) >> 43) as i64; // sign-extend 21
+                if op == 1 {
+                    let base = (pc & !0xfff) as i64;
+                    self.w(rd, base.wrapping_add(simm << 12) as u64, true);
+                } else {
+                    let imm = simm as u64;
+                    self.w(rd, pc.wrapping_add(imm), true);
+                }
+                return Ok(());
+            }
+            // ADD/SUB immediate
+            if op0 == 0b1000 && bits(w, 24, 24) == 1 {
+                let op = bits(w, 30, 30);
+                let s = bits(w, 29, 29) == 1;
+                let imm = (bits(w, 21, 10) as u64) << if bits(w, 22, 22) == 1 { 12 } else { 0 };
+                // Rn==31 is SP except with S set (CMP/CMN aliases read
+                // XZR — verified against the fork: `cmp sp, x0` clears C).
+                let a = if s && rn == 31 { self.r(rn) } else { self.rsp(rn) };
+                let (r, n, z, c, v) = if op == 0 {
+                    Cpu::add_with_carry(sf, a, imm, 0)
+                } else {
+                    Cpu::add_with_carry(sf, a, !imm, 1)
+                };
+                if s {
+                    self.n = n;
+                    self.z = z;
+                    self.c = c;
+                    self.v = v;
+                }
+                // CMP/CMN (S set, Rd==31) discard; otherwise Rd==31 is SP.
+                if !(s && rd == 31) {
+                    self.wsp(rd, r, sf);
+                }
+                return Ok(());
+            }
+            // Logical immediate
+            if op0 == 0b1001 && op1t == 0b00 {
+                let opc = bits(w, 30, 29);
+                let n = bits(w, 22, 22);
+                let (wmask, _, _, _, all_ones) =
+                    decode_masks(n, bits(w, 15, 10), bits(w, 21, 16), sf).ok_or(ill)?;
+                if all_ones {
+                    return Err(ill);
+                }
+                let a = self.r(rn);
+                let (r, setf) = match opc {
+                    0b00 => (a & wmask, false),
+                    0b01 => (a | wmask, false),
+                    0b10 => (a ^ wmask, false),
+                    _ => (a & wmask, true),
+                };
+                if setf {
+                    let r = if sf { r } else { r & 0xffff_ffff };
+                    self.n = if sf { r >> 63 != 0 } else { r >> 31 != 0 };
+                    self.z = r == 0;
+                    self.c = false;
+                    self.v = false;
+                }
+                self.w(rd, r, sf);
+                return Ok(());
+            }
+            // Move wide
+            if op0 == 0b1001 && op1t == 0b01 {
+                let opc = bits(w, 30, 29);
+                let pos = bits(w, 22, 21) * 16;
+                let v = (bits(w, 20, 5) as u64) << pos;
+                let m = if sf { u64::MAX } else { 0xffff_ffff };
+                let r = match opc {
+                    0b00 => (!v) & m,
+                    // M57 MOVK-ZERO FIX (kernel-proven): `movk x11,#0`
+                    // =0xF280000B has opc=0b11 with imm16=0,pos=0 — the
+                    // old KEEP arm `(Rd & !mask)|v` is CORRECT here, but
+                    // an earlier variant special-cased it wrong. Keep
+                    // the canonical form; the kernel's
+                    // movk x11,#0x800,lsl#16 (0xF2A1000B) + movk x11,#0
+                    // (0xF280000B) sequence must yield 0x8000000.
+                    0b10 => v,
+                    0b11 => (self.r(rd) & !(0xffffu64 << pos)) | v,
+                    _ => return Err(ill),
+                };
+                self.w(rd, r, sf);
+                return Ok(());
+            }
+            // EXTR (extract register, incl. the ROR-imm alias the
+            // assembler emits as extr Rd,Rn,Rn,#sh): gate from 4-word
+            // assembler truth, disjoint from the bitfield class below
+            // (100110 vs 100111 in bits28:23).
+            if ((w >> 23) & 0xff) == 0x27 {
+                let rm = bits(w, 20, 16);
+                let lsb = bits(w, 15, 10);
+                let width = if sf { 64 } else { 32 };
+                let m = if sf { u64::MAX } else { 0xffff_ffff };
+                let a = self.r(rn) & m;
+                let b = self.r(rm) & m;
+                // NOTE: Rn/Rm order matters (fixed 2026-09-12): the
+                // result is (Rn << (width-lsb)) | (Rm >> lsb) — an
+                // earlier version had a/b swapped, which passed the
+                // lsb==0 and Rn==Rm (ROR-alias) cases but silently
+                // corrupted everything else (proven by multf3's
+                // mantissa alignment: 10x10 -> 64.0 instead of 100.0).
+                let r = if lsb == 0 {
+                    a
+                } else {
+                    ((a << (width - lsb)) | (b >> lsb)) & m
+                };
+                self.w(rd, r, sf);
+                return Ok(());
+            }
+            // Bitfield
+            if op0 == 0b1001 && op1t == 0b10 {
+                let opc = bits(w, 30, 29);
+                let nbits = if sf { 64 } else { 32 };
+                let r = bits(w, 21, 16) % nbits;
+                let s = bits(w, 15, 10) % nbits;
+                let src = self.r(rn);
+                let result = match opc {
+                    0b10 => {
+                        // UBFM: degenerate S==n-1 are MOV/LSR aliases
+                        if s == nbits - 1 {
+                            if r == 0 {
+                                src
+                            } else {
+                                (src & if sf { u64::MAX } else { 0xffff_ffff }) >> r
+                            }
+                        } else {
+                            // General: oracle-verified selector shared
+                            // with BFM/SBFM — S < R inserts at position
+                            // (wmask), else extracts low (tmask);
+                            // UBFM zero-extends (no dst merge).
+                            let (wmask, tmask, ds, dr, _) = decode_masks(
+                                bits(w, 22, 22),
+                                bits(w, 15, 10),
+                                bits(w, 21, 16),
+                                sf,
+                            )
+                            .ok_or(ill)?;
+                            let tmp = ror(src, dr as u32, nbits);
+                            if ds < dr {
+                                tmp & wmask
+                            } else {
+                                tmp & tmask
+                            }
+                        }
+                    }
+                    0b00 => {
+                        // SBFM: degenerate are MOV/ASR aliases
+                        if s == nbits - 1 {
+                            if r == 0 {
+                                src
+                            } else if sf {
+                                ((src as i64) >> r) as u64
+                            } else {
+                                ((((src as u32) as i32) >> r) as u32) as u64
+                            }
+                        } else {
+                            // General: same selector, then sign-extend
+                            // from bit d (d = (S-R) mod nbits). Covers
+                            // sbfiz/sbfx and the ROR-imm SBFM shapes.
+                            let (wmask, tmask, ds, dr, _) = decode_masks(
+                                bits(w, 22, 22),
+                                bits(w, 15, 10),
+                                bits(w, 21, 16),
+                                sf,
+                            )
+                            .ok_or(ill)?;
+                            let tmp = ror(src, dr as u32, nbits);
+                            let f = if ds < dr { tmp & wmask } else { tmp & tmask };
+                            let d = ds.wrapping_sub(dr) & (nbits as u64 - 1);
+                            sext(f, (d + 1) as u32)
+                        }
+                    }
+                    0b01 => {
+                        // BFM: oracle-verified (30+ points, valid dst):
+                        // S < R inserts at position (wmask form), else
+                        // extracts low (tmask form). Covers canonical
+                        // BFI/BFXIL plus arbitrary (R,S).
+                        let dst = self.r(rd);
+                        let (wmask, tmask, ds, dr, _) =
+                            decode_masks(bits(w, 22, 22), bits(w, 15, 10), bits(w, 21, 16), sf)
+                                .ok_or(ill)?;
+                        let tmp = ror(src, dr as u32, nbits);
+                        if ds < dr {
+                            (dst & !wmask) | (tmp & wmask)
+                        } else {
+                            (dst & !tmask) | (tmp & tmask)
+                        }
+                    }
+                    _ => return Err(ill),
+                };
+                self.w(rd, result, sf);
+                return Ok(());
+            }
+            return Err(ill);
+    }
+
+    /// M114 shared predicate: LDST-int 0x1c arm gate (moved verbatim
+    /// out of the exec() chain, incl. all four exclusion clauses + the
+    /// M93e STTR-lane OR-term). Chain and TB classifier share it.
+    fn g_ldst(w: u32) -> bool {
+                ((w >> 25) & 0x1f) == 0x1c
+            // M104 LSE-ATOMIC EXCLUSION (assembler truth atom6.s,
+            // kernel-proven 6.967B: EVERY LSE RMW word — plain twins
+            // (ldadd/ldset/swp/stadd, o1==1+o2==001) AND acquire twins
+            // (ldaddal/ldsetal/swpal, o1==1+o2==101/111) — shares the
+            // 0x1c 5-bit class (bits[29:25]==11100) with bit24==0, so
+            // the 0x1c test FIRES on all of them. The old guards only
+            // excluded the b21==1 reg-offset path and the STTR/LDTR
+            // lane, so every LSE word fell into the 0x1c body: opc==
+            // 0b10 (all RMW: LDADD/LDSET/SWP carry opc==10) decoded as
+            // "signed load", size==0b10/W decoded 4 bytes, and the body
+            // executed a PLAIN LOAD (is_load = opc != 00) — the ticket
+            // lock's ldsetal became a load that never ORs, init wedged
+            // at b9dc80 with lock stuck 0x101. Exclude the whole LSE
+            // class here (o1==1 + b11_10==00, atom6.s + reg.s + casb.s:
+            // disjoint from every plain form — plain reg-offset carries
+            // b11_10==10, plain U12 is b24==1, STTR/LDTR is o1==0; NO o2
+            // gate — LSE acquire forms span o2==001/011/101/111) and
+            // let the atomic lane below own it.
+            && !(((w >> 24) & 0x3f) == 0b111000
+                && bits(w, 21, 21) == 1
+                && ((bits(w, 11, 11) << 1) | bits(w, 10, 10)) == 0b00)
+            // M60 LSE-GUARD (assembler truth, atom.s): the register-offset
+            // path (bit24==0, bit21==1) collides with the LSE atomic lane
+            // (class 111000 = stadd/ldadd/swp shapes, all bit24==0/
+            // bit21==1). Real discriminator (ARM ARM): integer reg-offset
+            // fixes bits[11:10]==10 (B8616801/B8617801/F82A780C all 10);
+            // LSE carries 00 (every LSE word: stadd, swp, ldadd...).
+            // Non-10 words are NOT integer reg-offset — skip the whole
+            // arm so they reach the atomic lane (previously stadd
+            // executed as a wrong-address register-offset store and
+            // "passed" one.rs fault-only checks while corrupting
+            // memory). M93e STTR/LDTR CARVE-OUT (assembler truth,
+            // kernel-proven 6.945B, corrected 2026-09-28: the size<3
+            // gate is WRONG — X forms (`sttr xzr,[x0]`=0xF800081F) are
+            // size==0b11 (sttr.s truth table). The carve-out admits opc
+            // 00/01 + b11_10==10 with NO size gate; signed opc==0b10/
+            // 0b11 stay on existing paths. LDTRSW-X (size==3/opc==0b10)
+            // is unreachable here (plain-form b11_10==00/01/11 never
+            // matches 0b10) so the PRFM-absorb note below is about the
+            // shared body, not this gate.
+            // shares the LSE 6-bit class 111000 (bit24==0) but has
+            // bit21==0, so the b21==1 guard above does NOT exclude it —
+            // yet the 0x1c arm's own (bit11,bit10) switch decodes
+            // b11_10==10 as UNALLOCATED and faults it Illegal. Admit
+            // the lane here FIRST (plain-form addressing + access
+            // semantics, EL0 folded): b11_10==10 + opc 00/01 only, no
+            // size gate (signed opc==0b10/0b11 stay on existing paths).
+            && !(bits(w, 24, 24) == 0
+                && bits(w, 21, 21) == 1
+                && (((bits(w, 11, 11) << 1) | bits(w, 10, 10)) != 0b10))
+            // M60 EXCLUSIVE-GUARD (bh.s assembler truth: B/H exclusives
+            // share bits[29:25]==00100 with NO plain form — plain LDRB/H
+            // is class 11100 (ldrb 0x39400001), exclusives are class
+            // 00100 at every size (stlrb 0x089FFC01 ... stxr 0x88037E62).
+            // So inside this arm, o1==0 + op==111 marks EXCLUSIVE at all
+            // sizes (STXR/STLXR o2==000, LDXR/LDAXR o2==010/L==1/Rs==31,
+            // STLR/LDAR o2==100/110/Rs==31); plain U12 never has op==111
+            // with o1==0 here. Skip the arm for those (let the atomic
+            // lane below own every exclusive shape). Class gate added
+            // after the B9427E61 regression (plain `ldr w1,[x19,#636]`
+            // class 11100 carries o1==0/op==111 too — without the class
+            // test the guard stole ALL such loads into Err(ill)).
+            && !(((w >> 25) & 0x1f) == 0b00100
+                && bits(w, 21, 21) == 0
+                && bits(w, 14, 12) == 0b111)
+            // M92 STTR/LDTR LANE (assembler truth, corrected 2026-09-28:
+            // the size<3 gate is WRONG — X forms are size==0b11 (sttr.s
+            // truth table). Gate: opc==0b00/0b01 + bit24==0 + bit21==0
+            // + (bit11,bit10)==0b10, NO size gate. Signed opc==0b10/
+            // 0b11 (LDTRSW/SB/SH) keep their existing paths; plain
+            // unscaled (b11_10==00), post (01), pre (11) never match
+            // 0b10, so no plain-form word can enter. Selects the
+            // UNPRIVILEGED lane (STTR/LDTR — `sttr xzr,[x0]`=
+            // 0xF800081F; the kernel's memset uses it). The base arm
+            // below decodes (bit11,bit10)==0b10 as UNALLOCATED
+            // (`_ => return Err(ill)`), so admit the lane FIRST: same
+            // addressing (unscaled imm9) + same data semantics as the
+            // plain forms (EL0-checked, folded since pi-cpu is
+            // single-regime), with writeback forms admitted too (STTR
+            // post/pre-index exist in the encoding space).
+            // M93d LANE-ADMIT (superseded 2026-09-28: the standalone
+            // arm above owns the lane now; this || term is kept as a
+            // belt-and-braces twin with identical terms. The old "Rust
+            // &&/|| precedence" theory was WRONG — opclass decode
+            // proved the size gate was the killer, not precedence.)
+            // M93e ATOMICS-LANE EXCLUSION (assembler truth, corrected
+            // 2026-09-28: no size gate — X forms are size==0b11.
+            // Exclude V==0 + b24==0 + b21==0 + b11_10==0b10 + opc
+            // 00/01: admits nothing a real LSE word carries (all LSE
+            // words have o1==1 i.e. b21==1 per excl.s; CAS is class
+            // 001000, not 111000). Narrow + disjoint by construction.)
+            || (((w >> 25) & 0x1f) == 0b11100
+                && bits(w, 26, 26) == 0
+                && (bits(w, 23, 22) == 0b00 || bits(w, 23, 22) == 0b01)
+                && bits(w, 24, 24) == 0
+                && bits(w, 21, 21) == 0
+                && ((bits(w, 11, 11) << 1) | bits(w, 10, 10)) == 0b10)
+    }
+
+    /// M114 shared body: LDST-int (moved verbatim out of the exec() chain).
+    /// Self-contained given (bus, w); reconstructs rn/rd/ill.
+    #[inline(always)]
+    fn b_ldst(&mut self, bus: &mut Bus, _pc: u64, w: u32) -> Result<(), Fault> {
+        let ill = Fault::Illegal(w);
+        let rn = bits(w, 9, 5);
+        let rd = bits(w, 4, 0);
+            let size = bits(w, 31, 30);
+            if bits(w, 26, 26) == 1 {
+                return Err(ill); // SIMD (non-Q handled above)
+            }
+            let nbytes = 1u64 << size;
+            let opc = bits(w, 23, 22);
+            // PRFM (M57 register + M60 register-offset forms): every PRFM
+            // is a prefetch hint — absorb as NOP, whatever the addressing
+            // mode. Register form `prfm pstl1keep,[x17]`=0xF9800071
+            // (size=3/opc=0b10/bit24==1/imm12==0); register-OFFSET form
+            // `prfm pstl1keep,[x26,x0]`=0xF8A06B50 (bit24==0/bit21==1/
+            // b11_10==10, the integer-reg-offset shape — stepat-proven at
+            // the 25.6M point: opc==0b10/size==3 faulted as PRFM-imm
+            // before reaching any offset decode). Gate on size==3/opc==
+            // 0b10 ONLY (both forms); real LDRSW-X (signed 64-bit load)
+            // shares opc==0b10/size==3 but is UNREACHABLE here — LDRSW-X
+            // literal lives in the 0b01100 arm above and LDRSW-X reg-off
+            // ... is distinguished by L==1 (loads) vs PRFM's L==0? NO —
+            // prfm has no L bit. Truth: PRFM-register/offset are the ONLY
+            // size==3/opc==0b10 words with bit24==0-or-(bit24==1&imm12==
+            // 0); LDRSW-X forms carry a real offset. The kernel emits no
+            // LDRSW-X-reg forms on this path (882 fuzzer + 23 smoke pin
+            // the scalar forms), so absorb all size==3/opc==0b10 here.
+            if size == 3 && opc == 0b10 {
+                return Ok(()); // PRFM (all forms) / LDRSW-X-imm (absorbed)
+            }
+            // opc: 00 store, 01 zero-extending load, 10 signed load to
+            // 64 bits (LDRSB/H/SW-X), 11 signed load to 32 bits (size<2;
+            // unallocated for size>=2). PRFM-imm (size 3, opc 2) is
+            // absorbed above (all PRFM forms are NOPs).
+            // (M92 STTR/LDTR: admitted by the lane gate on the arm
+            // condition above; they execute through this shared body
+            // with plain-form semantics — no separate code needed.)
+            let is_load = opc != 0b00;
+            if opc == 0b11 && size >= 2 {
+                return Err(ill); // unallocated
+            }
+            // signed result width in bits (0 = zero-extend/Normal store).
+            let sext_to: u32 = match opc {
+                0b10 => 64,
+                0b11 => 32,
+                _ => 0,
+            };
+            let (addr, wb) = if bits(w, 24, 24) == 1 {
+                let off = (bits(w, 21, 10) as u64) * nbytes;
+                (self.rsp(rn).wrapping_add(off), None)
+            } else {
+                // bit24 == 0: bit21 selects register-offset (1) vs imm9
+                // modes (0); the latter decode via (bit11,bit10): 00 =
+                // unscaled, 01 = post-index, 11 = pre-index (10 is
+                // unallocated). Verified word-by-word against the
+                // assembler — never hand-derive these fields again.
+                if bits(w, 21, 21) == 1 {
+                    // register offset (M57 LSL-FIX, kernel-proven): the
+                    // amount is bit12 S selecting the NATURAL shift —
+                    // LSL #esz-log2 for option==0b011 (plain LSL form).
+                    // Assembler truth: `ldr x1,[x0,x1]`=0xF8616801
+                    // (S=0, LSL #0) vs `ldr x1,[x0,x1,lsl#3]`=
+                    // 0xF8617801 (S=1, LSL #3). The old code passed S
+                    // itself as amount, so `str x12,[x0,x10,lsl#3]`
+                    // shifted by 1 (pairwise aliasing, walked idx
+                    // zero). Guests never use scaled register offsets
+                    // (fuzzer green either way), so no golden moves.
+                    // NOTE size==access-size: the kernel's W-form
+                    // `ldr w1,[x0,x1]` (size=0b10, S=1) shifts by 2
+                    // (esz=4), NOT 3 — amount=size is log2(esz) by
+                    // construction (size 0/1/2/3 -> 1/2/4/8 bytes).
+                    let rm = bits(w, 20, 16);
+                    let option = bits(w, 15, 13);
+                    let s = bits(w, 12, 12);
+                    let amount = if s == 1 { size } else { 0 };
+                    let off = extend_reg(self.r(rm), option, amount);
+                    (self.rsp(rn).wrapping_add(off), None)
+                } else {
+                    // (M92 STTR/LDTR: the lane gate on the arm condition
+                    // admits b11_10==0b10 here with unscaled-imm9
+                    // addressing — the unprivileged alias of 0b00.
+                    // Writeback variants (post/pre-index) share the same
+                    // alias encoding and execute identically.)
+                    match (bits(w, 11, 11) << 1) | bits(w, 10, 10) {
+                        0b00 | 0b10 => {
+                            let off = sext(bits(w, 20, 12) as u64, 9);
+                            (self.rsp(rn).wrapping_add(off), None)
+                        }
+                        0b01 => {
+                            let off = sext(bits(w, 20, 12) as u64, 9);
+                            let b = self.rsp(rn);
+                            (b, Some(b.wrapping_add(off)))
+                        }
+                        0b11 => {
+                            // Pre-index: writeback applies AFTER a
+                            // successful access (the fork observably skips
+                            // it on fault; post-index keeps it).
+                            let off = sext(bits(w, 20, 12) as u64, 9);
+                            let a = self.rsp(rn).wrapping_add(off);
+                            (a, Some(a))
+                        }
+                        _ => return Err(ill),
+                    }
+                }
+            };
+            if is_load {
+                let v = bus.read(addr, nbytes).map_err(|_| Fault::UnmappedData(addr))?;
+                let v = if sext_to != 0 { sext(v, (nbytes * 8) as u32) } else { v };
+                // Signed-to-32 results zero-extend into the 64-bit reg;
+                // anything else follows the access size (w() masks).
+                self.w(rd, v, sext_to == 64 || size == 3);
+            } else {
+                let v = if size == 3 { self.r(rd) } else { self.r(rd) & mask(nbytes) };
+                bus.write(addr, nbytes, v).map_err(|_| Fault::UnmappedData(addr))?;
+            }
+            if let Some(b) = wb {
+                self.wsp(rn, b, true);
+            }
+            return Ok(());
+    }
+
+    /// M114 shared predicate: LDP/STP integer-pair class (pure word test).
+    /// Top-byte set proven disjoint from every earlier chain arm
+    /// (exhaustive 256-value enumeration) — safe in TB order.
+    #[inline(always)]
+    fn g_ldp(w: u32) -> bool {
+        ((w >> 25) & 0x1f) == 0x14
+    }
+
+    /// M114 shared body: LDP/STP integer pairs (moved verbatim).
+    /// Self-contained given (bus, w); reconstructs locals.
+    #[inline(always)]
+    fn b_ldp(&mut self, bus: &mut Bus, _pc: u64, w: u32) -> Result<(), Fault> {
+        let ill = Fault::Illegal(w);
+        let rn = bits(w, 9, 5);
+        let rd = bits(w, 4, 0);
+            let is64 = bits(w, 31, 31) == 1;
+            // Load-vs-store is bit22 (REVERTED M57 bit30 experiment —
+            // full 14-word assembler survey: STP=0xA9000440/LDP=
+            // 0xA9400440 differ ONLY in bit22; bit30 is 0 for every
+            // plain pair form. The kernel word 0xA9841D07 is genuinely
+            // STP-pre-index (mode 0b11, offset +64): the OLD bit22 code
+            // executed it as STP all along — CORRECT. The memmove
+            // corruption came from elsewhere (still open); the bit30
+            // swap broke 7 goldens (gpio/smp/irq/sd/rpi-kernel/
+            // firmware/debug) by flipping every plain LDP into a
+            // store. Lesson stands: pairs need the full survey, and
+            // one-sided evidence (one kernel word) never flips a
+            // golden-pinned gate.
+            let is_load = bits(w, 22, 22) == 1;
+            // LDPSW (op2 == 11): signed-word pair, 64-bit results.
+            // (Machine-derived: regular pairs have op2 == 01.)
+            let is_ldpsw = bits(w, 30, 29) == 0b11;
+            if is_ldpsw && !is_load {
+                return Err(ill);
+            }
+            let mode = bits(w, 24, 23);
+            let sc = if is64 { 8u64 } else { 4u64 };
+            let off = sext(bits(w, 21, 15) as u64, 7).wrapping_mul(sc) as i64 as u64;
+            let rt2 = bits(w, 14, 10);
+            let base = self.rsp(rn);
+            // Writeback timing (fork-observed, see test/cpu-cases.mjs):
+            // pre-index applies AFTER a successful access (skipped on
+            // fault); post-index applies immediately (kept on fault).
+            let (addr, wb) = match mode {
+                0b10 | 0b00 => (base.wrapping_add(off), None),
+                0b11 => {
+                    let a = base.wrapping_add(off);
+                    (a, Some(a))
+                }
+                _ => {
+                    // Post-index (mode 01): writeback FIRST (pre-access),
+                    // fuzzer-pinned (mem_28_2 golden: fork keeps wb on
+                    // fault). The 25.8M x21-zeroing is then a GENUINE
+                    // faulting-pair side effect (or a different bug) —
+                    // NOT evidence for wb-after-access. Revert to the
+                    // golden-pinned ordering; re-examine 25.8M fresh.
+                    let a = base;
+                    self.wsp(rn, base.wrapping_add(off), true);
+                    (a, None)
+                }
+            };
+            if is_load {
+                if is_ldpsw {
+                    let v1 = bus.read(addr, 4).map_err(|_| Fault::UnmappedData(addr))?;
+                    let v2 = bus
+                        .read(addr.wrapping_add(4), 4)
+                        .map_err(|_| Fault::UnmappedData(addr))?;
+                    if let Some(b) = wb {
+                        self.wsp(rn, b, true);
+                    }
+                    self.w(rd, sext(v1, 32), true);
+                    self.w(rt2, sext(v2, 32), true);
+                } else {
+                    let v1 = bus.read(addr, sc).map_err(|_| Fault::UnmappedData(addr))?;
+                    let v2 = bus
+                        .read(addr.wrapping_add(sc), sc)
+                        .map_err(|_| Fault::UnmappedData(addr))?;
+                    if let Some(b) = wb {
+                        self.wsp(rn, b, true);
+                    }
+                    self.w(rd, v1, is64);
+                    self.w(rt2, v2, is64);
+                }
+            } else {
+                bus.write(addr, sc, if is64 { self.r(rd) } else { self.r(rd) & 0xffff_ffff })
+                    .map_err(|_| Fault::UnmappedData(addr))?;
+                let a2 = addr.wrapping_add(sc);
+                bus.write(a2, sc, if is64 { self.r(rt2) } else { self.r(rt2) & 0xffff_ffff })
+                    .map_err(|_| Fault::UnmappedData(a2))?;
+                if let Some(b) = wb {
+                    self.wsp(rn, b, true);
+                }
+            }
+            return Ok(());
+    }
+
+    /// M114 shared body: STTR/LDTR lane (moved verbatim).
+    /// Self-contained given (bus, w); reconstructs locals.
+    #[inline(always)]
+    fn b_sttr(&mut self, bus: &mut Bus, _pc: u64, w: u32) -> Result<(), Fault> {
+        let ill = Fault::Illegal(w);
+        let rn = bits(w, 9, 5);
+        let rd = bits(w, 4, 0);
+            let size = bits(w, 31, 30);
+            let nbytes = 1u64 << size;
+            let opc = bits(w, 23, 22);
+            let is_load = opc != 0b00;
+            let sext_to: u32 = match opc {
+                0b10 => 64,
+                0b11 => 32,
+                _ => 0,
+            };
+            // is_load/opc decoding mirrors the base arm: opc==0b11 +
+            // size>=2 unallocated; signed widths per opc.
+            if opc == 0b11 && size >= 2 {
+                return Err(ill);
+            }
+            let (addr, wb) = match (bits(w, 11, 11) << 1) | bits(w, 10, 10) {
+                0b10 => {
+                    let off = sext(bits(w, 20, 12) as u64, 9);
+                    (self.rsp(rn).wrapping_add(off), None)
+                }
+                0b01 => {
+                    let off = sext(bits(w, 20, 12) as u64, 9);
+                    let b = self.rsp(rn);
+                    (b, Some(b.wrapping_add(off)))
+                }
+                0b11 => {
+                    let off = sext(bits(w, 20, 12) as u64, 9);
+                    let a = self.rsp(rn).wrapping_add(off);
+                    (a, Some(a))
+                }
+                _ => return Err(ill),
+            };
+            if is_load {
+                let v = bus.read(addr, nbytes).map_err(|_| Fault::UnmappedData(addr))?;
+                let v = if sext_to != 0 { sext(v, (nbytes * 8) as u32) } else { v };
+                self.w(rd, v, sext_to == 64 || size == 3);
+            } else {
+                let v = if size == 3 { self.r(rd) } else { self.r(rd) & mask(nbytes) };
+                bus.write(addr, nbytes, v).map_err(|_| Fault::UnmappedData(addr))?;
+            }
+            if let Some(b) = wb {
+                self.wsp(rn, b, true);
+            }
+            return Ok(());
+    }
+
     fn exec(&mut self, bus: &mut Bus, pc: u64, w: u32) -> Result<(), Fault> {
         let ill = Fault::Illegal(w);
         let sf = bits(w, 31, 31) == 1;
@@ -7079,10 +7748,7 @@ impl Cpu {
         // 0x88E5FCE6) never reaches this cls-111000 arm; the o2==101/
         // 111 CAS arm below is untouched. Body is the M104 RMW lane
         // verbatim (op=bits[15:14] ALU map, o0==1+op==10 selects SWP).
-        if bus.linux_mode
-            && ((w >> 24) & 0x3f) == 0b111000
-            && bits(w, 21, 21) == 1
-            && ((bits(w, 11, 11) << 1) | bits(w, 10, 10)) == 0b00
+        if Self::g_lse_pre(w, bus.linux_mode)
         {
             // M104b op4 MAP (opfull.s: op=bits[15:12] is 4-bit —
             // 0000=ADD..0111=UMIN,1000=SWP — NOT bits[15:14]. The old
@@ -7202,9 +7868,11 @@ impl Cpu {
             return Ok(());
         }
         // Exception-generating: SVC/HVC/BRK (M54 ch12 shape + M60 BRK).
-        // SVC fills ESR_EL1 (EC=0x15, ISS=imm16) and takes the EL1h sync
-        // vector synchronously: ELR=fault pc, SPSR=pstate(), DAIF masked,
-        // pc=VBAR+0x200. HVC is absorbed (M58 PSCI probe); BRK is absorbed
+        // SVC fills ESR_EL1 (EC=0x15, ISS=imm16) and takes the sync
+        // vector synchronously: ELR=SVC+4 in linux_mode (M78 — SVC is a
+        // completed-insn exception per the ARM ARM; upstream advances
+        // nothing) or ELR=fault pc bare-metal (M54 guest skips itself),
+        // SPSR=pstate(), DAIF masked, pc=VBAR+vec (origin-dependent).
         // (M60 WARN path). Anything else in 0xD4 (SMC/...): out of scope.
         // Encoding: SVC word=0xD4+imm16<<5+01
         // (low byte 0x01; HVC is 0x02, SMC 0x03, BRK is 0x00 — the old
@@ -7234,7 +7902,18 @@ impl Cpu {
                 let el0_origin = self.cur_el == 0;
                 let vec_off = if el0_origin { 0x400 } else { 0x200 };
                 self.esr_el1 = (0x15 << 26) | imm;
-                self.elr_el1 = pc;
+                // M78 SVC-ELR (init-proven 12B: busybox init's brk at
+                // 0x452f88 re-executed forever — ERET landed back ON the
+                // svc, 40 identical brk(0x24a9000) in 1M insns, zero EL0
+                // forward progress. ARM ARM: SVC/HVC/SMC are COMPLETED-
+                // insn exceptions — ELR holds the NEXT pc (svc+4), unlike
+                // aborts (ELR = faulting insn for retry). Upstream needs
+                // no +4 (entry-common.c el0_svc + syscall.c el0_svc_common
+                // advance nothing — verified against rpi-6.1.y source).
+                // linux_mode delivers svc+4; bare-metal keeps ELR=pc
+                // (the M54 guest glue does its own ELR+=4 skip — its
+                // golden pins it).
+                self.elr_el1 = if bus.linux_mode { pc.wrapping_add(4) } else { pc };
                 self.spsr_el1 = self.pstate();
                 self.daif = 0xf;
                 let vbar = if self.vbar_el1 == 0 { 0x100000 } else { self.vbar_el1 };
@@ -7355,6 +8034,16 @@ impl Cpu {
                     return Ok(());
                 }
                 if (crm == 10 || crm == 14 || crm == 5) && op2 == 1 {
+                    // M114 code-sync epoch: IC IVAU (crm==5) means the guest
+                    // patched code (DC + IC sequence: jump labels, static
+                    // keys) — cached TB words for that page are stale by
+                    // architectural definition (I-side stays stale until
+                    // IC IVAU on real HW too). Bump the epoch so TBs (and
+                    // the TLB) revalidate. DC CVAC/CIVAC are D-side only:
+                    // no bump (data writes never invalidate code).
+                    if crm == 5 {
+                        bus.tlb_gen = bus.tlb_gen.wrapping_add(1);
+                    }
                     return Ok(()); // DC CVAC/CIVAC, IC IVAU: NOP
                 }
             }
@@ -7835,86 +8524,10 @@ impl Cpu {
         // bits(29:25) == 10100 (bit30/31 vary: 64-bit pairs, 32-bit
         // pairs, LDPSW). Verified against assembler truth — never
         // hand-derive these fields again.
-        if ((w >> 25) & 0x1f) == 0x14 {
-            let is64 = bits(w, 31, 31) == 1;
-            // Load-vs-store is bit22 (REVERTED M57 bit30 experiment —
-            // full 14-word assembler survey: STP=0xA9000440/LDP=
-            // 0xA9400440 differ ONLY in bit22; bit30 is 0 for every
-            // plain pair form. The kernel word 0xA9841D07 is genuinely
-            // STP-pre-index (mode 0b11, offset +64): the OLD bit22 code
-            // executed it as STP all along — CORRECT. The memmove
-            // corruption came from elsewhere (still open); the bit30
-            // swap broke 7 goldens (gpio/smp/irq/sd/rpi-kernel/
-            // firmware/debug) by flipping every plain LDP into a
-            // store. Lesson stands: pairs need the full survey, and
-            // one-sided evidence (one kernel word) never flips a
-            // golden-pinned gate.
-            let is_load = bits(w, 22, 22) == 1;
-            // LDPSW (op2 == 11): signed-word pair, 64-bit results.
-            // (Machine-derived: regular pairs have op2 == 01.)
-            let is_ldpsw = bits(w, 30, 29) == 0b11;
-            if is_ldpsw && !is_load {
-                return Err(ill);
-            }
-            let mode = bits(w, 24, 23);
-            let sc = if is64 { 8u64 } else { 4u64 };
-            let off = sext(bits(w, 21, 15) as u64, 7).wrapping_mul(sc) as i64 as u64;
-            let rt2 = bits(w, 14, 10);
-            let base = self.rsp(rn);
-            // Writeback timing (fork-observed, see test/cpu-cases.mjs):
-            // pre-index applies AFTER a successful access (skipped on
-            // fault); post-index applies immediately (kept on fault).
-            let (addr, wb) = match mode {
-                0b10 | 0b00 => (base.wrapping_add(off), None),
-                0b11 => {
-                    let a = base.wrapping_add(off);
-                    (a, Some(a))
-                }
-                _ => {
-                    // Post-index (mode 01): writeback FIRST (pre-access),
-                    // fuzzer-pinned (mem_28_2 golden: fork keeps wb on
-                    // fault). The 25.8M x21-zeroing is then a GENUINE
-                    // faulting-pair side effect (or a different bug) —
-                    // NOT evidence for wb-after-access. Revert to the
-                    // golden-pinned ordering; re-examine 25.8M fresh.
-                    let a = base;
-                    self.wsp(rn, base.wrapping_add(off), true);
-                    (a, None)
-                }
-            };
-            if is_load {
-                if is_ldpsw {
-                    let v1 = bus.read(addr, 4).map_err(|_| Fault::UnmappedData(addr))?;
-                    let v2 = bus
-                        .read(addr.wrapping_add(4), 4)
-                        .map_err(|_| Fault::UnmappedData(addr))?;
-                    if let Some(b) = wb {
-                        self.wsp(rn, b, true);
-                    }
-                    self.w(rd, sext(v1, 32), true);
-                    self.w(rt2, sext(v2, 32), true);
-                } else {
-                    let v1 = bus.read(addr, sc).map_err(|_| Fault::UnmappedData(addr))?;
-                    let v2 = bus
-                        .read(addr.wrapping_add(sc), sc)
-                        .map_err(|_| Fault::UnmappedData(addr))?;
-                    if let Some(b) = wb {
-                        self.wsp(rn, b, true);
-                    }
-                    self.w(rd, v1, is64);
-                    self.w(rt2, v2, is64);
-                }
-            } else {
-                bus.write(addr, sc, if is64 { self.r(rd) } else { self.r(rd) & 0xffff_ffff })
-                    .map_err(|_| Fault::UnmappedData(addr))?;
-                let a2 = addr.wrapping_add(sc);
-                bus.write(a2, sc, if is64 { self.r(rt2) } else { self.r(rt2) & 0xffff_ffff })
-                    .map_err(|_| Fault::UnmappedData(a2))?;
-                if let Some(b) = wb {
-                    self.wsp(rn, b, true);
-                }
-            }
-            return Ok(());
+        // LDP/STP integer pairs: gate shared via g_ldp, body in
+        // b_ldp (M114 shared body, also used by TB classifier).
+        if Self::g_ldp(w) {
+            return self.b_ldp(bus, pc, w);
         }
         // SIMD STP/LDP S/D/Q: class bits(29:25) == 10110 (vs 10100
         // for integer pairs). Element size from bits(31:30): 00=S(4B),
@@ -8268,272 +8881,16 @@ impl Cpu {
         // (plain-form semantics, EL0 folded).
         // Assembler truth: STTR/LDTR/LDTRSW/LDTRSB/LDTRSH unscaled +
         // post/pre-index share b11_10==10; writeback admitted too.
-        if ((w >> 25) & 0x1f) == 0b11100
-            && bits(w, 26, 26) == 0
-            && (bits(w, 23, 22) == 0b00 || bits(w, 23, 22) == 0b01)
-            && bits(w, 24, 24) == 0
-            && bits(w, 21, 21) == 0
-            && ((bits(w, 11, 11) << 1) | bits(w, 10, 10)) == 0b10
-        {
-            let size = bits(w, 31, 30);
-            let nbytes = 1u64 << size;
-            let opc = bits(w, 23, 22);
-            let is_load = opc != 0b00;
-            let sext_to: u32 = match opc {
-                0b10 => 64,
-                0b11 => 32,
-                _ => 0,
-            };
-            // is_load/opc decoding mirrors the base arm: opc==0b11 +
-            // size>=2 unallocated; signed widths per opc.
-            if opc == 0b11 && size >= 2 {
-                return Err(ill);
-            }
-            let (addr, wb) = match (bits(w, 11, 11) << 1) | bits(w, 10, 10) {
-                0b10 => {
-                    let off = sext(bits(w, 20, 12) as u64, 9);
-                    (self.rsp(rn).wrapping_add(off), None)
-                }
-                0b01 => {
-                    let off = sext(bits(w, 20, 12) as u64, 9);
-                    let b = self.rsp(rn);
-                    (b, Some(b.wrapping_add(off)))
-                }
-                0b11 => {
-                    let off = sext(bits(w, 20, 12) as u64, 9);
-                    let a = self.rsp(rn).wrapping_add(off);
-                    (a, Some(a))
-                }
-                _ => return Err(ill),
-            };
-            if is_load {
-                let v = bus.read(addr, nbytes).map_err(|_| Fault::UnmappedData(addr))?;
-                let v = if sext_to != 0 { sext(v, (nbytes * 8) as u32) } else { v };
-                self.w(rd, v, sext_to == 64 || size == 3);
-            } else {
-                let v = if size == 3 { self.r(rd) } else { self.r(rd) & mask(nbytes) };
-                bus.write(addr, nbytes, v).map_err(|_| Fault::UnmappedData(addr))?;
-            }
-            if let Some(b) = wb {
-                self.wsp(rn, b, true);
-            }
-            return Ok(());
+        // STTR/LDTR lane: gate shared via g_sttrlane, body in
+        // b_sttr (M114 shared body, also used by TB classifier).
+        if Self::g_sttrlane(w) {
+            return self.b_sttr(bus, pc, w);
         }
 
-        if ((w >> 25) & 0x1f) == 0x1c
-            // M104 LSE-ATOMIC EXCLUSION (assembler truth atom6.s,
-            // kernel-proven 6.967B: EVERY LSE RMW word — plain twins
-            // (ldadd/ldset/swp/stadd, o1==1+o2==001) AND acquire twins
-            // (ldaddal/ldsetal/swpal, o1==1+o2==101/111) — shares the
-            // 0x1c 5-bit class (bits[29:25]==11100) with bit24==0, so
-            // the 0x1c test FIRES on all of them. The old guards only
-            // excluded the b21==1 reg-offset path and the STTR/LDTR
-            // lane, so every LSE word fell into the 0x1c body: opc==
-            // 0b10 (all RMW: LDADD/LDSET/SWP carry opc==10) decoded as
-            // "signed load", size==0b10/W decoded 4 bytes, and the body
-            // executed a PLAIN LOAD (is_load = opc != 00) — the ticket
-            // lock's ldsetal became a load that never ORs, init wedged
-            // at b9dc80 with lock stuck 0x101. Exclude the whole LSE
-            // class here (o1==1 + b11_10==00, atom6.s + reg.s + casb.s:
-            // disjoint from every plain form — plain reg-offset carries
-            // b11_10==10, plain U12 is b24==1, STTR/LDTR is o1==0; NO o2
-            // gate — LSE acquire forms span o2==001/011/101/111) and
-            // let the atomic lane below own it.
-            && !(((w >> 24) & 0x3f) == 0b111000
-                && bits(w, 21, 21) == 1
-                && ((bits(w, 11, 11) << 1) | bits(w, 10, 10)) == 0b00)
-            // M60 LSE-GUARD (assembler truth, atom.s): the register-offset
-            // path (bit24==0, bit21==1) collides with the LSE atomic lane
-            // (class 111000 = stadd/ldadd/swp shapes, all bit24==0/
-            // bit21==1). Real discriminator (ARM ARM): integer reg-offset
-            // fixes bits[11:10]==10 (B8616801/B8617801/F82A780C all 10);
-            // LSE carries 00 (every LSE word: stadd, swp, ldadd...).
-            // Non-10 words are NOT integer reg-offset — skip the whole
-            // arm so they reach the atomic lane (previously stadd
-            // executed as a wrong-address register-offset store and
-            // "passed" one.rs fault-only checks while corrupting
-            // memory). M93e STTR/LDTR CARVE-OUT (assembler truth,
-            // kernel-proven 6.945B, corrected 2026-09-28: the size<3
-            // gate is WRONG — X forms (`sttr xzr,[x0]`=0xF800081F) are
-            // size==0b11 (sttr.s truth table). The carve-out admits opc
-            // 00/01 + b11_10==10 with NO size gate; signed opc==0b10/
-            // 0b11 stay on existing paths. LDTRSW-X (size==3/opc==0b10)
-            // is unreachable here (plain-form b11_10==00/01/11 never
-            // matches 0b10) so the PRFM-absorb note below is about the
-            // shared body, not this gate.
-            // shares the LSE 6-bit class 111000 (bit24==0) but has
-            // bit21==0, so the b21==1 guard above does NOT exclude it —
-            // yet the 0x1c arm's own (bit11,bit10) switch decodes
-            // b11_10==10 as UNALLOCATED and faults it Illegal. Admit
-            // the lane here FIRST (plain-form addressing + access
-            // semantics, EL0 folded): b11_10==10 + opc 00/01 only, no
-            // size gate (signed opc==0b10/0b11 stay on existing paths).
-            && !(bits(w, 24, 24) == 0
-                && bits(w, 21, 21) == 1
-                && (((bits(w, 11, 11) << 1) | bits(w, 10, 10)) != 0b10))
-            // M60 EXCLUSIVE-GUARD (bh.s assembler truth: B/H exclusives
-            // share bits[29:25]==00100 with NO plain form — plain LDRB/H
-            // is class 11100 (ldrb 0x39400001), exclusives are class
-            // 00100 at every size (stlrb 0x089FFC01 ... stxr 0x88037E62).
-            // So inside this arm, o1==0 + op==111 marks EXCLUSIVE at all
-            // sizes (STXR/STLXR o2==000, LDXR/LDAXR o2==010/L==1/Rs==31,
-            // STLR/LDAR o2==100/110/Rs==31); plain U12 never has op==111
-            // with o1==0 here. Skip the arm for those (let the atomic
-            // lane below own every exclusive shape). Class gate added
-            // after the B9427E61 regression (plain `ldr w1,[x19,#636]`
-            // class 11100 carries o1==0/op==111 too — without the class
-            // test the guard stole ALL such loads into Err(ill)).
-            && !(((w >> 25) & 0x1f) == 0b00100
-                && bits(w, 21, 21) == 0
-                && bits(w, 14, 12) == 0b111)
-            // M92 STTR/LDTR LANE (assembler truth, corrected 2026-09-28:
-            // the size<3 gate is WRONG — X forms are size==0b11 (sttr.s
-            // truth table). Gate: opc==0b00/0b01 + bit24==0 + bit21==0
-            // + (bit11,bit10)==0b10, NO size gate. Signed opc==0b10/
-            // 0b11 (LDTRSW/SB/SH) keep their existing paths; plain
-            // unscaled (b11_10==00), post (01), pre (11) never match
-            // 0b10, so no plain-form word can enter. Selects the
-            // UNPRIVILEGED lane (STTR/LDTR — `sttr xzr,[x0]`=
-            // 0xF800081F; the kernel's memset uses it). The base arm
-            // below decodes (bit11,bit10)==0b10 as UNALLOCATED
-            // (`_ => return Err(ill)`), so admit the lane FIRST: same
-            // addressing (unscaled imm9) + same data semantics as the
-            // plain forms (EL0-checked, folded since pi-cpu is
-            // single-regime), with writeback forms admitted too (STTR
-            // post/pre-index exist in the encoding space).
-            // M93d LANE-ADMIT (superseded 2026-09-28: the standalone
-            // arm above owns the lane now; this || term is kept as a
-            // belt-and-braces twin with identical terms. The old "Rust
-            // &&/|| precedence" theory was WRONG — opclass decode
-            // proved the size gate was the killer, not precedence.)
-            // M93e ATOMICS-LANE EXCLUSION (assembler truth, corrected
-            // 2026-09-28: no size gate — X forms are size==0b11.
-            // Exclude V==0 + b24==0 + b21==0 + b11_10==0b10 + opc
-            // 00/01: admits nothing a real LSE word carries (all LSE
-            // words have o1==1 i.e. b21==1 per excl.s; CAS is class
-            // 001000, not 111000). Narrow + disjoint by construction.)
-            || (((w >> 25) & 0x1f) == 0b11100
-                && bits(w, 26, 26) == 0
-                && (bits(w, 23, 22) == 0b00 || bits(w, 23, 22) == 0b01)
-                && bits(w, 24, 24) == 0
-                && bits(w, 21, 21) == 0
-                && ((bits(w, 11, 11) << 1) | bits(w, 10, 10)) == 0b10)
-        {
-            let size = bits(w, 31, 30);
-            if bits(w, 26, 26) == 1 {
-                return Err(ill); // SIMD (non-Q handled above)
-            }
-            let nbytes = 1u64 << size;
-            let opc = bits(w, 23, 22);
-            // PRFM (M57 register + M60 register-offset forms): every PRFM
-            // is a prefetch hint — absorb as NOP, whatever the addressing
-            // mode. Register form `prfm pstl1keep,[x17]`=0xF9800071
-            // (size=3/opc=0b10/bit24==1/imm12==0); register-OFFSET form
-            // `prfm pstl1keep,[x26,x0]`=0xF8A06B50 (bit24==0/bit21==1/
-            // b11_10==10, the integer-reg-offset shape — stepat-proven at
-            // the 25.6M point: opc==0b10/size==3 faulted as PRFM-imm
-            // before reaching any offset decode). Gate on size==3/opc==
-            // 0b10 ONLY (both forms); real LDRSW-X (signed 64-bit load)
-            // shares opc==0b10/size==3 but is UNREACHABLE here — LDRSW-X
-            // literal lives in the 0b01100 arm above and LDRSW-X reg-off
-            // ... is distinguished by L==1 (loads) vs PRFM's L==0? NO —
-            // prfm has no L bit. Truth: PRFM-register/offset are the ONLY
-            // size==3/opc==0b10 words with bit24==0-or-(bit24==1&imm12==
-            // 0); LDRSW-X forms carry a real offset. The kernel emits no
-            // LDRSW-X-reg forms on this path (882 fuzzer + 23 smoke pin
-            // the scalar forms), so absorb all size==3/opc==0b10 here.
-            if size == 3 && opc == 0b10 {
-                return Ok(()); // PRFM (all forms) / LDRSW-X-imm (absorbed)
-            }
-            // opc: 00 store, 01 zero-extending load, 10 signed load to
-            // 64 bits (LDRSB/H/SW-X), 11 signed load to 32 bits (size<2;
-            // unallocated for size>=2). PRFM-imm (size 3, opc 2) is
-            // absorbed above (all PRFM forms are NOPs).
-            // (M92 STTR/LDTR: admitted by the lane gate on the arm
-            // condition above; they execute through this shared body
-            // with plain-form semantics — no separate code needed.)
-            let is_load = opc != 0b00;
-            if opc == 0b11 && size >= 2 {
-                return Err(ill); // unallocated
-            }
-            // signed result width in bits (0 = zero-extend/Normal store).
-            let sext_to: u32 = match opc {
-                0b10 => 64,
-                0b11 => 32,
-                _ => 0,
-            };
-            let (addr, wb) = if bits(w, 24, 24) == 1 {
-                let off = (bits(w, 21, 10) as u64) * nbytes;
-                (self.rsp(rn).wrapping_add(off), None)
-            } else {
-                // bit24 == 0: bit21 selects register-offset (1) vs imm9
-                // modes (0); the latter decode via (bit11,bit10): 00 =
-                // unscaled, 01 = post-index, 11 = pre-index (10 is
-                // unallocated). Verified word-by-word against the
-                // assembler — never hand-derive these fields again.
-                if bits(w, 21, 21) == 1 {
-                    // register offset (M57 LSL-FIX, kernel-proven): the
-                    // amount is bit12 S selecting the NATURAL shift —
-                    // LSL #esz-log2 for option==0b011 (plain LSL form).
-                    // Assembler truth: `ldr x1,[x0,x1]`=0xF8616801
-                    // (S=0, LSL #0) vs `ldr x1,[x0,x1,lsl#3]`=
-                    // 0xF8617801 (S=1, LSL #3). The old code passed S
-                    // itself as amount, so `str x12,[x0,x10,lsl#3]`
-                    // shifted by 1 (pairwise aliasing, walked idx
-                    // zero). Guests never use scaled register offsets
-                    // (fuzzer green either way), so no golden moves.
-                    // NOTE size==access-size: the kernel's W-form
-                    // `ldr w1,[x0,x1]` (size=0b10, S=1) shifts by 2
-                    // (esz=4), NOT 3 — amount=size is log2(esz) by
-                    // construction (size 0/1/2/3 -> 1/2/4/8 bytes).
-                    let rm = bits(w, 20, 16);
-                    let option = bits(w, 15, 13);
-                    let s = bits(w, 12, 12);
-                    let amount = if s == 1 { size } else { 0 };
-                    let off = extend_reg(self.r(rm), option, amount);
-                    (self.rsp(rn).wrapping_add(off), None)
-                } else {
-                    // (M92 STTR/LDTR: the lane gate on the arm condition
-                    // admits b11_10==0b10 here with unscaled-imm9
-                    // addressing — the unprivileged alias of 0b00.
-                    // Writeback variants (post/pre-index) share the same
-                    // alias encoding and execute identically.)
-                    match (bits(w, 11, 11) << 1) | bits(w, 10, 10) {
-                        0b00 | 0b10 => {
-                            let off = sext(bits(w, 20, 12) as u64, 9);
-                            (self.rsp(rn).wrapping_add(off), None)
-                        }
-                        0b01 => {
-                            let off = sext(bits(w, 20, 12) as u64, 9);
-                            let b = self.rsp(rn);
-                            (b, Some(b.wrapping_add(off)))
-                        }
-                        0b11 => {
-                            // Pre-index: writeback applies AFTER a
-                            // successful access (the fork observably skips
-                            // it on fault; post-index keeps it).
-                            let off = sext(bits(w, 20, 12) as u64, 9);
-                            let a = self.rsp(rn).wrapping_add(off);
-                            (a, Some(a))
-                        }
-                        _ => return Err(ill),
-                    }
-                }
-            };
-            if is_load {
-                let v = bus.read(addr, nbytes).map_err(|_| Fault::UnmappedData(addr))?;
-                let v = if sext_to != 0 { sext(v, (nbytes * 8) as u32) } else { v };
-                // Signed-to-32 results zero-extend into the 64-bit reg;
-                // anything else follows the access size (w() masks).
-                self.w(rd, v, sext_to == 64 || size == 3);
-            } else {
-                let v = if size == 3 { self.r(rd) } else { self.r(rd) & mask(nbytes) };
-                bus.write(addr, nbytes, v).map_err(|_| Fault::UnmappedData(addr))?;
-            }
-            if let Some(b) = wb {
-                self.wsp(rn, b, true);
-            }
-            return Ok(());
+        // LDST-int 0x1c: gate shared via g_ldst, body lives in
+        // b_ldst (M114 shared body, also used by the TB classifier).
+        if Self::g_ldst(w) {
+            return self.b_ldst(bus, pc, w);
         }
 
         // Atomics (M57 Linux-track, single-core model): everything the
@@ -9089,228 +9446,18 @@ impl Cpu {
             return Err(ill);
         }
 
-        // Data-processing (immediate): op0 = bits(28:25). Branches and
-        // loads/stores returned above. Verified against assembler output:
-        // 1000 = PC-rel (op1 0000) / ADD-SUB-imm (op1 1000);
-        // 1001 = move-wide (op1t 01) / logical-imm (op1t 00) /
-        //        bitfield (op1t 10), where op1t = bits(24:23) — the low
-        //        two op1 bits are N/hw shared with the operand.
-        if ((w >> 25) & 0xf) == 0x8 || ((w >> 25) & 0xf) == 0x9 {
-            let op0 = bits(w, 28, 25);
-            let op1t = bits(w, 24, 23);
-            // PC-relative (bit24 == 0) vs ADD/SUB-immediate (bit24 == 1).
-            // (sh/imm12 live below bit24, so this split is stable.)
-            if op0 == 0b1000 && bits(w, 24, 24) == 0 {
-                let op = bits(w, 31, 31);
-                // M57 ADRP FIX (spec-correct, kernel-proven): the offset
-                // is a SIGNED 21-bit imm (immhi:immlo) scaled by 4K —
-                // sign-extend BEFORE the <<12, in i64 space. The old
-                // code sext()ed to u64 then wrapping_shl(12), which
-                // re-interprets bit63 of the extended value as a NEW
-                // sign (0xF...F44F -> 0x2780...000): every negative
-                // ADRP landed ~0x2780_0000_0000_0000 too high. The
-                // 4M-guest goldens never caught it (their adrp offsets
-                // are all positive). ADR (unscaled) was always correct.
-                let raw = (((bits(w, 23, 5) << 2) | bits(w, 30, 29)) as u64) as i64;
-                let simm = ((raw << 43) >> 43) as i64; // sign-extend 21
-                if op == 1 {
-                    let base = (pc & !0xfff) as i64;
-                    self.w(rd, base.wrapping_add(simm << 12) as u64, true);
-                } else {
-                    let imm = simm as u64;
-                    self.w(rd, pc.wrapping_add(imm), true);
-                }
-                return Ok(());
-            }
-            // ADD/SUB immediate
-            if op0 == 0b1000 && bits(w, 24, 24) == 1 {
-                let op = bits(w, 30, 30);
-                let s = bits(w, 29, 29) == 1;
-                let imm = (bits(w, 21, 10) as u64) << if bits(w, 22, 22) == 1 { 12 } else { 0 };
-                // Rn==31 is SP except with S set (CMP/CMN aliases read
-                // XZR — verified against the fork: `cmp sp, x0` clears C).
-                let a = if s && rn == 31 { self.r(rn) } else { self.rsp(rn) };
-                let (r, n, z, c, v) = if op == 0 {
-                    Cpu::add_with_carry(sf, a, imm, 0)
-                } else {
-                    Cpu::add_with_carry(sf, a, !imm, 1)
-                };
-                if s {
-                    self.n = n;
-                    self.z = z;
-                    self.c = c;
-                    self.v = v;
-                }
-                // CMP/CMN (S set, Rd==31) discard; otherwise Rd==31 is SP.
-                if !(s && rd == 31) {
-                    self.wsp(rd, r, sf);
-                }
-                return Ok(());
-            }
-            // Logical immediate
-            if op0 == 0b1001 && op1t == 0b00 {
-                let opc = bits(w, 30, 29);
-                let n = bits(w, 22, 22);
-                let (wmask, _, _, _, all_ones) =
-                    decode_masks(n, bits(w, 15, 10), bits(w, 21, 16), sf).ok_or(ill)?;
-                if all_ones {
-                    return Err(ill);
-                }
-                let a = self.r(rn);
-                let (r, setf) = match opc {
-                    0b00 => (a & wmask, false),
-                    0b01 => (a | wmask, false),
-                    0b10 => (a ^ wmask, false),
-                    _ => (a & wmask, true),
-                };
-                if setf {
-                    let r = if sf { r } else { r & 0xffff_ffff };
-                    self.n = if sf { r >> 63 != 0 } else { r >> 31 != 0 };
-                    self.z = r == 0;
-                    self.c = false;
-                    self.v = false;
-                }
-                self.w(rd, r, sf);
-                return Ok(());
-            }
-            // Move wide
-            if op0 == 0b1001 && op1t == 0b01 {
-                let opc = bits(w, 30, 29);
-                let pos = bits(w, 22, 21) * 16;
-                let v = (bits(w, 20, 5) as u64) << pos;
-                let m = if sf { u64::MAX } else { 0xffff_ffff };
-                let r = match opc {
-                    0b00 => (!v) & m,
-                    // M57 MOVK-ZERO FIX (kernel-proven): `movk x11,#0`
-                    // =0xF280000B has opc=0b11 with imm16=0,pos=0 — the
-                    // old KEEP arm `(Rd & !mask)|v` is CORRECT here, but
-                    // an earlier variant special-cased it wrong. Keep
-                    // the canonical form; the kernel's
-                    // movk x11,#0x800,lsl#16 (0xF2A1000B) + movk x11,#0
-                    // (0xF280000B) sequence must yield 0x8000000.
-                    0b10 => v,
-                    0b11 => (self.r(rd) & !(0xffffu64 << pos)) | v,
-                    _ => return Err(ill),
-                };
-                self.w(rd, r, sf);
-                return Ok(());
-            }
-            // EXTR (extract register, incl. the ROR-imm alias the
-            // assembler emits as extr Rd,Rn,Rn,#sh): gate from 4-word
-            // assembler truth, disjoint from the bitfield class below
-            // (100110 vs 100111 in bits28:23).
-            if ((w >> 23) & 0xff) == 0x27 {
-                let rm = bits(w, 20, 16);
-                let lsb = bits(w, 15, 10);
-                let width = if sf { 64 } else { 32 };
-                let m = if sf { u64::MAX } else { 0xffff_ffff };
-                let a = self.r(rn) & m;
-                let b = self.r(rm) & m;
-                // NOTE: Rn/Rm order matters (fixed 2026-09-12): the
-                // result is (Rn << (width-lsb)) | (Rm >> lsb) — an
-                // earlier version had a/b swapped, which passed the
-                // lsb==0 and Rn==Rm (ROR-alias) cases but silently
-                // corrupted everything else (proven by multf3's
-                // mantissa alignment: 10x10 -> 64.0 instead of 100.0).
-                let r = if lsb == 0 {
-                    a
-                } else {
-                    ((a << (width - lsb)) | (b >> lsb)) & m
-                };
-                self.w(rd, r, sf);
-                return Ok(());
-            }
-            // Bitfield
-            if op0 == 0b1001 && op1t == 0b10 {
-                let opc = bits(w, 30, 29);
-                let nbits = if sf { 64 } else { 32 };
-                let r = bits(w, 21, 16) % nbits;
-                let s = bits(w, 15, 10) % nbits;
-                let src = self.r(rn);
-                let result = match opc {
-                    0b10 => {
-                        // UBFM: degenerate S==n-1 are MOV/LSR aliases
-                        if s == nbits - 1 {
-                            if r == 0 {
-                                src
-                            } else {
-                                (src & if sf { u64::MAX } else { 0xffff_ffff }) >> r
-                            }
-                        } else {
-                            // General: oracle-verified selector shared
-                            // with BFM/SBFM — S < R inserts at position
-                            // (wmask), else extracts low (tmask);
-                            // UBFM zero-extends (no dst merge).
-                            let (wmask, tmask, ds, dr, _) = decode_masks(
-                                bits(w, 22, 22),
-                                bits(w, 15, 10),
-                                bits(w, 21, 16),
-                                sf,
-                            )
-                            .ok_or(ill)?;
-                            let tmp = ror(src, dr as u32, nbits);
-                            if ds < dr {
-                                tmp & wmask
-                            } else {
-                                tmp & tmask
-                            }
-                        }
-                    }
-                    0b00 => {
-                        // SBFM: degenerate are MOV/ASR aliases
-                        if s == nbits - 1 {
-                            if r == 0 {
-                                src
-                            } else if sf {
-                                ((src as i64) >> r) as u64
-                            } else {
-                                ((((src as u32) as i32) >> r) as u32) as u64
-                            }
-                        } else {
-                            // General: same selector, then sign-extend
-                            // from bit d (d = (S-R) mod nbits). Covers
-                            // sbfiz/sbfx and the ROR-imm SBFM shapes.
-                            let (wmask, tmask, ds, dr, _) = decode_masks(
-                                bits(w, 22, 22),
-                                bits(w, 15, 10),
-                                bits(w, 21, 16),
-                                sf,
-                            )
-                            .ok_or(ill)?;
-                            let tmp = ror(src, dr as u32, nbits);
-                            let f = if ds < dr { tmp & wmask } else { tmp & tmask };
-                            let d = ds.wrapping_sub(dr) & (nbits as u64 - 1);
-                            sext(f, (d + 1) as u32)
-                        }
-                    }
-                    0b01 => {
-                        // BFM: oracle-verified (30+ points, valid dst):
-                        // S < R inserts at position (wmask form), else
-                        // extracts low (tmask form). Covers canonical
-                        // BFI/BFXIL plus arbitrary (R,S).
-                        let dst = self.r(rd);
-                        let (wmask, tmask, ds, dr, _) =
-                            decode_masks(bits(w, 22, 22), bits(w, 15, 10), bits(w, 21, 16), sf)
-                                .ok_or(ill)?;
-                        let tmp = ror(src, dr as u32, nbits);
-                        if ds < dr {
-                            (dst & !wmask) | (tmp & wmask)
-                        } else {
-                            (dst & !tmask) | (tmp & tmask)
-                        }
-                    }
-                    _ => return Err(ill),
-                };
-                self.w(rd, result, sf);
-                return Ok(());
-            }
-            return Err(ill);
+        // Data-processing (immediate): op0 = bits(28:25). Body lives in
+        // b_dataimm (M114 shared body, also used by the TB classifier);
+        // gate shared via g_dataimm (disjointness: see its comment).
+        if Self::g_dataimm(w) {
+            return self.b_dataimm(bus, pc, w);
         }
 
         // AdvSIMD extras (the few vector forms guests use; everything
         // else vector faults like the stock core, so parity holds):
-        // DUP-element (.4h from W), MOVI (2d #0, 16b #0x20), EOR
-        // (.8b/.16b full-128), lane-extract to FP scalar (H/S). Rows
+        // DUP general (all arrangements) + DUP element (all lanes),
+        // MOVI (2d #0, 16b #0x20), EOR (.8b/.16b full-128), lane-extract
+        // to FP scalar (H/S). Rows
         // machine-derived (mask,value); Q file holds vectors (top
         // halves zeroed on write — unobservable while other vector
         // ops fault).
@@ -9318,23 +9465,476 @@ impl Cpu {
             let rd = bits(w, 4, 0);
             let rn = bits(w, 9, 5);
             let rm = bits(w, 20, 16);
-            // DUP .4h (exact row; other dup forms fault).
-            if (w & 0xffff_fc00) == 0x0e02_0c00 {
-                let v = (self.r(rn) & 0xffff) as u128;
+            // DUP general (M78: all arrangements from Wn/Xn) + DUP element
+            // (all lanes from Vn). Replicate esz bits across Q?128:64
+            // (Q=0 writes the low 64 only — top zeroed per the file
+            // convention). Masks/values machine-derived (dup.s):
+            // general (w&0xBFE0FC00)==0x0E000C00, element
+            // (w&0xBF00FC00)==0x0E000400 — verified disjoint from each
+            // other and every other extras row (dupcheck). esz = 8<<ctz
+            // of the size field (general imm5[20:16], element combined
+            // [23:16] where index = C>>(k+1)); general source is Wn for
+            // esz<64 else Xn (Rn=31/XZR reads 0 — M51-verified). Subsumes
+            // the old exact DUP-4h/DUP-2d rows (identical semantics —
+            // fuzzer goldens byte-identical after regen). Non-single-bit
+            // sizes, 2d-with-Q=0 (no 1d form), and out-of-range element
+            // indices fault honestly.
+            if (w & 0xBFE0_FC00) == 0x0E00_0C00 {
+                let imm5 = bits(w, 20, 16);
+                if imm5.count_ones() != 1 || imm5 > 8 {
+                    return Err(ill);
+                }
+                let k = imm5.trailing_zeros();
+                let esz = 8u32 << k; // 8/16/32/64
+                if esz == 64 && bits(w, 30, 30) == 0 {
+                    return Err(ill);
+                }
+                let src = self.r(rn) & (u64::MAX >> (64 - esz));
+                let lanes = (if bits(w, 30, 30) == 1 { 128 } else { 64 }) / esz;
                 let mut q: u128 = 0;
-                for i in 0..4 {
-                    q |= v << (16 * i);
+                for i in 0..lanes {
+                    q |= (src as u128) << (i * esz);
                 }
                 self.q[rd as usize] = q;
                 return Ok(());
             }
-            // MOVI 2d #0 / 16b #0x20 (exact rows; other immediates fault).
-            if (w & 0xffff_ffe0) == 0x6f00_e400 {
-                self.q[rd as usize] = 0;
+            if (w & 0xBF00_FC00) == 0x0E00_0400 {
+                let c = bits(w, 23, 16);
+                let k = c.trailing_zeros();
+                if k > 3 {
+                    return Err(ill);
+                }
+                let esz = 8u32 << k;
+                if esz == 64 && bits(w, 30, 30) == 0 {
+                    return Err(ill);
+                }
+                let idx = c >> (k + 1);
+                if idx >= (16 >> k) {
+                    return Err(ill);
+                }
+                let v = if esz == 64 {
+                    (self.q[rn as usize] >> (idx * esz)) as u64
+                } else {
+                    ((self.q[rn as usize] >> (idx * esz)) & ((1u128 << esz) - 1)) as u64
+                };
+                let lanes = (if bits(w, 30, 30) == 1 { 128 } else { 64 }) / esz;
+                let mut q: u128 = 0;
+                for i in 0..lanes {
+                    q |= (v as u128) << (i * esz);
+                }
+                self.q[rd as usize] = q;
                 return Ok(());
             }
-            if (w & 0xffff_ffe0) == 0x4f01_e400 {
-                self.q[rd as usize] = 0x2020_2020_2020_2020_2020_2020_2020_2020;
+            // LD1/ST1 single + 2/3/4-register (M78: busybox memcpy —
+            // `ld1 {v1.16b},[x2],#16` El0Trap-looped at 0x400d9c until
+            // this row landed). Family (w&0xBF200000)==0x0C000000
+            // ([31]=0, [29:24]=001100, bit21=0 — disjointness proven in
+            // ldst1check against every extras row both ways, and the
+            // faulting word already proved no earlier arm matches by
+            // reaching the M100 trap). L=bit22, R(bit23)=post-index
+            // flag, per-reg bytes = Q?16:8 (element size is irrelevant
+            // for contiguous transfers), count from [15:12] (7/10/6/2 =
+            // 1/2/3/4 regs — LD2/3/4-interleave + LD1R shapes fall out
+            // as ill). Post-index: Rm==31 advances by the transfer size
+            // (the assembler pins imm==size), else Xn advances by x[Rm]
+            // (64-bit, no extend). Rn=31 uses the stack bank (rsp/wsp —
+            // EL0 spills reach SP_EL0). Faults map UnmappedData (real
+            // demand-paging retry — ELR=pc for aborts, no loop hazard).
+            if (w & 0xBF20_0000) == 0x0C00_0000 {
+                let l = bits(w, 22, 22);
+                let r = bits(w, 23, 23);
+                let count = match bits(w, 15, 12) {
+                    7 => 1,
+                    10 => 2,
+                    6 => 3,
+                    2 => 4,
+                    _ => return Err(ill),
+                };
+                let per: u64 = if bits(w, 30, 30) == 1 { 16 } else { 8 };
+                let total = count as u64 * per;
+                let base = self.rsp(rn);
+                let mut addr = base;
+                for i in 0..count {
+                    let rt = (rd + i) & 31;
+                    if l == 1 {
+                        let v = if per == 16 {
+                            let lo = bus.read(addr, 8).map_err(|_| Fault::UnmappedData(addr))?;
+                            let hi = bus.read(addr.wrapping_add(8), 8).map_err(|_| Fault::UnmappedData(addr))?;
+                            ((hi as u128) << 64) | lo as u128
+                        } else {
+                            bus.read(addr, 8).map_err(|_| Fault::UnmappedData(addr))? as u128
+                        };
+                        self.q[rt as usize] = v;
+                    } else {
+                        let v = self.q[rt as usize];
+                        bus.write(addr, 8, v as u64).map_err(|_| Fault::UnmappedData(addr))?;
+                        if per == 16 {
+                            bus.write(addr.wrapping_add(8), 8, (v >> 64) as u64).map_err(|_| Fault::UnmappedData(addr))?;
+                        }
+                    }
+                    addr = addr.wrapping_add(per);
+                }
+                if r == 1 {
+                    let inc = if rm == 31 { total } else { self.r(rm) };
+                    self.wsp(rn, base.wrapping_add(inc), true);
+                }
+                return Ok(());
+            }
+            // CMEQ/CMGE/CMGT/CMLT/CMLE-against-zero + CMTST (M78:
+            // busybox string loops — `cmeq v2.16b,v1.16b,#0` El0Trap-
+            // looped at 0x400da0 until this row landed). Zero-compare
+            // family (w&0x9F3F0C00)==0x0E200800 ([31]=0, [28:24]=01110,
+            // [21:16]=100000, [11:10]=10); op from S(bit29)+opc[15:12]:
+            // EQ={9,0} LE={9,1} GT={8,0} GE={8,1} LT={10,0} ({10,1}
+            // unallocated). CMTST (w&0xBF00FC00)==0x0E008C00 (bit29=0 —
+            // 3-reg CMEQ/CMGE/CMHI carry S=1 or other [15:10] opcodes,
+            // verified disjoint in cmpcheck). esz from size[23:22];
+            // lanes over Q?128:64; a true lane is all-ones. Q=0 writes
+            // the low 64 only (top zeroed).
+            if (w & 0x9F3F_0C00) == 0x0E20_0800 {
+                let opc = bits(w, 15, 12);
+                let s = bits(w, 29, 29);
+                let kind = match (opc, s) {
+                    (9, 0) => 0, // EQ
+                    (9, 1) => 1, // LE
+                    (8, 0) => 2, // GT
+                    (8, 1) => 3, // GE
+                    (10, 0) => 4, // LT
+                    _ => return Err(ill),
+                };
+                let esz = 8u32 << bits(w, 23, 22);
+                let lanes = (if bits(w, 30, 30) == 1 { 128 } else { 64 }) / esz;
+                let lmask = if esz == 64 { u128::MAX } else { (1u128 << esz) - 1 };
+                let mut q: u128 = 0;
+                for i in 0..lanes {
+                    let lane = (self.q[rn as usize] >> (i * esz)) & lmask;
+                    let sign = esz < 64 && ((lane >> (esz - 1)) & 1) == 1
+                        || esz == 64 && ((lane >> 63) & 1) == 1;
+                    let t = match kind {
+                        0 => lane == 0,
+                        1 => sign || lane == 0,
+                        2 => !sign && lane != 0,
+                        3 => !sign,
+                        _ => sign,
+                    };
+                    if t {
+                        q |= lmask << (i * esz);
+                    }
+                }
+                self.q[rd as usize] = q;
+                return Ok(());
+            }
+            if (w & 0xBF00_FC00) == 0x0E00_8C00 {
+                let esz = 8u32 << bits(w, 23, 22);
+                let lanes = (if bits(w, 30, 30) == 1 { 128 } else { 64 }) / esz;
+                let lmask = if esz == 64 { u128::MAX } else { (1u128 << esz) - 1 };
+                let mut q: u128 = 0;
+                for i in 0..lanes {
+                    let a = (self.q[rn as usize] >> (i * esz)) & lmask;
+                    let b = (self.q[rm as usize] >> (i * esz)) & lmask;
+                    if (a & b) != 0 {
+                        q |= lmask << (i * esz);
+                    }
+                }
+                self.q[rd as usize] = q;
+                return Ok(());
+            }
+            // 3-reg compares CMEQ/CMGE/CMGT/CMHI/CMHS (M78: memcmp —
+            // `cmeq v3.16b,v1.16b,v0.16b` El0Trap-looped at 0x400da4
+            // until this row landed) + AND/BIC vector logicals. Masks
+            // machine-derived (cmp3.s + bic8.s); disjointness proven in
+            // cmp3check vs every extras row both ways (AND/BIC also vs
+            // the EOR/ORR/BIT/BIF/BSL logicals). S(bit29)+opc[15:10]:
+            // EQ={1,100011} GE={0,001111} GT={0,001101} HI={1,001101}
+            // HS={1,001111} (no 3-reg LT/LE exist — the assembler
+            // demands an immediate). AND = {S0,opc000111,size00},
+            // BIC = {S0,opc000111,size01} (BIC's [23:22] is
+            // opcode-fixed — bic8/bic16 agree). esz from size[23:22]
+            // (compares); AND/BIC are full-width (Q=0 → low 64). True
+            // lane = all-ones; Q=0 top zeroed.
+            {
+                let op3 = w & 0xBF20_FC00;
+                let kind = if op3 == 0x2E20_8C00 {
+                    0 // EQ
+                } else if op3 == 0x0E20_3C00 {
+                    1 // GE (signed >=)
+                } else if op3 == 0x0E20_3400 {
+                    2 // GT (signed >)
+                } else if op3 == 0x2E20_3400 {
+                    3 // HI (unsigned >)
+                } else if op3 == 0x2E20_3C00 {
+                    4 // HS (unsigned >=)
+                } else {
+                    9
+                };
+                if kind != 9 {
+                    let esz = 8u32 << bits(w, 23, 22);
+                    let lanes = (if bits(w, 30, 30) == 1 { 128 } else { 64 }) / esz;
+                    let lmask = if esz == 64 { u128::MAX } else { (1u128 << esz) - 1 };
+                    let mut q: u128 = 0;
+                    for i in 0..lanes {
+                        let a = (self.q[rn as usize] >> (i * esz)) & lmask;
+                        let b = (self.q[rm as usize] >> (i * esz)) & lmask;
+                        let t = match kind {
+                            0 => a == b,
+                            1 => (((a << (64 - esz)) as i64) >> (64 - esz))
+                                >= (((b << (64 - esz)) as i64) >> (64 - esz)),
+                            2 => (((a << (64 - esz)) as i64) >> (64 - esz))
+                                > (((b << (64 - esz)) as i64) >> (64 - esz)),
+                            3 => a > b,
+                            _ => a >= b,
+                        };
+                        if t {
+                            q |= lmask << (i * esz);
+                        }
+                    }
+                    self.q[rd as usize] = q;
+                    return Ok(());
+                }
+            }
+            if (w & 0xBFE0_FC00) == 0x0E20_1C00 {
+                let r = self.q[rn as usize] & self.q[rm as usize];
+                self.q[rd as usize] = if bits(w, 30, 30) == 0 {
+                    r & 0xffff_ffff_ffff_ffff
+                } else {
+                    r
+                };
+                return Ok(());
+            }
+            if (w & 0xBFE0_FC00) == 0x0E60_1C00 {
+                let r = self.q[rn as usize] & !self.q[rm as usize];
+                self.q[rd as usize] = if bits(w, 30, 30) == 0 {
+                    r & 0xffff_ffff_ffff_ffff
+                } else {
+                    r
+                };
+                return Ok(());
+            }
+            // ADDP pairwise (M78: string-compare reduction — `addp
+            // v5.16b,v2.16b,v2.16b` looped at 0x400db8). Mask
+            // (w&0xBF20FC00)==0x0E20BC00 ([31]=0, S(bit29)=0 — the S=1
+            // shape is FADDP-float, excluded; [28:24]=01110, [21]=1,
+            // opc[15:10]=101111); disjointness vs the compare/logical
+            // rows proven in cmp3check-extended (same mask as CMEQ3 etc.,
+            // distinct [15:10]). esz from size[23:22]; dest low half =
+            // Vn-pair sums, high half = Vm-pair sums (mod 2^esz);
+            // Q=0 writes the low 64 only (top zeroed).
+            if (w & 0xBF20_FC00) == 0x0E20_BC00 {
+                let esz = 8u32 << bits(w, 23, 22);
+                let lanes = (if bits(w, 30, 30) == 1 { 128 } else { 64 }) / esz;
+                let half = lanes / 2;
+                let lmask = if esz == 64 { u128::MAX } else { (1u128 << esz) - 1 };
+                let mut q: u128 = 0;
+                for i in 0..half {
+                    let a = (self.q[rn as usize] >> ((2 * i) * esz)) & lmask;
+                    let b = (self.q[rn as usize] >> ((2 * i + 1) * esz)) & lmask;
+                    q |= ((a + b) & lmask) << (i * esz);
+                }
+                for j in 0..half {
+                    let a = (self.q[rm as usize] >> ((2 * j) * esz)) & lmask;
+                    let b = (self.q[rm as usize] >> ((2 * j + 1) * esz)) & lmask;
+                    q |= ((a + b) & lmask) << ((half + j) * esz);
+                }
+                self.q[rd as usize] = q;
+                return Ok(());
+            }
+            // UMAXP/SMAXP/UMINP/SMINP pairwise (M78: memcmp reduction —
+            // `umaxp v6.16b,v2.16b,v2.16b` looped at 0x40076c). S(bit29)+
+            // opc[15:10]: UMAX={1,101001} SMAX={0,101001} UMIN={1,101011}
+            // SMIN={0,101011} (mask 0xBF20FC00; disjointness proven in
+            // maxpcheck vs every extras row both ways). Same pairwise
+            // layout as ADDP (low half from Vn pairs, high half from Vm
+            // pairs) with max/min instead of add; U compares unsigned,
+            // S sign-extended. Q=0 top zeroed.
+            {
+                let opm = w & 0xBF20_FC00;
+                let kind = if opm == 0x2E20_A400 {
+                    0 // UMAX
+                } else if opm == 0x0E20_A400 {
+                    1 // SMAX
+                } else if opm == 0x2E20_AC00 {
+                    2 // UMIN
+                } else if opm == 0x0E20_AC00 {
+                    3 // SMIN
+                } else {
+                    9
+                };
+                if kind != 9 {
+                    let esz = 8u32 << bits(w, 23, 22);
+                    let lanes = (if bits(w, 30, 30) == 1 { 128 } else { 64 }) / esz;
+                    let half = lanes / 2;
+                    let lmask = if esz == 64 { u128::MAX } else { (1u128 << esz) - 1 };
+                    let qn = self.q[rn as usize];
+                    let qm = self.q[rm as usize];
+                    let lane = |qq: u128, idx: u32| (qq >> (idx * esz)) & lmask;
+                    let pick = |a: u128, b: u128| -> u128 {
+                        if kind == 0 {
+                            if a >= b { a } else { b }
+                        } else if kind == 2 {
+                            if a <= b { a } else { b }
+                        } else {
+                            let sa = (((a << (64 - esz)) as i64) >> (64 - esz));
+                            let sb = (((b << (64 - esz)) as i64) >> (64 - esz));
+                            if kind == 1 {
+                                if sa >= sb { a } else { b }
+                            } else if sa <= sb {
+                                a
+                            } else {
+                                b
+                            }
+                        }
+                    };
+                    let mut q: u128 = 0;
+                    for i in 0..half {
+                        q |= pick(lane(qn, 2 * i), lane(qn, 2 * i + 1)) << (i * esz);
+                    }
+                    for j in 0..half {
+                        q |= pick(lane(qm, 2 * j), lane(qm, 2 * j + 1)) << ((half + j) * esz);
+                    }
+                    self.q[rd as usize] = q;
+                    return Ok(());
+                }
+            }
+            // UMOV/SMOV lane-extract to general (M78: `mov x3,v3.d[0]`
+            // looped at 0x400adc). UMOV (w&0xBF00FC00)==0x0E003C00
+            // ([15:11]=00111), SMOV ==0x0E002C00 ([15:11]=00101);
+            // disjointness proven in umovcheck vs every extras row both
+            // ways (same mask as DUP-E/CMTST, distinct [15:10]). C =
+            // [23:16] with esz=8<<ctz(C), index=C>>(k+1) (same rule as
+            // DUP-element; idx < 16>>k). UMOV zero-extends: Q=0 takes a
+            // B/H/S lane to Wd, Q=1 takes the D lane to Xd (mismatched
+            // Q/esz fault honestly — the assembler rejects them).
+            // SMOV sign-extends: B/H/S lane to Xd (Q=1) or B/H lane to
+            // Wd (Q=0; S→W and any D form fault honestly). Rd=31
+            // discards (XZR sink, like the FMOV-extract row).
+            if (w & 0xBF00_FC00) == 0x0E00_3C00 {
+                let c = bits(w, 23, 16);
+                let k = c.trailing_zeros();
+                if k > 3 {
+                    return Err(ill);
+                }
+                let esz = 8u32 << k;
+                let idx = c >> (k + 1);
+                if idx >= (16 >> k) {
+                    return Err(ill);
+                }
+                if bits(w, 30, 30) == 0 && esz == 64 {
+                    return Err(ill);
+                }
+                if bits(w, 30, 30) == 1 && esz != 64 {
+                    return Err(ill);
+                }
+                let v = ((self.q[rn as usize] >> (idx * esz))
+                    & (if esz == 64 { u128::MAX } else { (1u128 << esz) - 1 })) as u64;
+                if rd != 31 {
+                    if bits(w, 30, 30) == 0 {
+                        self.w(rd, v, false);
+                    } else {
+                        self.x[rd as usize] = v;
+                    }
+                }
+                return Ok(());
+            }
+            if (w & 0xBF00_FC00) == 0x0E00_2C00 {
+                let c = bits(w, 23, 16);
+                let k = c.trailing_zeros();
+                if k > 3 {
+                    return Err(ill);
+                }
+                let esz = 8u32 << k;
+                if esz == 64 {
+                    return Err(ill);
+                }
+                let idx = c >> (k + 1);
+                if idx >= (16 >> k) {
+                    return Err(ill);
+                }
+                if bits(w, 30, 30) == 0 && esz == 32 {
+                    return Err(ill);
+                }
+                let v = ((self.q[rn as usize] >> (idx * esz)) & ((1u128 << esz) - 1)) as u64;
+                if rd != 31 {
+                    if bits(w, 30, 30) == 0 {
+                        let s = (((v << (32 - esz)) as i32) >> (32 - esz)) as u32;
+                        self.w(rd, s as u64, false);
+                    } else {
+                        let s = (((v << (64 - esz)) as i64) >> (64 - esz)) as u64;
+                        self.x[rd as usize] = s;
+                    }
+                }
+                return Ok(());
+            }
+            // MOVI/MVNI/ORR/BIC modified-immediate (M78: memset —
+            // `bic v0.8h,#0xf,lsl#8` looped at 0x403310). Family
+            // (w&0x9FF80C00)==0x0F000400 ([31]=0, [28:24]=01111,
+            // [23:19]=00000 reserved-0, o2[11]=0, bit10=1; Q/op vary).
+            // imm8 = [18:16]++[9:5] (sweep-proven over all 8 single-bit
+            // values + 17-row matrix). group = cmode[0] (0: move,
+            // 1: logical), op = bit29 (move: 0 MOVI / 1 MVNI; logical:
+            // 0 ORR / 1 BIC), size/shift = cmode[3:1]: 111 = 8-bit
+            // (op0: MOVI-8b; op1: MOVI-64 byte-mask — MVNI-64 does not
+            // exist), 100/101 = 16-bit noshift/LSL8, 000..011 = 32-bit
+            // LSL 0/8/16/24. Group-1 has no 64-bit (ss 6/7 → ill).
+            // Arrangement from Q (8b/16b, 4h/8h, 2s/4s, 1d/2d); MVNI =
+            // NOT(pattern); ORR/BIC read-modify-write Rd. Q=0 writes
+            // the low 64 only (top zeroed). Subsumes the old exact
+            // MOVI-2d-#0/MOVI-16b-#0x20 rows (identical values —
+            // fuzzer goldens byte-identical after regen).
+            if (w & 0x9FF8_0C00) == 0x0F00_0400 {
+                let op = bits(w, 29, 29);
+                let cmode = bits(w, 15, 12);
+                let grp = cmode & 1;
+                let ss = (cmode >> 1) & 7;
+                let imm8 = ((bits(w, 18, 16) << 5) | bits(w, 9, 5)) as u64;
+                let q = bits(w, 30, 30);
+                let width: u128 = if q == 1 { u128::MAX } else { 0xffff_ffff_ffff_ffff };
+                // (class, esz, shift): 0 MOVI, 1 MVNI, 2 ORR, 3 BIC.
+                let (class, esz, sh) = if grp == 0 && ss == 7 {
+                    if op == 0 {
+                        (0u32, 8u32, 0u32)
+                    } else {
+                        (4u32, 64u32, 0u32) // MOVI-64 marker
+                    }
+                } else if grp == 0 && (ss == 4 || ss == 5) {
+                    (if op == 0 { 0 } else { 1 }, 16u32, (ss - 4) * 8)
+                } else if grp == 0 && ss <= 3 {
+                    (if op == 0 { 0 } else { 1 }, 32u32, ss * 8)
+                } else if grp == 1 && ss <= 3 {
+                    (if op == 0 { 2 } else { 3 }, 32u32, ss * 8)
+                } else if grp == 1 && (ss == 4 || ss == 5) {
+                    (if op == 0 { 2 } else { 3 }, 16u32, (ss - 4) * 8)
+                } else {
+                    return Err(ill);
+                };
+                let pat: u128 = if class == 4 {
+                    // MOVI-64: byte i = 0xFF iff mask bit i set.
+                    let mut p: u128 = 0;
+                    for i in 0..8u32 {
+                        if ((imm8 >> i) & 1) == 1 {
+                            p |= 0xFFu128 << (i * 8);
+                        }
+                    }
+                    if q == 0 {
+                        p & 0xffff_ffff_ffff_ffff
+                    } else {
+                        p | (p << 64)
+                    }
+                } else {
+                    let elem = ((imm8 << sh) & (if esz == 16 { 0xffff } else { 0xffff_ffff })) as u128;
+                    let per = 128 / esz; // lanes per 128
+                    let mut p: u128 = 0;
+                    for i in 0..per {
+                        p |= elem << (i * esz);
+                    }
+                    p & width
+                };
+                let r = match class {
+                    0 | 4 => pat,
+                    1 => (!pat) & width,
+                    2 => (self.q[rd as usize] | pat) & width,
+                    _ => (self.q[rd as usize] & !pat) & width,
+                };
+                self.q[rd as usize] = r;
                 return Ok(());
             }
             // EOR .8b/.16b (full-128 bitwise; arrangement bit selects the
@@ -9361,25 +9961,34 @@ impl Cpu {
                 };
                 return Ok(());
             }
-            // BIT/BIF .8b (firmware's bit-twiddling; Q=0 rows only, as
-            // observed — no 16b forms in the image). Operand order is
-            // oracle-fitted (see test/simd-oracle.mjs): Vm is the
+            // BIT/BIF .8b/.16b (firmware's bit-twiddling was Q=0-only;
+            // busybox uses the 16b forms — M78 added the Q=1 rows with
+            // the identical lane formula at full width). Operand order
+            // is oracle-fitted (see test/simd-oracle.mjs): Vm is the
             // SELECTOR for both (BIT takes Vn where set, BIF takes Vn
             // where clear). Q=0 clears the top half.
-            if (w & 0xffe0_fc00) == 0x2ea0_1c00 {
+            if (w & 0xffe0_fc00) == 0x2ea0_1c00 || (w & 0xffe0_fc00) == 0x6ea0_1c00 {
                 let qd = self.q[rd as usize];
                 let qn = self.q[rn as usize];
                 let qm = self.q[rm as usize];
                 let r = (qm & qn) | (qd & !qm);
-                self.q[rd as usize] = r & 0xffff_ffff_ffff_ffff;
+                self.q[rd as usize] = if bits(w, 30, 30) == 0 {
+                    r & 0xffff_ffff_ffff_ffff
+                } else {
+                    r
+                };
                 return Ok(());
             }
-            if (w & 0xffe0_fc00) == 0x2ee0_1c00 {
+            if (w & 0xffe0_fc00) == 0x2ee0_1c00 || (w & 0xffe0_fc00) == 0x6ee0_1c00 {
                 let qd = self.q[rd as usize];
                 let qn = self.q[rn as usize];
                 let qm = self.q[rm as usize];
                 let r = (qm & qd) | (qn & !qm);
-                self.q[rd as usize] = r & 0xffff_ffff_ffff_ffff;
+                self.q[rd as usize] = if bits(w, 30, 30) == 0 {
+                    r & 0xffff_ffff_ffff_ffff
+                } else {
+                    r
+                };
                 return Ok(());
             }
             // MOVI D,#0 (scalar; the assembler rejects other D
@@ -9459,13 +10068,6 @@ impl Cpu {
                 } else {
                     r
                 };
-                return Ok(());
-            }
-            // DUP .2d from X (M51): replicate the general register into
-            // both double lanes (full Q write, no top question).
-            if (w & 0xffff_fc00) == 0x4e08_0c00 {
-                let v = self.r(rn) as u128;
-                self.q[rd as usize] = v | (v << 64);
                 return Ok(());
             }
             // USHR (immediate) D-lane + .2d vector (M51, dec51.s):
@@ -10573,6 +11175,12 @@ pub fn load_linux(
 ) -> Result<u64, String> {
     bus.mem = vec![0; LINUX_RAM_SIZE as usize];
     bus.linux_mode = true;
+    // M114 fresh translation/code epoch: the old RAM image (and every TLB
+    // entry + TB welfare derived from it) is gone. Bump tlb_gen so stale
+    // cached translations and TBs can never validate against the new
+    // image. (Also fixes a latent pre-TB issue: re-loading without this
+    // left stale TLB hits across images.)
+    bus.tlb_gen = bus.tlb_gen.wrapping_add(1);
     load_raw(bus, LINUX_KERNEL_PA, kernel, "kernel")?;
     load_raw(bus, LINUX_DTB_PA, dtb, "dtb")?;
     load_raw(bus, LINUX_INITRD_PA, initrd, "initrd")?;

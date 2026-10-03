@@ -269,9 +269,18 @@ impl Runner {
                 // lirq phase B: x1 only; console/regs/pc/insns all match).
                 // Reproducing chained-TB entry is out of scope (depends on
                 // translator cache state, not the architecture).
-                // DAIF masked, vector at VBAR+0x280. The IRQ_RET magic path
-                // resumes host-assisted guests to saved_pc; eret resumes the
-                // rest natively at ELR.
+                // DAIF masked, vector by ORIGIN (M77: EL0-origin IRQs take
+                // VBAR+0x480 el0_64_irq, EL1 takes VBAR+0x280 el1h_64_irq —
+                // the old code always took +0x280, so a timer IRQ firing in
+                // EL0 init entered the EL1h handler whose kernel_entry 1
+                // reads current via sp_el0 WITHOUT installing it (sp_el0 is
+                // still the user stack) — NULL+352 fault at 0e1dd4, nested
+                // sp_el0+6648 fault at b9faec, die_lock pending 0x101 spin.
+                // Proven by the zzspel0 trail 6.966B-6.967B: ERET to EL0
+                // 0x46c100, IRQ-DELIVER at 0x46c0ec, then both EL1 faults
+                // with sp_el0=user stack). The IRQ_RET magic path resumes
+                // host-assisted guests to saved_pc; eret resumes the rest
+                // natively at ELR.
                 cpu.elr_el1 = cpu.pc;
                 cpu.spsr_el1 = cpu.pstate();
                 self.saved_daif = cpu.daif;
@@ -292,7 +301,8 @@ impl Runner {
                     self.irq_pcs.push(cpu.pc);
                 }
                 let vbar = if cpu.vbar_el1 == 0 { 0x100000 } else { cpu.vbar_el1 };
-                self.vector_pending = Some(vbar + 0x280);
+                let vec_off = if cpu.cur_el == 0 { 0x480 } else { 0x280 };
+                self.vector_pending = Some(vbar + vec_off);
             }
         }
         self.n - start

@@ -2462,6 +2462,201 @@ dual traces + `dmaunit`/`scrunit` unit probes + battery after each).
   probe helpers. Temp `cpu/examples/zz*.rs` probes all deleted.
 - Battery: smoke 25/25 + fuzzer 882/882 (after every slice).
 
+### M106–M112 — JIT-speedup investigation: interpreter micro-opts exhausted, verdict recorded (DONE, uncommitted)
+
+User strategy change (JIT is back in scope — the M73 "out of scope"
+design rule is lifted): pi-cpu at ~60 MIPS native / ~2–4M insns/s in
+wasm cannot boot the 7B-insn kernel in acceptable time. Six
+interpreter-level attempts, each measured best-of-5 on the 20M triage
+and battery-guarded, ALL ~zero:
+- **O3/thin-LTO/codegen-units=1 (KEPT):** 0.60–0.65s (vs opt-s baseline;
+  M73's old revert was load noise — proven by stock A/B at 0.32–0.36s
+  on the idle machine, identical with/without). Binary 504K→586K.
+- **M109 trace gating (KEPT):** last 3 unconditional `eprintln!`
+  (SDCMD/SD17/BLK0) behind SDTRACE. Real hygiene win (smoke stderr
+  603B→0B), ~zero triage effect (they don't fire in that window).
+- **M110 size-specialized gather/scatter (KEPT):** byte loops →
+  from_le_bytes/match in read/write RAM paths. ~zero (compiler had
+  already unrolled/vectorized them). Harmless + arguably cleaner.
+- **M107 decode reorder (REVERTED):** hottest class to position 2,
+  top-byte-proven disjoint — measured zero (predictor already folds
+  the chain; it moved work rather than removing it).
+- **M111 dispatch cache (REVERTED):** 1024-entry (pc,word)→arm memo +
+  5 hoisted bodies (43% dynamic), airtight word-equality validation —
+  measured ~zero (0.58 vs 0.60 best, noise).
+- **M112 fetch-page buffer (REVERTED):** last-MMU-page translation
+  reuse, gen-validated — measured ~zero.
+- **Method lessons:** poor-man's split (TEMP nop_exec switch, reverted)
+  showed decode+body ≈ 60–70% of step; eu-stack sampling (gdb present,
+  no perf) showed leaf frames spread across exec/fetch/read with NO
+  dominant function and translate fully inlined — cost is diffuse, so
+  no single-component tweak can move it. Slice 4096 vs 1048576
+  identical → chunk overhead already negligible.
+- **Honest verdict:** the interpreter is at its compiler-optimal floor
+  (~60 MIPS native). The remaining multipliers are architectural, in
+  order: (1) TB execution (amortize fetch+decode+pc-update together,
+  not dispatch alone — M111 proved dispatch-only is worthless);
+  (2) true codegen JIT; (3) fewer guest insns (boot-path shortening).
+  Do NOT retry dispatch-only, reorder-only, gather-only, or
+  fetch-buffer-only speedups (all measured zero above).
+- Battery throughout: smoke 25/25 + fuzzer 882/882 + trajectory pins
+  (20M @4096/@65536 identical) + wasm size + pw-pi-linux 8/8.
+
+### M114 — TB execution tried, measured +15%, reverted machinery (DONE, uncommitted)
+
+First real JIT attempt (strategy change is now implementation, not
+just verdict): straight-line op cache (128-entry direct-mapped TBs,
+≤12 ops, shared predicates+bodies for DataImm/LDST-int/LDP-STP/STTR,
+per-op word validation, live data translates, gen-epoch invalidation
+via tlb_gen incl. new IC-IVAU + load_linux bumps, fault mapping
+shared with step()).
+- Result: 0.71 stable vs 0.60–0.62 baseline (**+15% loss**), battery
+  green throughout, pins held. Isolation experiment (runner back on
+  step(), extraction kept) restored 0.62 — proving the TB machinery
+  itself loses, not the extraction.
+- Why: only 37% of insns executed via TB at avg 1.9 ops/run (DataImm
+  23% dynamic → ~1.3-op runs); 12.5M/20M lookups miss (77% words
+  uncovered); per-op validation + loop + match scaffolding exceeds
+  the fetch-probe + predicted-chain it saves. eu-stack sampling
+  confirmed cost diffuse across exec/fetch/read (no dominant
+  function). Cache 128→2048 identical (not thrash); fetch_pa single
+  probe + #[inline(always)] + LDST/LDP/STTR coverage all tried, none
+  flipped the sign.
+- Kept (zero-cost, proven 0.62): shared gate predicates + body
+  methods (g_/b_ DataImm/LDST/LDP/STTR, finish_op) as single source
+  of truth for any future TB retry; tlb_gen bumps (load_linux +
+  IC-IVAU code-sync — the latter also correct in principle).
+  Reverted: TB cache/build/step_n/fetch_pa/runner hook/counters.
+- Lesson (load-bearing): interpreter TB without codegen cannot beat
+  this chain — per-op scaffolding ≥ per-op savings at ≤2-op runs.
+  Next speedup must be TRUE codegen (wasm emit) or boot-path
+  shortening (fewer guest insns), not better caching.
+
+### M113 — browser harness throughput: engine was never the gap (DONE, uncommitted)
+
+Key measurement first: the actual wasm build in bare Node runs 20M
+insns in 0.69s = **28.8 MIPS** (vs ~33–36 native) — the wasm engine
+was only ~15–20% slower than native all along. The ~10–20x browser
+gap was harness-side, not engine-side.
+- **Single-call batching (`runSliceN`):** 64× `pi.run(4K)` crossings
+  → one `pi.run(256K)`. `run_to()` chunks internally at
+  runner.slice (4K) with identical sync/IRQ/schedule/first-fault
+  behavior — proven trajectory-identical by execution (Node wasm:
+  5000×4K vs 10×2M → same pc/insns/console bytes; pc matches the
+  native 20M pin).
+- **Stats throttle:** `updateStats()` (innerHTML rebuild) every 8th
+  frame for pi-linux only.
+- **256 slices/frame (1M insns):** 64→256 measured 15.6→28.2M wall
+  insns/s @98% wall efficiency (engine 28.75, matching Node);
+  256→512 measured identical (28.5M) — batching plateau reached,
+  kept 256 for input latency. 7B-insn boot now ≈ 4 min in-browser.
+- Battery: smoke 25/25 + fuzzer 882/882 + pw-pi-linux 8/8 on the
+  rebuilt bundle. Further harness batching cannot help (plateau
+  proven); remaining speed is engine-side (see M106–M112 verdict).
+
+
+### M78 — EL0 IRQ vector + SVC-ELR: the die_lock deadlock is GONE, userspace boots (DONE, committed)
+
+Two semantic bugs, both found by execution, that together explain the
+M77 terminal stall (`pc=...b9dc80`, `die_lock=0x101` pending-spin at
+6.97B, hung-task trace at 7B, console frozen at 67978 B).
+
+**1. IRQ delivery ignored the exception ORIGIN (runner.rs).** The runner
+always entered `VBAR+0x280` (EL1h IRQ vector). A timer IRQ that fires
+while the CPU is in **EL0 userspace** must enter `VBAR+0x480`
+(`el0t_64_irq`): the EL1h vector's `kernel_entry 1` reads `current` from
+SP_EL0 but **does not install** it — SP_EL0 is still the user stack at
+that point (`mrs x21,sp_el0` saves the user SP, `msr sp_el0,tsk`
+installs the task). Consequence chain, proved step-by-step by
+`zzspel0` (single-step replica of the exact runner chunk loop, with
+IRQ actuation/delivery replicated):
+
+```
+6.967087170  eret -> EL0 pc=0x46c100 (init userspace)
+6.967087104  runner IRQ-DELIVER at pc=0x46c0ec, cur_el=0
+              -> installed 0x800000+0x280  (EL1h — WRONG)
+              el1h entry: mrs sp_el0 = 0x7fdedf21a0 (user stack!)
+6.967089394  DATA abort ec=0x25 elr=0xffffffc0080e1dd4 far=0x160
+              (current+352 on a garbage pointer)
+6.967089600  DATA abort ec=0x25 elr=0xffffffc008b9faec far=0x7fdedf3b98
+              (die path: [sp_el0+6648] on a user address)
+```
+and the guest then entered the *nested-oops* `die_lock` acquire
+(`ldseta/casa` set pending=0x101) whose holder is the die routine that
+can never run on a single core — the spin the M77 forensics kept
+finding. Fix: `vector_pending = vbar + (if cpu.cur_el == 0 {0x480} else {0x280})`,
+matching the SVC/data-abort arms that were already origin-aware.
+
+**2. SVC set ELR to the faulting pc, not pc+4 (lib.rs).** SVC/HVC/SMC are
+*completed-insn* exceptions (ARM ARM): ELR must hold the **next**
+instruction. pi-cpu stored `pc`, so the syscall returned into the SVC
+and busybox's `brk` at `0x452f88` looped forever — 40 identical
+`brk(0x24a9000)` in 1M insns, zero EL0 progress, no SVC in the trail.
+Upstream needs no `+4` because it never writes ELR+4 anywhere
+(`entry-common.c`/`syscall.c`, fetched from rpi-6.1.y). Fix:
+`self.elr_el1 = pc.wrapping_add(4)` under `linux_mode` only (bare-metal
+keeps `pc` so the M54 SVC-glue golden, which does its own `ELR += 4`,
+is unchanged).
+
+**Effect:** both stalls are gone. The 7B `die_lock` park and the
+12B console freeze no longer exist; the boot now runs past
+`Run /bin/init` into real busybox (`exitcode=0x7f00` instead of a
+hung spin).
+
+**3. Then the NEON gap showed up (the real userspace blocker).** With
+SVCs flowing, `zzsvcwin`/`zztrail` found each next undecoded AdvSIMD
+word as a single EL0t-trap site (the M100 EL0 catch-all keeps the guest
+alive but frozen at the same pc), and each one got a machine-derived
+row (assembler truth, disjointness proven against every other extras
+row both ways before pinning):
+
+| word | insn | why busybox needed it |
+|---|---|---|
+| `4e010c20` | `dup v.16b,w1` | string fill |
+| `4cdf7041` | `ld1 {v.16b},[x2],#16` | memcpy |
+| `4e209822` | `cmeq v.16b,v.16b,#0` | strcmp |
+| `6e208c23` | `cmeq v3,v1,v0` (3-reg) | memcmp |
+| `6ea41c62` | `bit v.16b,v3,v4` | bitmask ops (16b row) |
+| `4e22bc45` | `addp v.16b,v2,v2` | pairwise reduce |
+| `6e22a446` | `umaxp/smaxp/uminp/sminp` | pairwise reduce |
+| `4e083c63` | `mov x3,v3.d[0]` (UMOV) | lane extract |
+| `6e208c23` | `smov x,w from lane` | sign-extract |
+| `6f00b5e0` | `bic v.8h,#imm,lsl#8` (MOVI-class) | memset |
+
+New rows are **families**, not one-offs: DUP general (all arrangements
+from W/X) + DUP element; LD1/ST1 1/2/3/4-register with post-index by
+size or by Xm (Rn=31 uses the SP bank); CMEQ/CMGE/CMGT/CMLT/CMLE-vs-zero
++ CMTST; 3-reg CMEQ/CMGE/CMGT/CMHI/CMHS; vector AND/BIC (BIT/BIF/Bsl
+keep the Q=0 masking convention); ADDP; UMAXP/SMAXP/UMINP/SMINP;
+UMOV/SMOV (sign-extend); and the full **MOVI/MVNI/ORR/BIC
+modified-immediate** family (mask `(w&0x9FF80C00)==0x0F000400`,
+`imm8 = [18:16]++[9:5]`, size/shift from `cmode[3:1]`, 64-bit byte-mask
+mode for `movi v.2d,#0xff`). Superseded exact rows were deleted
+(the old MOVI-2d-#0/MOVI-16b-#0x20/DUP-.4h/DUP-.2d rows) — fuzzer
+goldens for those stay byte-identical after regen, which is the proof
+the families agree with the pinned oracle values.
+Fuzzer grew 882 → **1173** cases (+291 across 3 vectors); all 291 new
+rows come from `aarch64-none-elf-as`, never hand-hex.
+
+- **Current Linux state:** root mounted (ext4 on mmcblk0), init runs,
+  busybox forks/execs, `exitcode=0x7f00` at ~7.04B. `zztrail` shows
+  the SVC stream is now real (openat/ioctl/mmap/brk/clone/exit_group).
+  The remaining blocker is **userspace, not the core**: the rootfs has
+  no `/etc/inittab` (busybox init falls back to defaults) and its
+  `/dev` only has `null`, so init's `askfirst` never opens a console —
+  next slice is a rootfs/`rcS` question (or a `devtmpfs` mount), not a
+  decoder gap.
+- Battery: smoke **25/25**, fuzzer **1173/1173**, Linux trajectory
+  pins unchanged (`20M → pc=0xffffffc0082d6308 x0=0x1 fault=null` at
+  slices 4096 and 65536), 12B Linux run `fault=null`, all `zz*.rs`
+  probes deleted before commit.
+- Lesson (load-bearing): **every exception entry must be origin-aware**
+  (EL0 → +0x400 sync / +0x480 irq; EL1 → +0x200 / +0x280) and
+  completed-insn exceptions (SVC) must advance ELR. Missing either and
+  a single-core guest wedges in a lock spin whose holder can never run
+  — the symptom (a pending qspinlock) pointed at the lock, not the
+  vector.
+
 
 ## Key risks (M49: unicorn retired — the first two risks below are closed)
 
@@ -2472,7 +2667,7 @@ dual traces + `dmaunit`/`scrunit` unit probes + battery after each).
   browser button-IRQ E2E.)
 - SDHCI/DMA under Linux is much harder than the FAT12 demo.
 - ~~Keep M1–M19 regression green: 20 probes + browser E2Es~~ SUPERSEDED:
-  test/pi-cpu-smoke.mjs (22 goldens) + test/cpu-cases.mjs (819) +
+  test/pi-cpu-smoke.mjs (25 goldens) + test/cpu-cases.mjs (1173) +
   9 upython suites + browser E2Es (16/16 boots, REPL/float/button/fb).
 
 ## Working conventions

@@ -3,5 +3,6 @@ resolver = "2"
 members = ["board", "cpu"]
 
 [profile.release]
-opt-level = "s"
-lto = true
+opt-level = 3
+lto = "thin"
+codegen-units = 1

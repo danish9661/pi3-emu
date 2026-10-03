@@ -260,6 +260,12 @@ function runSlice(count) {
 // Batched variant: run n slices of `count` insns, one wall_tick up
 // front, one console drain at the end. pi-linux only (other guests
 // need per-slice LED/canvas/audio interleave).
+// M113 single-call batching: ONE pi.run(count*n) crossing instead of n
+// crossings. run_to() chunks internally at runner.slice (4096) with
+// identical sync_out/sync_in, IRQ actuation, key/button schedules and
+// first-fault stop — instruction-for-instruction identical trajectory
+// to n separate calls (verified: same 20M pins in the Node wasm
+// harness), at 1/nth the wasm-bindgen boundary cost.
 function runSliceN(count, n) {
   const t0 = performance.now();
   if (!VIRTUAL_TIME) {
@@ -268,20 +274,15 @@ function runSliceN(count, n) {
     lastWall = now;
     pi.wall_tick(dus);
   }
-  let total = 0;
-  for (let i = 0; i < n; i++) {
-    try {
-      pi.run(count);
-      total += count;
-      faultStreak = 0;
-    } catch (e) {
-      lastFault = e;
-      try { lastFaultText = pi.fault() || String(e).slice(0, 120); } catch (_) { lastFaultText = String(e).slice(0, 120); }
-      faultStreak++;
-      try { window.__lastFault = lastFaultText; } catch (_) {}
-      break;
-    }
-    if (faultHalted()) break;
+  const total = count * n;
+  try {
+    pi.run(total);
+    faultStreak = 0;
+  } catch (e) {
+    lastFault = e;
+    try { lastFaultText = pi.fault() || String(e).slice(0, 120); } catch (_) { lastFaultText = String(e).slice(0, 120); }
+    faultStreak++;
+    try { window.__lastFault = lastFaultText; } catch (_) {}
   }
   stats.emuMs += performance.now() - t0;
   stats.steps += n;
@@ -688,7 +689,11 @@ const PI_LINUX_FRAME_MS = 110;
 // ...b92d44 con=8189 irqs=552). IRQ delivery + timer compare happen
 // at chunk boundaries, so bigger slices change interleaving, not
 // just overhead. Batch COUNT (slices/frame), never slice SIZE.
-const PI_LINUX_SLICES_PER_FRAME = 64;
+const PI_LINUX_SLICES_PER_FRAME = 256;
+// M113: stats-row DOM rebuild throttled for pi-linux (innerHTML parse +
+// layout every frame is pure overhead; liveness still shows via the
+// terminal + 8Hz stats).
+let piLinuxFrameNo = 0;
 function irqRun() {
   let out = '';
   const frame = () => {
@@ -702,10 +707,13 @@ function irqRun() {
       // stats each) to ~4; the DOM churn (draw/updateStats) from
       // every-slice to once-per-frame. Tab stays responsive: rAF
       // still yields between frames; scroll/input handled.
+      // M113: runSliceN is now a single pi.run crossing (run_to chunks
+      // internally at 4K with identical trajectory); 256 slices/frame
+      // ≈ 1M insns ≈ 48ms engine @21MIPS + overhead per rAF tick.
       out += runSliceN(SLICE_INSNS, PI_LINUX_SLICES_PER_FRAME);
       draw(out);
       out = '';
-      updateStats();
+      if ((piLinuxFrameNo++ & 7) === 0) updateStats();
     } else {
       do {
         out += runSlice(SLICE_INSNS);
