@@ -106,6 +106,15 @@ pub enum Fault {
     UnmappedData(u64),
     /// Stage-1 translation fault (bad descriptor/range during the walk).
     Translation(u64),
+    /// Stage-1 PERMISSION fault: the descriptor exists but denies the
+    /// access (AP[2:1] = 00/01 = EL1-only, or 10 = read-only against a
+    /// store). M113-TRUE: without this the core never faults a write to a
+    /// read-only mapping, so Linux never takes the COW path and the guest
+    /// writes straight into shared page-cache pages — the exact mechanism
+    /// that let one physical page end up mapped at both busybox's .bss and
+    /// the glibc heap, corrupting `ptmalloc_initialized` (see the `tlb_tag`
+    /// doc comment). Carries the faulting VA.
+    Permission(u64),
     /// Synchronous data abort DELIVERED to the guest vector (M93):
     /// step() took the EL1h/EL0 sync vector instead of returning the
     /// fault. Carries the fault VA. The runner/harness treat this as
@@ -235,11 +244,52 @@ pub struct Bus {
     // SCTLR.M, the kernel builds its tables once). Keyed on
     // (va>>12) + half + (ttbr0, tcr.t0sz, ttbr1, tcr.t1sz, sctlr.M,
     // loose) generation — any regime change invalidates wholesale.
-    // 256-entry direct-mapped (index = VPN mod 256); hit = one array
-    // read, no walk. Miss walks once and fills.
+    // 256-entry direct-mapped (index = VPN mod 256); hit = two array
+    // reads, no walk. Miss walks once and fills.
+    //
+    // M113-TRUE (Linux corruption root cause): the tag MUST be an
+    // EXACT test of (VPN+half, generation) — two fields compared
+    // separately. The previous single-field scheme folded the
+    // generation in arithmetically:
+    //     tag = vpn ^ (hi << 56) ^ gen ^ gen.wrapping_mul(PHI)
+    // and tested `tlb_tag[slot] == tag`. That is NOT injective in
+    // (vpn, gen): a lookup at generation G2 falsely matches a stale
+    // entry cached at G1 whenever the two VPNs differ by exactly
+    // f(d) = d ^ (d*PHI) with d = G1^G2, which happens for a large
+    // fraction of generation pairs (f(d) lands in VPN range ~1/4096
+    // of the time, and ~1/256 of those share the direct-mapped slot).
+    // Proven live on the 7B Linux boot: a guest memset wrote through
+    // VA 0x2fafd000 and landed on PA 0x1773000 — the SAME physical
+    // page busybox's .bss (VA 0x61A000) was mapped at (identical L3
+    // descriptor 0x160000001773fc3 in both) — so the zeroing cleared
+    // glibc's `ptmalloc_initialized` flag (busybox .bss 0x61AC08),
+    // ptmalloc_init re-ran, reset main_arena.top to the dummy
+    // unsorted_bin sentinel while last_remainder was non-zero, and
+    // the very next malloc died with "malloc(): corrupted top size".
+    // VPN+hi is injective in `vpn` itself (hi is bit 55 of va = bit 43
+    // of vpn), so `tlb_tag` holds the raw VPN and `tlb_tgen` the
+    // generation, each compared for equality — no mixing, no folding.
     tlb_tag: [u64; 256],
+    tlb_tgen: [u64; 256],
     tlb_pa: [u64; 256],
+    /// M113-TRUE: descriptor access-permission bits (AP[2:1] << 1 | AF)
+    /// cached beside the translation so `read`/`write` can raise the
+    /// `Permission` fault without re-walking. Packed: bit2..1 = AP,
+    /// bit0 = AF. Default 0b111 = AP=11 (EL0 read/write, AF set) so an
+    /// unpopulated slot never invents a fault.
+    tlb_ap: [u8; 256],
     tlb_gen: u64,
+    /// Current exception level of the executing context (0 = EL0, 1 =
+    /// EL1), written by `Cpu::step` so `read`/`write` can apply the
+    /// EL0-only part of the AP rules. Defaults to 1 (EL1) so bare-metal
+    /// probe/harness code that calls Bus::read/write directly keeps the
+    /// old (no-permission) behaviour.
+    pub cpu_el: u8,
+    /// True when the LAST `translate()` resolved through the TLB or a
+    /// page-table walk (i.e. `tlb_ap[slot]` is meaningful for that VA).
+    /// False after the MMU-off and device-window identity fast paths, so
+    /// `perm_denied` can never consult a stale slot for an MMIO access.
+    perm_checked: bool,
     // ARM arch timer (CNTP + CNTV, 19.2 MHz like the Pi 3): the counter follows
     // the facade's float virtual-time replica exactly (virtualUs_f +=
     // (n/ips)*1e6 per chunk, cntpct = floor(us*19.2)) so compare matches
@@ -645,8 +695,12 @@ impl Bus {
             mmu_mair: 0,
             par_el1: 0,
             tlb_tag: [u64::MAX; 256],
+            tlb_tgen: [u64::MAX; 256],
             tlb_pa: [0; 256],
+            tlb_ap: [0b111; 256],
             tlb_gen: 0,
+            cpu_el: 1,
+            perm_checked: false,
             cntpct: 0,
             cntp_cval: 0,
             cntp_ctl: 0,
@@ -1110,18 +1164,30 @@ impl Bus {
     /// map lives at 0xffffffc0...). Faults on out-of-range VA, non-4K
     /// granule, bad descriptors, unmapped non-device VAs, or tables
     /// outside RAM.
+    /// Invalidate every cached translation (the "TLBI vmalle1" effect).
+    /// Bumps the regime generation, so no TLB tag can validate: used by
+    /// the guest-kernel TLBI path and by triage/differential probes that
+    /// must compare a cached translation against a fresh walk.
+    pub fn tlb_flush(&mut self) {
+        self.tlb_gen = self.tlb_gen.wrapping_add(1);
+    }
+
     pub fn translate(&mut self, va: u64) -> Result<u64, Fault> {
+        self.perm_checked = false;
         if (self.mmu_sctlr & 1) == 0 {
             return Ok(va);
         }
         if Self::is_device_win(va) {
             return Ok(va);
         }
-        // M73 TLB probe (hot path): index by VPN mod 256, tag = full
-        // VPN + half + regime generation. Hit returns the cached
-        // PA page; the 12-bit page offset is re-planted per access
-        // (blocks share the entry: cached PA already contains the
-        // block base, offset plant is identical math).
+        // M73 TLB probe (hot path): index by VPN mod 256; the tag is
+        // the raw VPN and the generation is a SECOND field compared for
+        // equality (see the `tlb_tag` doc comment: the old folded-hash
+        // tag was non-injective and caused real cross-mapping writes on
+        // the Linux boot). Hit returns the cached PA page; the 12-bit
+        // page offset is re-planted per access (blocks share the entry:
+        // cached PA already contains the block base, offset plant is
+        // identical math).
         // M74 CHEAP GEN: the old probe folded ttbr0/ttbr1/tcr/sctlr/
         // loose into `gen` with two wrapping_muls per access — but
         // tlb_gen ALREADY bumps on every regime MSR, so the tag only
@@ -1134,24 +1200,21 @@ impl Bus {
         let gen = self.tlb_gen;
         let vpn = va >> 12;
         let slot = (vpn & 255) as usize;
-        // M73 TAG (correctness first): the tag is the FULL regime
-        // generation folded with the VPN — tlb_gen bumps on EVERY
-        // regime MSR (TCR/TTBR/SCTLR/MMU_CTL incl. MAIR — MAIR is
-        // recorded-never-consulted, but bumping on it too keeps the
-        // invariant "any MSR in the regime class invalidates" simple
-        // and audit-proof) AND at load_linux, and the tag compares
-        // the full 64-bit gen (second array read, still ~10× cheaper
-        // than a 4-level walk). A low-8-only tag was tried first and
-        // rejected: same-VPN + same-gen-low-8 across two regimes
-        // would hit stale (regimes change rarely, but "rarely" is
-        // not "never").
-        let tag = vpn ^ (hi << 56) ^ gen ^ gen.wrapping_mul(0x9e3779b97f4a7c15);
-        if self.tlb_tag[slot] == tag {
+        // M113-TRUE TAG: EXACT equality on both fields. VPN alone is
+        // injective for (va, half) — hi is bit 55 of va, i.e. bit 43 of
+        // vpn, so it is already inside the tag; the fold is kept only
+        // for readability. `u64::MAX` is the empty-slot sentinel and
+        // can never equal a real vpn (< 2^52).
+        let tag = vpn ^ (hi << 56);
+        self.perm_checked = true;
+        if self.tlb_tag[slot] == tag && self.tlb_tgen[slot] == gen {
             return Ok((self.tlb_pa[slot] & !0xfff) | (va & 0xfff));
         }
-        let pa = self.translate_walk(va, hi != 0)?;
+        let (pa, ap) = self.translate_walk(va, hi != 0)?;
         self.tlb_tag[slot] = tag;
+        self.tlb_tgen[slot] = gen;
         self.tlb_pa[slot] = pa & !0xfff;
+        self.tlb_ap[slot] = ap;
         // BUG TRAP (bitten during M73 dev): the cached value MUST be
         // the PAGE base (pa & !0xfff), NOT the full pa — the return
         // plants (va & 0xfff). Caching full pa double-plants the
@@ -1159,11 +1222,38 @@ impl Bus {
         Ok(pa)
     }
 
+    /// M113-TRUE: does the cached descriptor deny this access?
+    ///
+    /// Valid ONLY immediately after a successful `translate()` for the
+    /// same VA (the TLB entry the walk just validated/filled). Arm64
+    /// stage-1 AP[2:1]:
+    ///   00 / 01 -> EL1 read/write only (EL0: no access, either op)
+    ///   10      -> EL0 read-only (EL0 store denied)
+    ///   11      -> EL0 read/write (no fault)
+    /// EL1 accesses never fault here (AP 00 is EL1-writable), and AF is
+    /// carried for a future access-flag fault but NOT enforced yet
+    /// (documented gap: the kernel sets AF on every PTE it installs, and
+    /// adding AF faults would change every trajectory).
+    #[inline]
+    fn perm_denied(&self, va: u64, is_write: bool) -> bool {
+        if self.cpu_el != 0 || !self.perm_checked {
+            return false;
+        }
+        let slot = ((va >> 12) & 255) as usize;
+        let ap = (self.tlb_ap[slot] >> 1) & 3;
+        match ap {
+            0b11 => false,
+            0b10 => is_write,
+            _ => true, // 0b00 / 0b01: EL1-only
+        }
+    }
+
     /// Full table walk (M73: split out of translate() so the TLB probe
     /// above stays 3 compares + 2 array reads). Semantics UNCHANGED —
     /// this is the old translate() body verbatim after the MMU-off /
     /// device-window fast paths.
-    fn translate_walk(&self, va: u64, hi: bool) -> Result<u64, Fault> {        let tsz = if hi {
+    fn translate_walk(&self, va: u64, hi: bool) -> Result<(u64, u8), Fault> {
+        let tsz = if hi {
             ((self.mmu_tcr >> 16) & 0x3f) as u32
         } else {
             (self.mmu_tcr & 0x3f) as u32
@@ -1257,7 +1347,7 @@ impl Bus {
                 0b01 => {
                     // Block (1G at L1, 2M at L2) — strict ARM.
                     let block = 1u64 << shift;
-                    return Ok((d & outmask & !(block - 1)) | (va & (block - 1)));
+                    return Ok(((d & outmask & !(block - 1)) | (va & (block - 1)), ap_bits(d)));
                 }
                 0b11 if level == 3 => {
                     // 4K page (both dialects agree). M57 PHYS-MASK FIX
@@ -1269,12 +1359,12 @@ impl Bus {
                     // arms. The old `(d & !0xfff)` leaked bit63..48
                     // into the PA (0x68000001771F70, OOR) instead of
                     // 0x1771F70.
-                    return Ok((d & outmask) | (va & 0xfff));
+                    return Ok(((d & outmask) | (va & 0xfff), ap_bits(d)));
                 }
                 0b11 if self.mmu_loose => {
                     // Block (loose dialect).
                     let block = 1u64 << shift;
-                    return Ok((d & outmask & !(block - 1)) | (va & (block - 1)));
+                    return Ok(((d & outmask & !(block - 1)) | (va & (block - 1)), ap_bits(d)));
                 }
                 0b11 => {
                     // Table descend (strict ARM).
@@ -1285,10 +1375,10 @@ impl Bus {
                 _ if !self.mmu_loose => return Err(Fault::Translation(va)),
                 _ => {
                     if level == 3 {
-                        return Ok((d & outmask) | (va & 0xfff));
+                        return Ok(((d & outmask) | (va & 0xfff), ap_bits(d)));
                     }
                     let block = 1u64 << shift;
-                    return Ok((d & outmask & !(block - 1)) | (va & (block - 1)));
+                    return Ok(((d & outmask & !(block - 1)) | (va & (block - 1)), ap_bits(d)));
                 }
             }
         }
@@ -3881,7 +3971,11 @@ impl Bus {
                 return Ok(v);
             }
         } else {
+            let va = addr;
             addr = self.translate(addr)?;
+            if self.perm_denied(va, false) {
+                return Err(Fault::Permission(va));
+            }
             if self.in_ram(addr, size) {
                 let a = addr as usize;
                 let m = &self.mem[a..a + size as usize];
@@ -4648,7 +4742,11 @@ impl Bus {
                 return Ok(());
             }
         } else {
+            let va = addr;
             addr = self.translate(addr)?;
+            if self.perm_denied(va, true) {
+                return Err(Fault::Permission(va));
+            }
             if self.in_ram(addr, size) {
                 // M63 write-watch (MMU-on path): same as above, on the
                 // translated PA.
@@ -6654,6 +6752,9 @@ impl Cpu {
 
     pub fn step(&mut self, bus: &mut Bus) -> Result<(), Fault> {
         let pc = self.pc;
+        // M113-TRUE: publish the exception level so Bus::read/write can
+        // apply the EL0-only half of the descriptor AP rules.
+        bus.cpu_el = self.cur_el as u8;
         // M99 EXCEPTION TRACE (env-gated, zero-cost off): logs every
         // exception entry/exit with the runner's insn count (passed via
         // bus.exc_n, set once per chunk) + EL + stacks. Proves the
@@ -6760,6 +6861,31 @@ impl Cpu {
         // (UnmappedFetch/Illegal) still return to the harness — only
         // DATA-side faults deliver.
         match r {
+            // M113-TRUE PERMISSION FAULT: the descriptor exists but
+            // denies the access (write to RO / EL0 touch of an EL1-only
+            // page). Linux ESR EC: 0x26 DABT_LOW_PERR (from a lower EL)
+            // / 0x27 DABT_CUR_PERR (same EL); FSC 0x0D = "permission
+            // fault" (do_page_fault's ESR_ELx_FSC_PERR branch, which is
+            // what drives do_wp_page/COW). WnR from the faulting store.
+            Err(Fault::Permission(a)) if bus.linux_mode => {
+                let el0_origin = self.cur_el == 0;
+                let ec = if el0_origin { 0x26 } else { 0x27 };
+                let vec_off = if el0_origin { 0x400 } else { 0x200 };
+                let wnr = if Self::is_store_word(w) { 1 } else { 0 };
+                self.esr_el1 = (ec << 26) | (wnr << 6) | 0x0d;
+                self.far_el1 = a;
+                self.elr_el1 = pc;
+                self.spsr_el1 = self.pstate();
+                self.daif = 0xf;
+                let vbar = if self.vbar_el1 == 0 { 0x100000 } else { self.vbar_el1 };
+                self.pc = vbar + vec_off;
+                self.cur_el = 1;
+                if std::env::var("PI3_EXCTRACE").is_ok() {
+                    eprintln!("EXC n={} PERM ec=0x{:x} el0={} elr=0x{:x} far=0x{:x} vec=+0x{:x}", bus.exc_n, ec, el0_origin as u8, pc, a, vec_off);
+                }
+                self.abort_pending = true;
+                Err(Fault::DataAbort(a))
+            }
             Err(Fault::UnmappedData(a)) | Err(Fault::Translation(a)) if bus.linux_mode => {
                 // DFSC: 0b010001 (alignment, unused here) vs 0b000100
                 // (translation, L0 — the observed class: empty user
@@ -6847,6 +6973,13 @@ impl Cpu {
 // ---- decode helpers ----
 
 #[inline]
+/// Packed descriptor permission bits for the TLB: bit2..1 = AP[2:1],
+/// bit0 = AF (arm64 stage-1 descriptor bits 7:6 and 10).
+#[inline]
+fn ap_bits(d: u64) -> u8 {
+    ((((d >> 6) & 3) as u8) << 1) | ((d >> 10) & 1) as u8
+}
+
 fn bits(w: u32, hi: u32, lo: u32) -> u32 {
     (w >> lo) & ((1u32 << (hi - lo + 1)) - 1)
 }
@@ -8614,7 +8747,16 @@ impl Cpu {
             let opc = bits(w, 23, 22);
             match bits(w, 31, 30) {
                 0b00 => {
-                    if bits(w, 23, 23) != 1 {
+                    // M79 REGISTER OFFSET (was `return Err(ill)` — the
+                    // comment claimed "unneeded", busybox memcpy proved
+                    // otherwise: `ldr q1,[x1,x5]` at 0x400964 in
+                    // /bin/busybox is the NEON copy kernel and hard-faulted
+                    // the whole Linux userspace boot).
+                    // bit23 selects the width: 1 = Q (128-bit), 0 = B
+                    // (8-bit; opc 00 store / 01 load). opc 10/11 are the
+                    // Q store/load encodings (L = opc&1, as before).
+                    let esz: u64 = if bits(w, 23, 23) == 1 { 16 } else { 1 };
+                    if esz == 1 && opc > 0b01 {
                         return Err(ill);
                     }
                     let is_load = opc & 1 == 1;
@@ -8622,7 +8764,14 @@ impl Cpu {
                 let off = (bits(w, 21, 10) as u64) * 16;
                 (self.rsp(rn).wrapping_add(off), None)
             } else if bits(w, 21, 21) == 1 {
-                return Err(ill); // register offset Q (unneeded)
+                // Register offset: Rm, scaled by log2(esz) when bit12 is
+                // set (M79 — bit12, not bit11, is the shift flag for the
+                // Advanced-SIMD form: [15:10]=011010 no-shift vs 011110
+                // shift, assembler-verified across q/d/s/h/b).
+                let rm = bits(w, 20, 16);
+                let sh = if bits(w, 12, 12) == 1 { esz.trailing_zeros() } else { 0 };
+                let off = self.r(rm).wrapping_shl(sh);
+                (self.rsp(rn).wrapping_add(off), None)
             } else {
                 match (bits(w, 11, 11) << 1) | bits(w, 10, 10) {
                     0b00 => {
@@ -8643,15 +8792,26 @@ impl Cpu {
                 }
             };
             if is_load {
-                let lo = bus.read(addr, 8).map_err(|_| Fault::UnmappedData(addr))?;
-                let hi = bus
-                    .read(addr.wrapping_add(8), 8)
-                    .map_err(|_| Fault::UnmappedData(addr))?;
-                self.q[rd as usize] = ((hi as u128) << 64) | lo as u128;
+                if esz == 16 {
+                    let lo = bus.read(addr, 8).map_err(|_| Fault::UnmappedData(addr))?;
+                    let hi = bus
+                        .read(addr.wrapping_add(8), 8)
+                        .map_err(|_| Fault::UnmappedData(addr))?;
+                    self.q[rd as usize] = ((hi as u128) << 64) | lo as u128;
+                } else {
+                    // B: zero-extended into the Q file low lane.
+                    let v = bus.read(addr, 1).map_err(|_| Fault::UnmappedData(addr))?;
+                    self.q[rd as usize] = v as u128;
+                }
             } else {
-                let (l, h) = (self.q[rd as usize] as u64, (self.q[rd as usize] >> 64) as u64);
-                bus.write(addr, 8, l).map_err(|_| Fault::UnmappedData(addr))?;
-                bus.write(addr.wrapping_add(8), 8, h).map_err(|_| Fault::UnmappedData(addr))?;
+                if esz == 16 {
+                    let (l, h) = (self.q[rd as usize] as u64, (self.q[rd as usize] >> 64) as u64);
+                    bus.write(addr, 8, l).map_err(|_| Fault::UnmappedData(addr))?;
+                    bus.write(addr.wrapping_add(8), 8, h).map_err(|_| Fault::UnmappedData(addr))?;
+                } else {
+                    bus.write(addr, 1, self.q[rd as usize] as u64 & 0xff)
+                        .map_err(|_| Fault::UnmappedData(addr))?;
+                }
             }
             if let Some(b) = wb {
                 self.wsp(rn, b, true);
@@ -9604,7 +9764,7 @@ impl Cpu {
                 };
                 let esz = 8u32 << bits(w, 23, 22);
                 let lanes = (if bits(w, 30, 30) == 1 { 128 } else { 64 }) / esz;
-                let lmask = if esz == 64 { u128::MAX } else { (1u128 << esz) - 1 };
+                let lmask = (1u128 << esz) - 1;
                 let mut q: u128 = 0;
                 for i in 0..lanes {
                     let lane = (self.q[rn as usize] >> (i * esz)) & lmask;
@@ -9627,7 +9787,7 @@ impl Cpu {
             if (w & 0xBF00_FC00) == 0x0E00_8C00 {
                 let esz = 8u32 << bits(w, 23, 22);
                 let lanes = (if bits(w, 30, 30) == 1 { 128 } else { 64 }) / esz;
-                let lmask = if esz == 64 { u128::MAX } else { (1u128 << esz) - 1 };
+                let lmask = (1u128 << esz) - 1;
                 let mut q: u128 = 0;
                 for i in 0..lanes {
                     let a = (self.q[rn as usize] >> (i * esz)) & lmask;
@@ -9670,7 +9830,7 @@ impl Cpu {
                 if kind != 9 {
                     let esz = 8u32 << bits(w, 23, 22);
                     let lanes = (if bits(w, 30, 30) == 1 { 128 } else { 64 }) / esz;
-                    let lmask = if esz == 64 { u128::MAX } else { (1u128 << esz) - 1 };
+                    let lmask = (1u128 << esz) - 1;
                     let mut q: u128 = 0;
                     for i in 0..lanes {
                         let a = (self.q[rn as usize] >> (i * esz)) & lmask;
@@ -9723,7 +9883,7 @@ impl Cpu {
                 let esz = 8u32 << bits(w, 23, 22);
                 let lanes = (if bits(w, 30, 30) == 1 { 128 } else { 64 }) / esz;
                 let half = lanes / 2;
-                let lmask = if esz == 64 { u128::MAX } else { (1u128 << esz) - 1 };
+                let lmask = (1u128 << esz) - 1;
                 let mut q: u128 = 0;
                 for i in 0..half {
                     let a = (self.q[rn as usize] >> ((2 * i) * esz)) & lmask;
@@ -9763,7 +9923,7 @@ impl Cpu {
                     let esz = 8u32 << bits(w, 23, 22);
                     let lanes = (if bits(w, 30, 30) == 1 { 128 } else { 64 }) / esz;
                     let half = lanes / 2;
-                    let lmask = if esz == 64 { u128::MAX } else { (1u128 << esz) - 1 };
+                    let lmask = (1u128 << esz) - 1;
                     let qn = self.q[rn as usize];
                     let qm = self.q[rm as usize];
                     let lane = |qq: u128, idx: u32| (qq >> (idx * esz)) & lmask;
@@ -9825,7 +9985,7 @@ impl Cpu {
                     return Err(ill);
                 }
                 let v = ((self.q[rn as usize] >> (idx * esz))
-                    & (if esz == 64 { u128::MAX } else { (1u128 << esz) - 1 })) as u64;
+                    & ((1u128 << esz) - 1)) as u64;
                 if rd != 31 {
                     if bits(w, 30, 30) == 0 {
                         self.w(rd, v, false);

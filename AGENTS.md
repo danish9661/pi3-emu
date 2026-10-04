@@ -2502,6 +2502,90 @@ and battery-guarded, ALL ~zero:
 - Battery throughout: smoke 25/25 + fuzzer 882/882 + trajectory pins
   (20M @4096/@65536 identical) + wasm size + pw-pi-linux 8/8.
 
+### M115 — userspace corruption ROOT-CAUSED: TLB tag was non-injective + no PTE permission model (DONE, uncommitted)
+
+The Linux boot reached busybox init but init's child aborted with
+`malloc(): corrupted top size` + `Kernel panic - not syncing:
+Attempted to kill init! exitcode=0x00007f00`. Root-caused by
+execution, in three layers. **All three fixes are real core bugs, not
+rootfs/model workarounds**, and the panic is GONE.
+
+**1. `.2d` SIMD lane mask (found by the new differential rig).**
+`test/simd-diff.mjs` (new, permanent) assembles each row with
+`aarch64-none-elf-as`, runs it through `cpu/examples/one.rs` with seeded
+X/Q/scratch memory, and diffs against an INDEPENDENT JS
+implementation of the ARM ARM semantics written per family — the rig
+exists because the fuzzer goldens were REGENERATED after M78 added the
+SIMD families, so they only prove self-consistency (a real blind spot).
+309/309 green after one fix: every 64-bit-lane family used
+`lmask = u128::MAX` instead of the 64-bit lane mask, so lane 0 compared
+the FULL 128-bit register and, on any hit, wrote all 128 bits
+(`cmtst .2d` was the proof case). Uniform `(1u128 << esz) - 1` fixes
+all five sites. (The buggy rows are `.2d` only; busybox's path never
+reached them before the crash, so the Linux trajectory was unchanged.)
+
+**2. TLB tag was NOT injective (silent cross-mapping writes).** The
+M73 tag folded VPN+half+generation into one word:
+`tag = vpn ^ (hi<<56) ^ gen ^ gen.wrapping_mul(PHI)`, tested with
+`==`. XOR-folding is not injective in `(vpn, gen)`: a lookup at
+generation G2 falsely matches a stale entry from G1 whenever the VPNs
+differ by `f(d) = d ^ (d*PHI)` with `d = G1^G2` — `f(d)` lands in VPN
+range for ~1/4096 of generation pairs, and ~1/256 of those share the
+direct-mapped slot. The boot does ~10^5 generation bumps, so this fires.
+Now `tlb_tag` holds the raw VPN and a NEW `tlb_tgen` array holds the
+generation, each compared for equality (no mixing, no folding).
+
+**3. NO PTE PERMISSION MODEL AT ALL — the actual corruption vector.**
+`translate_walk` returned only a PA: no AP[2:1], no AF. So a write to a
+read-only mapping never faulted, Linux never took its COW path
+(`do_wp_page`), and the guest wrote **straight into shared page-cache
+pages**. Proven chain, every step by execution:
+- `glibc`'s `__libc_malloc` guards `ptmalloc_init` with the byte
+  `ptmalloc_initialized` at busybox VA `0x61AC08`; a guest memset
+  cleared it (`pc=0x4029b8`, then `dc zva` at `0x4029d0`).
+- `ptmalloc_init` re-ran (`0x424e54` = `av->top = unsorted_bin`), and
+  because `last_remainder` (arena+0x68, the dummy top's fake size) was
+  stale, `chunksize(av->top)` read `0x2fafb710 > system_mem` →
+  `malloc(): corrupted top size` at `0x4275ec-0x427600`
+  (`ldr x1,[x20,#96]` / `ldr x2,[x20,#2184]` / `cmp` — the arena is
+  `0x613960`).
+- WHY the memset reached `.bss`: `VA 0x2fafd000` (glibc's freshly
+  brk'd heap) and `VA 0x61A000` (busybox `.bss`) mapped the SAME
+  physical page `0x1773000` with a BIT-IDENTICAL L3 descriptor
+  `0x160000001773fc3` — two live mappings of one page. The aliasing
+  PTE was installed by the fault path at `0xffffffc0082bbce4`
+  (`str x20,[x22]`, PFN `0x1773` from `vmf->page`), and NO `clear_page`
+  ever ran for that page (only the later memset touched it), so the
+  page came from the page cache — exactly what no-COW produces.
+Fix: `ap_bits(d)` packs AP+AF from the descriptor, the walk returns it,
+the TLB caches it (`tlb_ap`), `Cpu::step` publishes `bus.cpu_el`, and
+`read`/`write` raise `Fault::Permission` for EL0 accesses the
+descriptor denies (AP 00/01: no EL0 access; AP 10: no EL0 store).
+Delivery: EC `0x26`/`0x27` (DABT_LOW/CUR_PERR), FSC `0x0D`
+(ESR_ELx_FSC_PERR — the branch that drives `do_wp_page`), WnR set.
+Hazard found while writing it: a device-window access returns from
+`translate()`'s identity fast path, so the check would consult a STALE
+TLB slot — gated behind a `perm_checked` flag set only on the
+TLB/walk paths.
+AF (access flag) is still NOT enforced — the kernel sets AF on every
+PTE it installs, and adding AF faults would move every trajectory;
+documented as a known gap, not silently ignored.
+
+**Effect (by execution):** the `malloc(): corrupted top size` abort and
+`Attempted to kill init!` panic are GONE (0 markers), console grows
+125218 B @7.1B → 1954827 B @20B insns, boot alive at 21 h virtual time,
+still no prompt — the blocker is now the **sdhost read path**
+(`mmc0: cmd op 18 ... err -110` + register dump), i.e. the M76/M77
+open edge, not corruption.
+Also fixed en route: `/etc/inittab` injected into the 4 MB rootfs with
+`debugfs` (image stays exactly 4194304 bytes, so `load.js` offsets are
+unchanged) — busybox init now finds a sysinit/askfirst table instead of
+falling back to defaults.
+**Battery:** smoke 25/25, fuzzer 1173/1173, simd-diff 309/309,
+upython-repl/sd/vfs/irq PASS, Linux 20M pin UNCHANGED
+(`pc=0xffffffc0082d6308 x0=0x1 fault=null` at slices 4096 AND 65536 —
+early boot never touches a RO page, which is why the pin held).
+
 ### M114 — TB execution tried, measured +15%, reverted machinery (DONE, uncommitted)
 
 First real JIT attempt (strategy change is now implementation, not

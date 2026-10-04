@@ -1288,3 +1288,27 @@ dist/                 production bundle
   stop after CMD12 (level dies on W1C) — next dual trace must prove
   the resumed level collapses the CMD13 count. Smoke 25/25, fuzzer
   882/882.
+- M115 -- userspace corruption root-caused (UNCOMMITTED): three real
+  core bugs, all found by execution. (1) Every 64-bit-lane SIMD family
+  used `lmask = u128::MAX`, so lane 0 compared the full 128-bit
+  register and any hit wrote all 128 bits -- caught by a NEW permanent
+  differential rig (`test/simd-diff.mjs`) that diffs each assembled row
+  against an independent JS spec implementation, because the fuzzer
+  goldens were regenerated with those rows and only prove
+  self-consistency. (2) The M73 TLB tag folded VPN+generation with XOR,
+  which is NOT injective: a stale entry from an older generation can
+  match a new lookup whose VPN differs by `d ^ (d*PHI)` -- now two
+  separately-compared fields (raw VPN + generation). (3) The core had
+  NO PTE permission model at all: writes to read-only mappings never
+  faulted, so Linux never took its COW path and the guest wrote
+  straight into shared page-cache pages -- which put one physical page
+  at both busybox's .bss and glibc's freshly brk'd heap, and the heap
+  memset then cleared glibc's `ptmalloc_initialized`, re-running
+  `ptmalloc_init` and aborting with `malloc(): corrupted top size`.
+  With AP[2:1] enforced (`Fault::Permission`, EC 0x26/0x27, FSC 0x0D
+  = the branch that drives `do_wp_page`) the corruption and the
+  `Attempted to kill init!` panic are GONE: console 125 KB @7.1B ->
+  1.95 MB @20B insns and still booting. Next blocker is the sdhost
+  read path (`mmc0 ... err -110`), i.e. the M76/M77 open edge.
+  Smoke 25/25, fuzzer 1173/1173, simd-diff 309/309, Linux 20M pin
+  unchanged.
