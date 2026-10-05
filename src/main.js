@@ -184,6 +184,17 @@ const VIRTUAL_TIME = (() => {
   try { return new URLSearchParams(location.search).get('vt') === '1'; } catch (_) { return false; }
 })();
 const VIRTUAL_IPS = 262144;
+// M117 Linux-path clock rate. The bare-metal guests above keep the
+// tiny 262144 ips (their goldens depend on it: a 4096-slice is
+// exactly 15625 us). Linux needs the REAL Pi 3 rate: measured
+// timer period ~768160 ticks ~= 40 ms (HZ~25), and at 262144 ips
+// the arch timer was chronically overdue, so irq-bcm2836.c's
+// one-source-per-entry dispatch (ffs(stat)-1) let a permanently
+// asserted CNTP bit 1 starve the GPU/DMA bit 8 and the mmc -110
+// timeouts. 26214400 ips == 1 tick/instruction ~= the 19.2 MHz
+// CNTFRQ the kernel is told, i.e. one instruction ~= 50 ns. With
+// this the 7B-insn boot spans ~267 virtual seconds.
+const LINUX_IPS = 26214400;
 
 function setStatus(text) {
   status.textContent = text;
@@ -407,7 +418,7 @@ async function bootPiLinux() {
   const initrd = bytes.slice(KERN_END);
   pi = new PiEmu();
   pi.set_slice(SLICE_INSNS);
-  pi.set_vt_ips(VIRTUAL_IPS);
+  pi.set_vt_ips(LINUX_IPS);
   const entry = pi.load_linux(kernel, dtb, initrd);
   lastWall = performance.now();
   lastFault = null;

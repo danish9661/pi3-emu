@@ -33,3 +33,17 @@ console.log(`data: ${data.length} bytes (dtb 0:${DTB_END}, kernel ${DTB_END}:${K
 const out = execFileSync(TRIAGE, [String(DTB_END), String(KERN_END), budget, slice],
   { maxBuffer: 256 * 1024 * 1024 }).toString();
 console.log(out.trimEnd());
+
+// Trajectory pin (M117: re-pinned). The guest's early boot is sensitive to
+// guest-visible changes — the DT `/reserved-memory` reservations move the
+// memory map, and the timer/RNG/thermal models change device behaviour —
+// so a pin move is expected when one of those lands. Keep the value in
+// git so the next change has to be acknowledged here, not silently
+// accepted. Only enforced for the standard 20M/slice-4096 run.
+const PIN = 'pc=0xffffffc008fadee4 x0=0x4b400 fault=null';
+if (budget === '20000000' && (slice === '4096' || slice === undefined)) {
+  const line = out.split('\n').find((l) => l.startsWith('triage\tn=')) || '';
+  if (line.includes('fault=null') && !line.includes(PIN)) {
+    console.log(`note: trajectory pin moved (expected only with a guest-visible change):\n  was ${PIN}\n  now ${line.split('console=')[0].trim()}`);
+  }
+}

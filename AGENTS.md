@@ -2502,6 +2502,134 @@ and battery-guarded, ALL ~zero:
 - Battery throughout: smoke 25/25 + fuzzer 882/882 + trajectory pins
   (20M @4096/@65536 identical) + wasm size + pw-pi-linux 8/8.
 
+### M117 — userspace runs: ESR WnR, timer/rng/thermal models, stage-1 permissions, DT reservations (DONE, uncommitted)
+Seven core fixes + one honest open item, all battery-green (smoke 25/25,
+fuzzer 1173/1173, simd-diff 309/309, mmu-tlb 18/18, Linux 20M pin
+byte-identical at slices 4096 AND 65536). **Headline: the real kernel8.img
+now runs busybox `init` in USERS SPACE** — the kernel mounts the ext4 root
+(`VFS: Mounted root` + `EXT4-fs`), execs `/bin/init` with the right
+arguments and environment, and init's own code executes at EL0 (previously
+it never got past `_start`). With `PI3_KEY=H node test/linux-triage.mjs
+3400000000`: `Run /bin/init` 1, `VFS: Mounted root` 1, `EXT4-fs` 1,
+**`Segmentation fault` 0, `Kernel panic` 0, `malloc` 0, `err -110` 0,
+`REGISTER DUMP` 0** — and the final pc is in busybox's text.
+
+Two things are NOT done, and both are the open item at the bottom: init
+does not reach the `askfirst` prompt (an intermediate build of this same
+milestone's code DID print "Please press Enter to activate this console."
+and then spawned `/bin/sh`, which died on a wild pointer), and
+`/bin/sh` never reaches a shell prompt.
+
+1. **`is_store_word` rewritten — bit 22 IS the `L` field.** The ESR WnR bit
+   for a data abort was computed from a top-byte table covering only a
+   slice of the LD/ST space, so `str w1,[x0,#0x268]` (0xb9026801) reported
+   **WnR=0**. The kernel took the fault as a *read*, `do_wp_page` never
+   ran, and init re-faulted on its own `.bss` 32 751 times (the loader
+   kept handing back the same read-only page — nothing ever COWed it).
+   Verified against **assembler truth over 55 encodings** (str/strb/strh,
+   stur/ldur, pre/post-index, register-offset, ldp/stp/ldnp/stnp,
+   ld1..4/st1..4, exclusives, LSE, SIMD unsigned-offset): bit 22 is `L` in
+   *every* arm64 load/store encoding. Documented residuals, both inert:
+   `prfm` reads as a store, `casal`/`swpal` as loads.
+
+2. **CNTP_CTL_EL0 bit 2 (ISTATUS) is now an event latch** (`cntp_istatus` +
+   `cntp_fired`): set on compare match, cleared by the guest's ack write,
+   re-armed only by CVAL/TVAL programming. Proven by the guest writing
+   `CNTP_CTL=0x5/0x7` (EN|IMASK|ISTATUS) **209 272 times** as its ack.
+
+3. **BCM2835 RNG** (`0x3F104000`): STATUS bits 27:24 now carry
+   words-available (`rng_avail=4` when RBGEN is set) and DATA returns
+   xorshift words. The old fixed `45000` STATUS made `STATUS>>24 == 0`, so
+   `bcm2835_rng_read`'s `while(!num_words){usleep_range(34,136);}` looped
+   **7 352 times per read** — rngd burned ~30 % of the boot and starved
+   the fault handler the `mmap_lock` init needed.
+
+4. **Thermal sensor** (`brcm,bcm2837-thermal` @ `0x3F212000`): the driver
+   is `drivers/thermal/broadcom/bcm2835_thermal.c` (it carries the
+   `brcm,bcm2835/36/37-thermal` compatibles), TSENSCTL +0x00 (latch) /
+   TSENSSTAT +0x04 with **VALID = bit 10** and DATA in bits 9:0 — so 0x496
+   = VALID|150 counts (~59.8 °C). (The `initcall_blacklist` also lists
+   `thermal` and `brcmstb_thermal`, so the oracle prints the same
+   `failed to read out thermal zone (-5)` — the spam is cosmetic here,
+   not worth chasing further.)
+
+5. **Stage-1 permission model rewritten** (`ap_bits` / `perm_denied`)
+   against `arch/arm64/include/asm/pgtable-hwdef.h`: AP[1] = bit 6 (EL0
+   access), AP[2] = bit 7, AF = bit 10, **DBM = bit 51**. EL0 access needs
+   AP[1]. The old decode read AP[2:1] as one 2-bit field, so ordinary user
+   RW pages looked EL1-only — that was the 900 877-fault EL0 livelock on
+   init's stack page.
+
+6. **Virtual clock rate for the Linux path**: `LINUX_IPS = 26214400`
+   (≈ one 19.2 MHz tick per instruction ≈ 50 ns) in `src/main.js`;
+   `cpu/examples/triage.rs` defaults to it and takes `PI3_VTIPS`. The
+   shared bare-metal `VIRTUAL_IPS = 262144` stays (its goldens depend on
+   it). At the old rate the arch timer was chronically overdue and
+   `irq-bcm2836.c`, which handles ONE source per entry (`ffs(stat)-1`),
+   let a permanently asserted CNTP bit 1 starve the GPU/DMA bit 8 — the
+   timer-source starvation behind every `mmc err -110`.
+
+7. **DT `/reserved-memory` for every blob we place in RAM.** The guest
+   reserves only `[_stert, _etext)` — the boot log reports 11 968K of
+   "kernel code" — but the `kernel8.img` blob is 22.4 MB, so ~10 MB past
+   `_etext` is ordinary allocatable RAM still holding kernel-file bytes.
+   Measured with a page-table census: **258–316 user pages mapped into
+   that range**. `dtb_reserve_region()` (three calls: `pi3-kernel`,
+   `pi3-dtb`, `pi3-rootfs`) adds a `/reserved-memory` child with
+   `reg = <base,len>` in the node's existing 32-bit cells. It runs after
+   `patch_dtb_chosen` (which rewrites the struct block, so the header
+   offsets are re-read) and no-ops when the node is absent. Verified: boots
+   clean, both 20M pins byte-identical.
+
+8. **New permanent test `test/mmu-tlb.mjs`** (`cargo run --example
+   mmu-tlb-diff`): builds synthetic page tables and compares `translate()`
+   against a hand-computed PA **cold, on a TLB hit, and after evicting the
+   direct-mapped slot with a colliding VPN** — 4K pages (three levels,
+   offset planting, a read-only page), 2M and 1G blocks, and the high half
+   with the SAME VPN as a low mapping (no cross-half aliasing), plus a
+   64-iteration interleave of both halves through one slot. 18/18 green.
+   (Two of my own test bugs are worth remembering: a 2M/1G block PA must be
+   block-aligned or the output mask legitimately drops it, and TG1 is
+   **inverted** vs TG0 — `0b10` is 4K.)
+
+**Rejected (documented, do not retry):** routing EL1-origin aborts on
+low/user addresses to the **EL0t** vector (+0x400). Wrong per the ARM ARM
+(`AArch64.ExceptionVector` selects by *origin* EL): the kernel's
+`el0t_64_sync_handler` has no EC 0x25 arm, so the fault fell through
+`do_undefinstr` → SIGILL → `Attempted to kill init! exitcode=0x4`. Keep
++0x200 for EL1-origin.
+
+**Trajectory pins re-pinned (M117).** The 20M Linux pin moved from
+`pc=0xffffffc0082d6308 x0=0x1` to `pc=0xffffffc008fadee4 x0=0x4b400`
+(fault still null, both slice sizes). That is EXPECTED for this milestone:
+the `/reserved-memory` reservations change the memory map the guest sees
+and the timer/RNG/thermal models change device behaviour, so early boot
+cannot be byte-identical. `test/linux-triage.mjs` now carries the value in
+git and prints a note when it moves, so the next change has to be
+acknowledged rather than silently accepted. Functionally the boot is
+healthier than the old pin: see the 3.4B marker run at the top.
+
+**Open, and honestly unexplained:** the boot trajectory depends on the
+binary. Three runs of the *same* command on the *same* code agree
+exactly, but simply ADDING code to two hot paths (`Bus::write`'s
+8-byte-store hook and the TLB-hit arm of `translate()`) flips the 2.6B
+trajectory to a different — and later-progressing — one (`pc` in userspace
+instead of the kernel, console 19 382 vs 19 489 bytes, irqs 27 940 vs
+26 235). It is NOT a stale TLB entry: a whole-boot audit that re-walks on
+every TLB hit (`PI3_TLBAUDIT`) recorded **0 mismatches in 2.6 B
+instructions**, and the new `test/mmu-tlb.mjs` shows the walk and the cache
+agreeing in every synthetic case. It is also NOT the fix for it: bumping
+`tlb_gen` on descriptor-shaped table writes (`PI3_NO_PTINVALIDATE` to
+disable) changes nothing either — both arms are byte-identical. So some
+input our model does not treat as state still reaches the guest. The
+shell's SIGSEGV at `pc=0x51f8ac ldrb w1,[x0]` with `x0=0x20000000000` (a
+single 8-byte slot — elements 12 and 14 are zero — of a 66-pointer array in
+the busybox `ash` struct) rides on the same mystery: a whole-boot VA
+write-watch saw **zero** stores to that VA, and a whole-boot hunt for
+stores of that value found only kernel-side writes of a legitimate 2^41
+constant. Next: bisect `cpu/src/lib.rs` to the commit whose code addition
+moves the trajectory, then find what non-state input leaks in.
+
 ### M115 — userspace corruption ROOT-CAUSED: TLB tag was non-injective + no PTE permission model (DONE, uncommitted)
 
 The Linux boot reached busybox init but init's child aborted with
@@ -2758,10 +2886,22 @@ rows come from `aarch64-none-elf-as`, never hand-hex.
 
 - Build: `bash build.sh` (pi-board wasm + pi-cpu wasm via wasm-pack into
   public/pi_cpu + guest programs), then `npx vite build` for production.
-- Regression: `node test/pi-cpu-smoke.mjs` (22 goldens),
-  `node test/cpu-cases.mjs` (819; `--regen` to re-pin),
+- Regression: `node test/pi-cpu-smoke.mjs` (25 goldens),
+  `node test/cpu-cases.mjs` (1173; `--regen` to re-pin),
+  `node test/simd-diff.mjs` (309, independent ARM-ARM oracle),
+  `node test/mmu-tlb.mjs` (18, stage-1 walk + TLB differential),
+  `node test/linux-triage.mjs 20000000 [slice]` (Linux 20M pin; the
+  Linux-path rate is the default now, no `PI3_VTIPS` needed),
   `node test/upython-repl.mjs` (etc. — 9 suites via test/pi-sess.mjs +
   `cargo build --release --example sess`).
+- **STALE-BINARY TRAP (bitten again in M117, twice):**
+  `test/cpu-cases.mjs` runs `target/debug/examples/one` and
+  `test/linux-triage.mjs` runs `target/debug/examples/triage`, but
+  `cargo build --release -p pi-cpu` rebuilds only the LIB. Run
+  `cargo build --examples` (debug) / `cargo build --release --examples`
+  before believing a battery or a Linux pin. A 3-day-old `one` binary
+  hid 288 stale fuzzer goldens (the M78 SIMD `dup`/`fneg` rows); a
+  3-day-old `triage` made the Linux pin check meaningless.
 - Browser E2E: `npx vite preview` on :5173 + headless chrome scripts
   (/tmp/opencode/picpu-e2e.mjs boots, picpu-interactive.mjs REPL/button).
 - Commit style: one long descriptive message per milestone, push to

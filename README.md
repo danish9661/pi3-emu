@@ -1312,3 +1312,47 @@ dist/                 production bundle
   read path (`mmc0 ... err -110`), i.e. the M76/M77 open edge.
   Smoke 25/25, fuzzer 1173/1173, simd-diff 309/309, Linux 20M pin
   unchanged.
+- M117 — **userspace runs**: seven core fixes take the real `kernel8.img`
+  from "root mounted" to busybox `init` executing at EL0 — the kernel
+  mounts the ext4 root, execs `/bin/init` with the right arguments and
+  environment, and init's own code runs (previously it never got past
+  `_start`). With `PI3_KEY=H node test/linux-triage.mjs 3400000000`:
+  `VFS: Mounted root` 1, `EXT4-fs` 1, `Segmentation fault` 0,
+  `Kernel panic` 0, `malloc` 0, `err -110` 0, `REGISTER DUMP` 0, final pc
+  inside busybox. Not yet: init does not reach the `askfirst` prompt and
+  `/bin/sh` never gets a shell (an intermediate build of this milestone
+  printed "Please press Enter to activate this console." and then spawned
+  a shell that died on a wild pointer — see AGENTS.md M117). (1) The ESR `WnR` bit came from a top-byte table
+  covering only a slice of the LD/ST space, so `str w1,[x0,#0x268]`
+  reported a *read* fault and `do_wp_page` never ran -- init re-faulted
+  on its own `.bss` 32 751 times. Rewritten after checking **assembler
+  truth across 55 encodings**: bit 22 is the `L` (load) field in *every*
+  arm64 load/store encoding. (2) `CNTP_CTL_EL0` bit 2 (ISTATUS) is now an
+  event latch (the guest acks it 209 272 times per boot). (3) The BCM2835
+  RNG reports words-available in STATUS bits 27:24, which stops
+  `bcm2835_rng_read` from spinning 7 352 times per read and starving the
+  boot. (4) A `brcm,bcm2837-thermal` model (TSENSSTAT VALID = bit 10).
+  (5) The stage-1 permission decode was rewritten against Linux's
+  `pgtable-hwdef.h` (AP[1] = bit 6, AP[2] = bit 7, AF = bit 10,
+  **DBM = bit 51**); the old code read AP[2:1] as one field, so ordinary
+  user RW pages looked EL1-only and init's stack page livelocked with
+  900 877 EL0 faults. (6) The Linux path now runs at a realistic
+  `LINUX_IPS = 26214400` (one 19.2 MHz tick per instruction) instead of
+  the bare-metal guests' 262144 -- at the old rate the arch timer was
+  chronically overdue and `irq-bcm2836.c`'s one-source-per-entry dispatch
+  let CNTP starve the DMA line, which is what produced every
+  `mmc err -110`. (7) Every blob we place in RAM (kernel Image, DTB,
+  rootfs image) is now reserved in the device tree via
+  `/reserved-memory`, because the guest only reserves `[_stert, _etext)`
+  (11 968K of "kernel code") while the Image blob is 22.4 MB -- ~10 MB
+  past `_etext` was allocatable RAM still holding kernel-file bytes
+  (measured: 258-316 user pages mapped into it). Also new: a permanent
+  stage-1/TLB differential test (`node test/mmu-tlb.mjs`) that checks
+  `translate()` cold, on a TLB hit and after evicting the direct-mapped
+  slot, over 4K pages, 2M/1G blocks and both halves of a 39-bit VA space.
+  Battery: smoke 25/25, fuzzer 1173/1173, mmu-tlb 18/18, Linux 20M pin
+  byte-identical at slices 4096 and 65536. Open: `/bin/sh` does not reach
+  a prompt yet, and the boot's trajectory depends on the *binary* (adding
+  an inert branch to a hot path moves it) -- see AGENTS.md M117 for the
+  instruments (whole-boot TLB audit: 0 stale hits; VA write-watch; wild
+  value hunt) and the exact next step.

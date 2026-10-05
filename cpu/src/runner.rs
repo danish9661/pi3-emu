@@ -294,7 +294,12 @@ impl Runner {
                     let dp1 = bus.dma_pending1();
                     let sp2 = bus.sdh_pending2();
                     if dp1 != 0 || sp2 != 0 {
-                        eprintln!("DMADLV n={} pc=0x{:x} dma_p1=0x{:x} sdh_p2=0x{:x}", self.n, cpu.pc, dp1, sp2);
+                        let mask: u32 = (0..16usize).fold(0u32, |a, ch| if bus.dma_int_ch_pub(ch) { a | (1 << ch) } else { a });
+                        let emask: u32 = (0..16usize).fold(0u32, |a, ch| if bus.dma_end_ch_pub(ch) { a | (1 << ch) } else { a });
+                        let line = bus.legacy_line();
+                        eprintln!("DMADLV n={} pc=0x{:x} dma_p1=0x{:x} sdh_p2=0x{:x} intmask=0x{:x} endmask=0x{:x} en1=0x{:x} line={} masked={} el={}",
+                            self.n, cpu.pc, dp1, sp2, mask, emask,
+                            bus.ic_en1_pub(), line as u8, cpu.irq_masked(), cpu.cur_el);
                     }
                 }
                 if self.irq_pcs.len() < 8 {

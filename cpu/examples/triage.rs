@@ -22,6 +22,14 @@ fn esc(s: &[u8]) -> String {
     o
 }
 
+/// M117: the Linux path runs at the real Pi 3 instruction rate (one
+/// 19.2 MHz tick per instruction ~= 50 ns). Override with
+/// PI3_VTIPS=<n>; the bare-metal default used to be 262144, which
+/// left the arch timer chronically overdue.
+fn linux_ips() -> u64 {
+    std::env::var("PI3_VTIPS").ok().and_then(|v| v.parse().ok()).unwrap_or(26214400)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dtb_end: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(32753);
@@ -41,7 +49,12 @@ fn main() {
     let mut runner = Runner::new();
     runner.budget = budget;
     runner.slice = slice;
-    bus.vt_ips = 262144;
+    bus.vt_ips = linux_ips();
+    // PI3_KEY=<byte>: push that byte into the PL011 RX FIFO every 20 M
+    // instructions. busybox init's `askfirst` handler waits for a key
+    // before it runs `/bin/sh`, so without this the boot stops at the
+    // console prompt and the shell is never exercised.
+    let key = std::env::var("PI3_KEY").ok().map(|k| k.as_bytes()[0]);
     // PI3_SAMPLE_EVERY=N: print n/pc/x0/x30 every N insns (trajectory to
     // find where progress stops; default 0 = only the final line).
     let every: u64 = std::env::var("PI3_SAMPLE_EVERY")
@@ -49,7 +62,18 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     if every == 0 {
-        runner.run_to(&mut cpu, &mut bus, budget);
+        // With a key schedule the loop must stay chunked so the byte is
+        // pushed while init is actually waiting at the console.
+        if key.is_some() {
+            while runner.n < budget && runner.fault_string().is_none() {
+                if runner.n % 20_000_000 < 4096 {
+                    bus.uart0_push(key.unwrap());
+                }
+                runner.run_to(&mut cpu, &mut bus, (runner.n + 4096).min(budget));
+            }
+        } else {
+            runner.run_to(&mut cpu, &mut bus, budget);
+        }
     } else {
         let mut done = 0u64;
         while done < budget && runner.fault_string().is_none() {
@@ -68,6 +92,37 @@ fn main() {
         runner.n, cpu.pc, cpu.x[0],
         runner.fault_string().unwrap_or_else(|| "null".into()),
         esc(&bus.console));
+    // Milestone markers, so `test/linux-triage.mjs` doubles as the
+    // "how far does the boot get" check instead of needing a
+    // throwaway probe. Counts are over the whole console; the tail is
+    // the last few lines with the per-second noise filtered out.
+    {
+        let c = String::from_utf8_lossy(&bus.console);
+        println!("markers\tbytes={}", c.len());
+        for m in [
+            "Run /bin/init",
+            "VFS: Mounted root",
+            "EXT4-fs",
+            "Please press Enter",
+            "starting interactive shell",
+            "~ #",
+            "Segmentation fault",
+            "Kernel panic",
+            "malloc",
+            "err -110",
+            "REGISTER DUMP",
+        ] {
+            println!("marker\t{:<26} {}", m, c.matches(m).count());
+        }
+        let noise = |l: &str| l.contains("thermal_zone0") || l.contains("mmc1: Timeout");
+        let lines: Vec<&str> = c
+            .split(|ch| ch == '\n' || ch == '\r')
+            .filter(|l| !l.is_empty() && !noise(l))
+            .collect();
+        for l in lines.iter().skip(lines.len().saturating_sub(8)) {
+            println!("tail\t{}", &l[..l.len().min(120)]);
+        }
+    }
     // M57 post-MMU trace: re-run step-by-step from reset and dump the
     // last K insns before the fault (pc + raw word + ESR/TCR/TTBRs),
     // plus a page-walk of the faulting VA. PI3_TRACE=1 enables.
@@ -78,7 +133,7 @@ fn main() {
         let entry2 = load_linux(&mut bus2, kernel, dtb, initrd).expect("reload");
         let mut cpu2 = Cpu::new(entry2);
         cpu2.linux_reset(entry2, LINUX_DTB_PA, 0x1FFF_FFF0);
-        bus2.vt_ips = 262144;
+        bus2.vt_ips = linux_ips();
         let mut r2 = Runner::new();
         r2.budget = start;
         r2.slice = slice;

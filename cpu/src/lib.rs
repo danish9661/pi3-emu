@@ -41,6 +41,8 @@ pub const SD_BASE: u64 = 0x3f300000;
 // clock manager, I2S/PCM, BSC0, AUX mini-UARTs 2-5, DWC2 USB (SNPSID +
 // DONE only — no full OTG model).
 pub const RNG_BASE: u64 = 0x3f104000;
+/// M117: bcm2837-the (DT soc/thermal@7e212000, reg size 8).
+pub const THERMAL_BASE: u64 = 0x3f212000;
 pub const CLK_BASE: u64 = 0x3f100000;
 // M74c clock-manager extension (execution-proven 2026-09-19): the 7.6B
 // fault walks VA 0xffffffc0097bd100/200 -> PA 0x3f1021xx (same L3 page,
@@ -289,7 +291,6 @@ pub struct Bus {
     /// page-table walk (i.e. `tlb_ap[slot]` is meaningful for that VA).
     /// False after the MMU-off and device-window identity fast paths, so
     /// `perm_denied` can never consult a stale slot for an MMIO access.
-    perm_checked: bool,
     // ARM arch timer (CNTP + CNTV, 19.2 MHz like the Pi 3): the counter follows
     // the facade's float virtual-time replica exactly (virtualUs_f +=
     // (n/ips)*1e6 per chunk, cntpct = floor(us*19.2)) so compare matches
@@ -303,6 +304,26 @@ pub struct Bus {
     pub cntpct: u64,
     pub cntp_cval: u64,
     pub cntp_ctl: u32,
+    /// M117 CNTP_CTL_EL0 bit 2 = ISTATUS — a real status LATCH, not a
+    /// derived "counter >= cval" test. DDI0487: hardware sets it when
+    /// the (enabled) counter reaches CVAL; software CLEARS it by
+    /// writing 1 (Linux `ARCH_TIMER_CNTP_ISTATUS` = 1<<2, used by
+    /// arm_generic_timer's `write_sysreg(irq_acks, CNTP_CTL_EL0)`).
+    /// The old model derived it from `cntpct >= cval` and let the
+    /// store keep bit 2 INERT, so the source latched on after the
+    /// FIRST compare and never dropped. That starves the local
+    /// block's `ffs(stat)-1` dispatch (irq-bcm2836.c handles exactly
+    /// ONE source per entry, the LOWEST set bit): with bit 1 pinned
+    /// high, bit 8 (GPU: mailbox/DMA/sdhost) was never dispatched —
+    /// the guest read LOCAL+0x60=0x102 forever with zero IC-bank reads
+    /// and the DMA completion IRQ could never be acked (mmc -110).
+    pub cntp_istatus: bool,
+    /// M117: the current CVAL match already fired. ISTATUS is an EVENT
+    /// latch (hardware sets it on the counter/CVAL match), not a level:
+    /// after software clears it, it must NOT re-assert until CVAL is
+    /// reprogrammed (or the counter passes it again). Level-derivation
+    /// here made every ack a no-op and the source latched forever.
+    cntp_fired: bool,
     cntv_cval: u64,
     cntv_ctl: u32,
     vt_us_f: f64,
@@ -334,6 +355,19 @@ pub struct Bus {
     // CLK/I2S/I2C0 are zero windows (absorbing, like the
     // facade's untouched windows).
     rng_ctrl: u32,
+    /// TRIAGE: last MMIO-read address logged (dedupes the trace stream).
+    mio_last: u64,
+    /// M117 RNG word-count in the output FIFO + generator state. The
+    /// M30 stub returned a fixed 45000 for STATUS, so bits 27:24
+    /// (WORDS AVAILABLE) read 0 forever and bcm2835_rng_read's
+    /// `while (!num_words) { usleep_range(34,136); }` looped 7352x per
+    /// read — rngd then burned ~30% of the CPU and its hrtimer sleeps
+    /// starved the mmap_lock that init's page-fault handler needs
+    /// (init never got past `_start`'s `ldr x1,[sp]`).
+    rng_avail: u8,
+    rng_seed: u32,
+    /// M117 TSENSCTL latch (bcm2835_thermal writes CTRL/THOLD/RSTB).
+    therm_ctl: u32,
     uart25_back: [[u32; 64]; 4],
     uart25_enabled: [bool; 4],
     usb_done: bool,
@@ -456,6 +490,14 @@ pub struct Bus {
     pub wwatch_pa: u64,
     pub wwatch_len: u64,
     pub wwatch_hits: u64,
+    /// M117 TLB AUDIT (env `PI3_TLBAUDIT`, zero-cost off): on every
+    /// TLB hit, ALSO run the full walk and compare PA *and* permissions.
+    /// Any mismatch means we served a stale translation. A 2.6 B
+    /// instruction Linux boot recorded 0 — the walk and the cache agree
+    /// everywhere in practice, which is why `test/mmu-tlb.mjs` pins the
+    /// synthetic cases instead.
+    pub tlb_audit: bool,
+    pub tlb_audit_mismatch: u64,
     // Local-block per-core timer/mailbox control cells (M61 IRQ path):
     // LOCAL_TIMER_INT_CONTROL0 (+0x40, core 0): low 4 bits = per-core
     // arch-timer IRQ enables (bit1 = CNTPNSIRQ — the timer the kernel's
@@ -700,10 +742,11 @@ impl Bus {
             tlb_ap: [0b111; 256],
             tlb_gen: 0,
             cpu_el: 1,
-            perm_checked: false,
             cntpct: 0,
             cntp_cval: 0,
             cntp_ctl: 0,
+            cntp_istatus: false,
+            cntp_fired: false,
             cntv_cval: 0,
             cntv_ctl: 0,
             vt_us_f: 0.0,
@@ -718,6 +761,10 @@ impl Bus {
             uart1_enabled: false,
             uart1_line_start: true,
             rng_ctrl: 0,
+            mio_last: u64::MAX,
+            rng_avail: 0,
+            rng_seed: 0x2545_f491,
+            therm_ctl: 0,
             uart25_back: [[0; 64]; 4],
             uart25_enabled: [false; 4],
             usb_done: false,
@@ -766,6 +813,8 @@ impl Bus {
             wwatch_pa: 0,
             wwatch_len: 0,
             wwatch_hits: 0,
+            tlb_audit: std::env::var("PI3_TLBAUDIT").is_ok(),
+            tlb_audit_mismatch: 0,
             local_timer_ctl0: 0,
             local_mbox_ctl0: 0,
             local_gpu_routing: 0,
@@ -927,6 +976,7 @@ impl Bus {
 
     fn is_rng(addr: u64, size: u64) -> bool {
         Self::is_page(addr, size, RNG_BASE)
+            || Self::is_page(addr, size, THERMAL_BASE)
     }
 
     fn is_clk(addr: u64, size: u64) -> bool {
@@ -1172,54 +1222,63 @@ impl Bus {
         self.tlb_gen = self.tlb_gen.wrapping_add(1);
     }
 
-    pub fn translate(&mut self, va: u64) -> Result<u64, Fault> {
-        self.perm_checked = false;
+    /// Fully-permissive AP encoding (AF=1, AP[1]=1, AP[2]=1, DBM=1) for
+    /// the paths that do not consult a descriptor at all: MMU off and
+    /// the device windows.
+    const AP_OPEN: u8 = 0b1111;
+
+    /// Translate AND return the descriptor's permission bits, so a
+    /// caller can never pair a translation with a *different* access's
+    /// cached `tlb_ap` (M117: that shared state made the boot's
+    /// user-visible behaviour depend on which code paths ran, because
+    /// `perm_denied` re-derived its slot from the VA and read whatever
+    /// the last fill had left there).
+    pub fn translate_ap(&mut self, va: u64) -> Result<(u64, u8), Fault> {
         if (self.mmu_sctlr & 1) == 0 {
-            return Ok(va);
+            return Ok((va, Self::AP_OPEN));
         }
         if Self::is_device_win(va) {
-            return Ok(va);
+            return Ok((va, Self::AP_OPEN));
         }
-        // M73 TLB probe (hot path): index by VPN mod 256; the tag is
-        // the raw VPN and the generation is a SECOND field compared for
-        // equality (see the `tlb_tag` doc comment: the old folded-hash
-        // tag was non-injective and caused real cross-mapping writes on
-        // the Linux boot). Hit returns the cached PA page; the 12-bit
-        // page offset is re-planted per access (blocks share the entry:
-        // cached PA already contains the block base, offset plant is
-        // identical math).
-        // M74 CHEAP GEN: the old probe folded ttbr0/ttbr1/tcr/sctlr/
-        // loose into `gen` with two wrapping_muls per access — but
-        // tlb_gen ALREADY bumps on every regime MSR, so the tag only
-        // needs (vpn, hi, tlb_gen). REVERTED (measured 0.30s -> 0.42s
-        // under load, then 0.28-0.31s on re-run: machine was loaded
-        // at 5.4 (qemu-arm + rv32emu + chrome hogging CPUs) — the
-        // delta was noise, not the mul. Kept simple anyway: one mul
-        // is one mul).
         let hi = (va >> 55) & 1;
         let gen = self.tlb_gen;
         let vpn = va >> 12;
         let slot = (vpn & 255) as usize;
-        // M113-TRUE TAG: EXACT equality on both fields. VPN alone is
-        // injective for (va, half) — hi is bit 55 of va, i.e. bit 43 of
-        // vpn, so it is already inside the tag; the fold is kept only
-        // for readability. `u64::MAX` is the empty-slot sentinel and
-        // can never equal a real vpn (< 2^52).
         let tag = vpn ^ (hi << 56);
-        self.perm_checked = true;
         if self.tlb_tag[slot] == tag && self.tlb_tgen[slot] == gen {
-            return Ok((self.tlb_pa[slot] & !0xfff) | (va & 0xfff));
+            let hit = (self.tlb_pa[slot] & !0xfff) | (va & 0xfff);
+            let ap = self.tlb_ap[slot];
+            if self.tlb_audit {
+                match self.translate_walk(va, hi != 0) {
+                    Ok((wpa, wap)) if (wpa & !0xfff) == (self.tlb_pa[slot] & !0xfff) && wap == ap => {}
+                    other => {
+                        self.tlb_audit_mismatch += 1;
+                        if self.tlb_audit_mismatch < 30 {
+                            eprintln!(
+                                "TLBAUDIT va=0x{:x} cached=0x{:x}/{:b} walk={:?} el={}",
+                                va, hit, ap, other.map(|(p, a)| (p, a)), self.cpu_el
+                            );
+                        }
+                    }
+                }
+            }
+            return Ok((hit, ap));
         }
         let (pa, ap) = self.translate_walk(va, hi != 0)?;
         self.tlb_tag[slot] = tag;
         self.tlb_tgen[slot] = gen;
         self.tlb_pa[slot] = pa & !0xfff;
         self.tlb_ap[slot] = ap;
-        // BUG TRAP (bitten during M73 dev): the cached value MUST be
-        // the PAGE base (pa & !0xfff), NOT the full pa — the return
-        // plants (va & 0xfff). Caching full pa double-plants the
-        // offset on hits (pa | va_off with pa's own low bits set).
-        Ok(pa)
+        Ok((pa, ap))
+    }
+
+    /// PA-only translation for callers that do not apply the stage-1
+    /// permission check themselves (probes, `walk_dump`, MMIO helpers).
+    /// The data path uses `translate_ap` + `perm_denied` instead, so a
+    /// translation can never be paired with another access's cached
+    /// permission bits.
+    pub fn translate(&mut self, va: u64) -> Result<u64, Fault> {
+        self.translate_ap(va).map(|(pa, _)| pa)
     }
 
     /// M113-TRUE: does the cached descriptor deny this access?
@@ -1235,17 +1294,30 @@ impl Bus {
     /// (documented gap: the kernel sets AF on every PTE it installs, and
     /// adding AF faults would change every trajectory).
     #[inline]
-    fn perm_denied(&self, va: u64, is_write: bool) -> bool {
-        if self.cpu_el != 0 || !self.perm_checked {
+    fn perm_denied(&self, va: u64, is_write: bool, packed: u8) -> bool {
+        if self.cpu_el != 0 || packed == Self::AP_OPEN {
             return false;
         }
-        let slot = ((va >> 12) & 255) as usize;
-        let ap = (self.tlb_ap[slot] >> 1) & 3;
-        match ap {
-            0b11 => false,
-            0b10 => is_write,
-            _ => true, // 0b00 / 0b01: EL1-only
+        let af = packed & 1;
+        let ap1 = (packed >> 1) & 1; // EL0 access
+        let ap2 = (packed >> 2) & 1; // read-only
+        let dbm = (packed >> 3) & 1; // write (hardware dirty tracking)
+        // EL0 access needs AP[1]. Writability: with AF set the hardware
+        // dirty-tracking bits decide (DBM=1 -> writable, DBM=0 -> RO);
+        // with AF clear AP[2] decides. M117: the old decode read
+        // AP[2:1] as a 2-bit field, so Linux's normal user RW page
+        // (PTE_RDONLY|PTE_DBM both set, AP[1]=1) looked EL1-only —
+        // init's first stack load raised Permission 32k times and the
+        // page was never usable.
+        if ap1 == 0 {
+            return true;
         }
+        let writable = if af == 1 { dbm == 1 } else { ap2 == 0 };
+        if std::env::var("PI3_PERMTRACE").is_ok() {
+            eprintln!("PERMCHK va=0x{:x} wr={} el={} packed={} af={} ap1={} ap2={} dbm={}",
+                va, is_write as u8, self.cpu_el, packed, af, ap1, ap2, dbm);
+        }
+        is_write && !writable
     }
 
     /// Full table walk (M73: split out of translate() so the TLB probe
@@ -1470,7 +1542,26 @@ impl Bus {
     /// Pi 3 uses CNTP for the clocksource tick; CNTV's program must
     /// not re-assert the line after CNTP is done).
     pub fn cntp_line(&self) -> bool {
-        (self.cntp_ctl & 1) != 0 && (self.cntp_ctl & 2) == 0 && self.cntpct >= self.cntp_cval
+        (self.cntp_ctl & 1) != 0 && (self.cntp_ctl & 2) == 0 && self.cntp_istatus
+    }
+
+    /// M117: hardware sets ISTATUS when the ENABLED counter reaches
+    /// CVAL. Called wherever cntpct/cval/ctl change (sync_in after the
+    /// virtual-clock advance, and the three CNTP_MSRS arms) so the
+    /// latch is current for both the +0x60 read arm and chunk-boundary
+    /// delivery. Clear-on-write-1 lives in the CTL MSR arm.
+    fn update_cntp_istatus(&mut self) {
+        if (self.cntp_ctl & 1) != 0 && !self.cntp_fired && self.cntpct >= self.cntp_cval {
+            self.cntp_istatus = true;
+            self.cntp_fired = true;
+        }
+    }
+
+    /// M117: (re)programming CVAL re-arms the match event, so an
+    /// already-expired compare fires again (per DDI0487).
+    fn arm_cntp_match(&mut self) {
+        self.cntp_fired = false;
+        self.update_cntp_istatus();
     }
 
     /// Legacy-IC gated line (bank-0 MAILBOX bit 1 + bank-1 timer bits +
@@ -2619,6 +2710,16 @@ impl Bus {
     /// never surfaced. The correct fix is edge timing (deliver the
     /// BLOCK edge exactly once, synchronously with completion), not
     /// a sticky level. QEMU parity: pure latched bits.
+    /// DMATRACE triage: per-channel INT/END latch view (the driver acks
+    /// per channel; a stale INT on a channel nobody acks keeps IRQ 7
+    /// asserted forever).
+    pub fn dma_int_ch_pub(&self, ch: usize) -> bool {
+        self.dma_int_ch[ch]
+    }
+    pub fn dma_end_ch_pub(&self, ch: usize) -> bool {
+        self.dma_end_ch[ch]
+    }
+
     pub fn sdh_pending2(&self) -> u32 {
         if (self.sdh_status & (0x400 | 0x200 | 0x100)) != 0 && ((self.ic_en2 >> 24) & 1) != 0 {
             1 << 24
@@ -3009,6 +3110,7 @@ impl Bus {
         self.vt_us = self.vt_us.wrapping_add(us);
         self.vt_us_f += us as f64;
         self.cntpct = (self.vt_us_f * 19.2).floor() as u64;
+        self.update_cntp_istatus();
     }
 
     /// M67 ethernet harness: push a raw ethernet frame into the
@@ -3068,6 +3170,12 @@ impl Bus {
     /// bus alias, not a walk gap).
     pub fn mem_u32_dbg(&self, addr: u64) -> u32 {
         self.mem_u32(addr)
+    }
+
+    /// Read eight bytes at a PHYSICAL address without going through
+    /// translation (probes and the `mmu-tlb-diff` test).
+    pub fn mem_u64_dbg_pub(&self, pa: u64) -> u64 {
+        self.mem_u32(pa) as u64 | ((self.mem_u32(pa + 4) as u64) << 32)
     }
 
     fn mem_u32(&self, addr: u64) -> u32 {
@@ -3948,7 +4056,20 @@ impl Bus {
         0
     }
 
+    /// TRIAGE: raw backing peek (no dispatch) for MMIO read traces.
+    fn peek_dbg(&self, addr: u64) -> u64 {
+        self.mem_u32(addr) as u64
+    }
+
     pub fn read(&mut self, mut addr: u64, size: u64) -> Result<u64, Fault> {
+        if std::env::var("PI3_MMIOTRACE").is_ok()
+            && size == 4
+            && addr != self.mio_last
+            && !self.in_ram(addr, size)
+        {
+            self.mio_last = addr;
+            eprintln!("MMIORD n={} pa=0x{:x} v=0x{:x}", self.exc_n, addr, self.peek_dbg(addr));
+        }
         // M58 hot-path: skip translate() entirely when the MMU is off
         // (all goldens + the kernel's 47k-instruction head.S prologue).
         // With MMU on, the device-window test precedes the walk so MMIO
@@ -3972,8 +4093,9 @@ impl Bus {
             }
         } else {
             let va = addr;
-            addr = self.translate(addr)?;
-            if self.perm_denied(va, false) {
+            let (pa, ap) = self.translate_ap(va)?;
+            addr = pa;
+            if self.perm_denied(va, false, ap) {
                 return Err(Fault::Permission(va));
             }
             if self.in_ram(addr, size) {
@@ -4366,9 +4488,45 @@ impl Bus {
         if Self::is_rng(addr, size) {
             let v: u64 = match addr - RNG_BASE {
                 0x00 => self.rng_ctrl as u64,
-                0x04 => 45000,
+                // M117: low 24 bits keep the M30 facade's 45.0 C fixture
+                // (periphs pins 40000..50000 at this address); bits 27:24
+                // now carry the real WORDS AVAILABLE count the rpi
+                // bcm2835-rng driver reads.
+                0x04 => (45000u32 | ((self.rng_avail as u32) << 24)) as u64,
+                // DATA: one entropy word per read (xorshift32). The real
+                // generator refills the 4-word FIFO at ~1 word/us, far
+                // faster than any reader, so avail is restored after
+                // each pop instead of modelling the refill timing.
+                0x08 => {
+                    let mut x = self.rng_seed;
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    self.rng_seed = x;
+                    if self.rng_avail == 0 && (self.rng_ctrl & 1) != 0 {
+                        self.rng_avail = 4;
+                    }
+                    x as u64
+                }
                 _ => 0,
             };
+            return Ok(v & mask(size));
+        }
+        // M117 thermal sensor (bcm2837-the @ 0x3F212000, upstream
+        // bcm2835_thermal.c register map): TSENSCTL latch + TSENSSTAT
+        // with VALID (bit 10) set and a plausible ADC count. The M74c
+        // umbrella read this page as zero, so get_temp returned -EIO
+        // forever and the driver re-probed once a second, spamming
+        // printk (20% of the run).
+        if Self::is_page(addr, size, THERMAL_BASE) {
+            let v: u64 = match addr - THERMAL_BASE {
+                0x00 => self.therm_ctl as u64,
+                0x04 => 0x496, // VALID | 150 ADC counts (~59.8 C)
+                _ => 0,
+            };
+            if std::env::var("PI3_THERMTRACE").is_ok() {
+                eprintln!("THERMRD n={} pa=0x{:x} off=0x{:x} val=0x{:x}", self.exc_n, addr, addr - THERMAL_BASE, v & mask(size));
+            }
             return Ok(v & mask(size));
         }
         if Self::is_clk(addr, size) || Self::is_i2s(addr, size) || Self::is_i2c0(addr, size) {
@@ -4464,6 +4622,14 @@ impl Bus {
                     self.dma_back.get((o / 4) as usize).copied().unwrap_or(0)
                 };
                 w |= (((cell >> (8 * (o % 4))) & 0xff) as u64) << (8 * i);
+            }
+            if self.dma_trace
+                && std::env::var("DMATRACE").is_ok()
+                && addr < DMA_ENABLE_PAGE
+                && (addr - base) % 0x100 <= 0x04 + size
+            {
+                let off = addr - base;
+                eprintln!("DMATRRD ch={} off=0x{:x} val=0x{:x}", off / 0x100, off % 0x100, w & mask(size));
             }
             return Ok(w & mask(size));
         }
@@ -4743,8 +4909,9 @@ impl Bus {
             }
         } else {
             let va = addr;
-            addr = self.translate(addr)?;
-            if self.perm_denied(va, true) {
+            let (pa, ap) = self.translate_ap(va)?;
+            addr = pa;
+            if self.perm_denied(va, true, ap) {
                 return Err(Fault::Permission(va));
             }
             if self.in_ram(addr, size) {
@@ -5256,6 +5423,18 @@ impl Bus {
         if Self::is_rng(addr, size) {
             if addr - RNG_BASE == 0x00 {
                 self.rng_ctrl = (val & mask(size)) as u32;
+                // RBGEN (bit 0) starts the generator -> FIFO fills.
+                if (self.rng_ctrl & 1) != 0 {
+                    self.rng_avail = 4;
+                } else {
+                    self.rng_avail = 0;
+                }
+            }
+            return Ok(());
+        }
+        if Self::is_page(addr, size, THERMAL_BASE) {
+            if addr - THERMAL_BASE == 0x00 {
+                self.therm_ctl = (val & mask(size)) as u32;
             }
             return Ok(());
         }
@@ -5984,6 +6163,7 @@ impl Bus {
             self.vt_us_f += (chunk_insns as f64 / self.vt_ips as f64) * 1e6;
             self.cntpct = (self.vt_us_f * 19.2).floor() as u64;
         }
+        self.update_cntp_istatus();
     }
 
     pub fn fetch(&mut self, pc: u64) -> Result<u32, Fault> {
@@ -6065,6 +6245,9 @@ pub struct Cpu {
     /// M57 thread registers: SP_EL0 + TPIDR_EL1 (per-CPU current).
     /// Backed u64s, zero at reset; MRS/MSR wired in the system arm.
     pub sp_el0: u64,
+    /// TRIAGE: fault-address watch + remaining handler-trace budget.
+    pub hwatch: u64,
+    pub htrace: u32,
     pub tpidr_el1: u64,
     /// M101 EL0 thread registers: TPIDRRO_EL0 + TPIDR_EL0 (the EL0t
     /// trampoline's x30 spill slot + EL0 thread ID). Same backing
@@ -6115,7 +6298,7 @@ pub struct Cpu {
 
 impl Cpu {
     pub fn new(entry: u64) -> Self {
-        Cpu { x: [0; 31], sp: 0, pc: entry, q: [0; 32], vbar_el1: 0, daif: 0xf, elr_el1: 0, spsr_el1: 0, spsr_el2: 0, elr_el2: 0, sp_el1: 0, cur_el: 2, spsr_el2_msrd: false, esr_el1: 0, far_el1: 0, abort_pending: false, sp_el0: 0, tpidr_el1: 0, tpidrro_el0: 0, tpidr_el0: 0, excl_addr: 0, excl_val: 0, excl_size: 0, excl_valid: false, n: false, z: false, c: false, v: false, fpsr_cum: 0 }
+        Cpu { x: [0; 31], sp: 0, pc: entry, q: [0; 32], vbar_el1: 0, daif: 0xf, elr_el1: 0, spsr_el1: 0, spsr_el2: 0, elr_el2: 0, sp_el1: 0, cur_el: 2, spsr_el2_msrd: false, esr_el1: 0, far_el1: 0, abort_pending: false, sp_el0: 0, tpidr_el1: 0, tpidrro_el0: 0, tpidr_el0: 0, hwatch: 0, htrace: 0, excl_addr: 0, excl_val: 0, excl_size: 0, excl_valid: false, n: false, z: false, c: false, v: false, fpsr_cum: 0 }
     }
 
     /// M56 Linux-track reset: ARM64 boot protocol regs (x0=DTB PA,
@@ -6712,14 +6895,25 @@ impl Cpu {
     /// write — report WnR=1 (a failed RMW looks like a store fault;
     /// nothing live reads the WnR bit for atomics, only EC/DFSC).
     /// SIMD/FP stores (0x1C/0x5C/0x9C/0xDC...) are plain stores too.
+    /// Is a faulting data access a STORE (ESR WnR)?
+    ///
+    /// M117: bit 22 is the `L` (load) field in EVERY arm64 load/store
+    /// encoding — verified against assembler truth over 55 encodings
+    /// (str/strb/strh, stur/ldur, pre/post-index, register-offset,
+    /// ldp/stp/ldnp/stnp, ld1..4/st1..4, exclusives, LSE, and the SIMD
+    /// unsigned-offset forms). The old table keyed on the top byte and
+    /// covered only a slice of the space, so `str w1,[x0,#0x268]`
+    /// (0xb9026801) reported WnR=0: the kernel took the fault as a READ,
+    /// `do_wp_page` never ran, and init re-faulted on its own .bss
+    /// 32k times. Known residuals (harmless, documented rather than
+    /// special-cased): PRFM reads as a store (an unnecessary COW at
+    /// worst) and the acquire/release LSE forms CASAL/SWPAL read as
+    /// loads (they never fault on aligned mapped memory). Only called on
+    /// an instruction that actually faulted a data access, so no LD/ST
+    /// class gate is needed.
+    #[inline]
     fn is_store_word(w: u32) -> bool {
-        let top = (w >> 24) & 0xff;
-        match top {
-            0xF8 | 0xF9 | 0xE8 | 0xE9 => ((w >> 22) & 1) == 0,
-            0x88 | 0xC8 | 0xB8 | 0xF8 => true,
-            0x1C | 0x5C | 0x9C | 0xDC => ((w >> 22) & 1) == 0,
-            _ => false,
-        }
+        (w >> 22) & 1 == 0
     }
 
     /// Set NZCV directly (single-step differential harness only).
@@ -6752,6 +6946,16 @@ impl Cpu {
 
     pub fn step(&mut self, bus: &mut Bus) -> Result<(), Fault> {
         let pc = self.pc;
+        // TRIAGE (PI3_EL0TRACE): trace every EL0 (userspace) pc.
+        if std::env::var("PI3_EL0TRACE").is_ok() && self.cur_el == 0 {
+            eprintln!("EL0 n={} pc=0x{:x} x0=0x{:x} x1=0x{:x} x2=0x{:x}", bus.exc_n, pc, self.x[0], self.x[1], self.x[2]);
+        }
+        // TRIAGE (PI3_HANDLERTRACE): trace the N instructions after a
+        // delivered data abort so the fault handler's path is visible.
+        if self.htrace > 0 {
+            eprintln!("HT pc=0x{:x} el={} sp=0x{:x} x0=0x{:x} x1=0x{:x} x2=0x{:x}", pc, self.cur_el, self.sp, self.x[0], self.x[1], self.x[2]);
+            self.htrace -= 1;
+        }
         // M113-TRUE: publish the exception level so Bus::read/write can
         // apply the EL0-only half of the descriptor AP rules.
         bus.cpu_el = self.cur_el as u8;
@@ -6899,7 +7103,52 @@ impl Cpu {
                 // +0x400 with EC 0x24 DABT_LOW (the kernel's
                 // el0t_64_sync_handler path); EL1 keeps +0x200/EC 0x25.
                 let el0_origin = self.cur_el == 0;
+                let kind = match r {
+                    Err(Fault::Translation(_)) => "TRANSLATION",
+                    Err(Fault::Permission(_)) => "PERMISSION",
+                    Err(Fault::UnmappedData(_)) => "UNMAPPED",
+                    _ => "OTHER",
+                };
+                if std::env::var("PI3_FAULTKIND").is_ok() {
+                    let slot = ((a >> 12) & 255) as usize;
+                    let hi = ((a >> 55) & 1) != 0;
+                    let w = bus.translate_walk(a, hi);
+                    // For a wild EL0 pointer, also dump the slot that
+                    // held it: x22 is the cursor register of busybox
+                    // ash's signal-table scan (pc 0x51f8ac), so x22
+                    // points at the offending entry.
+                    let slotinfo = if el0_origin && a > 0x0010_0000_0000 {
+                        match bus.translate(self.x[22] & !7) {
+                            Ok(sp) => format!(
+                                " x22=0x{:x} slotpa=0x{:x} w0=0x{:016x} w1=0x{:016x}",
+                                self.x[22],
+                                sp,
+                                bus.mem_u64_dbg_pub(sp),
+                                bus.mem_u64_dbg_pub(sp + 8)
+                            ),
+                            Err(_) => String::new(),
+                        }
+                    } else {
+                        String::new()
+                    };
+                    eprintln!("FAULTKIND {} va=0x{:x} el0={} cpu_el={} tlb_ap={} walk={:?} in_ram={}{}\n{}",
+                        kind, a, el0_origin as u8, bus.cpu_el,
+                        bus.tlb_ap[slot],
+                        w.as_ref().map(|(pa, ap)| (*pa, *ap)),
+                        w.as_ref().map(|(pa, _)| bus.in_ram(*pa, 8)).unwrap_or(false),
+                        slotinfo,
+                        bus.walk_dump(a));
+                }
                 let ec = if el0_origin { 0x24 } else { 0x25 };
+                // VECTOR by ORIGIN EL (ARM ARM AArch64.ExceptionVector:
+                // Current-EL vectors for EL1-origin, Lower-EL for EL0-origin).
+                // Tried address-class routing here (an EL1 abort on a
+                // low/user address -> EL0t) and it is WRONG: the kernel's
+                // el0t_64_sync_handler has no EC 0x25 arm, so it falls
+                // through to do_undefinstr -> SIGILL -> "Attempted to kill
+                // init! exitcode=0x4" (reproduced 2026-10-04). Kernel
+                // accesses to user pages are fixed up by do_mem_abort,
+                // reached via el1_sync — keep +0x200 for EL1-origin.
                 let vec_off = if el0_origin { 0x400 } else { 0x200 };
                 let wnr = if Self::is_store_word(w) { 1 } else { 0 };
                 self.esr_el1 = (ec << 26) | (wnr << 6) | 0x04;
@@ -6911,7 +7160,11 @@ impl Cpu {
                 self.pc = vbar + vec_off;
                 self.cur_el = 1;
                 if std::env::var("PI3_EXCTRACE").is_ok() {
-                    eprintln!("EXC n={} DATA ec=0x{:x} el0={} elr=0x{:x} far=0x{:x} vec=+0x{:x} sp=0x{:x} sp_el0=0x{:x}", bus.exc_n, if el0_origin { 0x24 } else { 0x25 }, el0_origin as u8, pc, a, vec_off, self.sp, self.sp_el0);
+                    eprintln!("EXC n={} DATA ec=0x{:x} el0={} elr=0x{:x} far=0x{:x} vec=+0x{:x} sp=0x{:x} sp_el0=0x{:x} esr=0x{:x} wnR={}", bus.exc_n, if el0_origin { 0x24 } else { 0x25 }, el0_origin as u8, pc, a, vec_off, self.sp, self.sp_el0, self.esr_el1, if Self::is_store_word(w) {1} else {0});
+                }
+                if std::env::var("PI3_HANDLERTRACE").is_ok() && a == self.hwatch {
+                    self.htrace = 40000;
+                    self.hwatch = 0; // one-shot
                 }
                 // M93c DELIVERY SIGNAL (not Ok): the abort was delivered
                 // to the guest vector, but the harness must NOT mistake
@@ -6976,8 +7229,20 @@ impl Cpu {
 /// Packed descriptor permission bits for the TLB: bit2..1 = AP[2:1],
 /// bit0 = AF (arm64 stage-1 descriptor bits 7:6 and 10).
 #[inline]
+/// Stage-1 page/block descriptor attribute extraction (Linux
+/// `arch/arm64/include/asm/pgtable-hwdef.h`, bit-exact):
+///   bit  6  PTE_USER  = AP[1] — EL0 may access at all
+///   bit  7  PTE_RDONLY= AP[2] — read-only unless AF/DBM say otherwise
+///   bit 10  PTE_AF          — access flag
+///   bit 51  PTE_DBM         — dirty bit management = the WRITE bit
+///                              (`PTE_WRITE == PTE_DBM`, and Linux's
+///                               PAGE_SHARED sets BOTH bit 7 and 51)
+/// Packed as: bit0 AF, bit1 AP[1], bit2 AP[2], bit3 DBM.
 fn ap_bits(d: u64) -> u8 {
-    ((((d >> 6) & 3) as u8) << 1) | ((d >> 10) & 1) as u8
+    ((((d >> 51) & 1) as u8) << 3)
+        | ((((d >> 7) & 1) as u8) << 2)
+        | ((((d >> 6) & 1) as u8) << 1)
+        | ((d >> 10) & 1) as u8
 }
 
 fn bits(w: u32, hi: u32, lo: u32) -> u32 {
@@ -7692,7 +7957,14 @@ impl Cpu {
                 }
             };
             if is_load {
-                let v = bus.read(addr, nbytes).map_err(|_| Fault::UnmappedData(addr))?;
+                let v = bus.read(addr, nbytes).map_err(|e| {
+                    if std::env::var("PI3_FAULTKIND").is_ok() {
+                        eprintln!("LOADFAIL pc=0x{:x} arg=0x{:x} size={} err={:?} in_ram_arg={} tlbhit={}",
+                            _pc, addr, nbytes, e, bus.in_ram(addr, nbytes) as u8,
+                            (bus.tlb_tag[((addr >> 12) & 255) as usize] == ((addr >> 12) ^ (((addr >> 55) & 1) << 56))) as u8);
+                    }
+                    Fault::UnmappedData(addr)
+                })?;
                 let v = if sext_to != 0 { sext(v, (nbytes * 8) as u32) } else { v };
                 // Signed-to-32 results zero-extend into the 64-bit reg;
                 // anything else follows the access size (w() masks).
@@ -8035,6 +8307,10 @@ impl Cpu {
                 let el0_origin = self.cur_el == 0;
                 let vec_off = if el0_origin { 0x400 } else { 0x200 };
                 self.esr_el1 = (0x15 << 26) | imm;
+                if std::env::var("PI3_SVCTRACE").is_ok() {
+                    eprintln!("SVC n={} pc=0x{:x} nr={} a0=0x{:x} a1=0x{:x} a2=0x{:x} a3=0x{:x} sp_el0=0x{:x}",
+                        bus.exc_n, pc, self.x[8], self.x[0], self.x[1], self.x[2], self.x[3], self.sp_el0);
+                }
                 // M78 SVC-ELR (init-proven 12B: busybox init's brk at
                 // 0x452f88 re-executed forever — ERET landed back ON the
                 // svc, 40 identical brk(0x24a9000) in 1M insns, zero EL0
@@ -8400,6 +8676,7 @@ impl Cpu {
                     if op2 == 0 {
                         // TVAL: CVAL = counter + value (32-bit offset).
                         bus.cntp_cval = bus.cntpct.wrapping_add(v & 0xffff_ffff);
+                        bus.arm_cntp_match();
                         if std::env::var("PI3_TIMERTRACE").is_ok() {
                             eprintln!("TMRMSR CNTP_TVAL=0x{:x} cval=0x{:x} cntpct=0x{:x}", v & 0xffff_ffff, bus.cntp_cval, bus.cntpct);
                         }
@@ -8416,12 +8693,25 @@ impl Cpu {
                         // timer-trace: the guest writes CTL=0x3 at the
                         // IMASK site (frame5 92dd90 orr #2) but the old
                         // mask stored 0x1.
-                        bus.cntp_ctl = (v & 0x7) as u32;
+                        // M117: bits[1:0] are R/W (EN|IMASK); bit 2 is
+                        // the read-only ISTATUS, cleared by writing 1
+                        // (the guest's ack path writes 0x5 / 0x7 —
+                        // 209272 times, execution-proven). The old
+                        // `(v & 0x7)` store left bit 2 inert, so the
+                        // source latched on after the first compare and
+                        // the local-block ffs dispatch never reached the
+                        // GPU (bit 8) line.
+                        bus.cntp_ctl = (v & 0x3) as u32;
+                        if (v & 0x4) != 0 {
+                            bus.cntp_istatus = false;
+                        }
+                        bus.update_cntp_istatus();
                         if std::env::var("PI3_TIMERTRACE").is_ok() {
-                            eprintln!("TMRMSR CNTP_CTL=0x{:x}", v & 0x7);
+                            eprintln!("TMRMSR CNTP_CTL=0x{:x} istatus={} pc=0x{:x}", v & 0x7, bus.cntp_istatus as u8, self.pc);
                         }
                     } else if op2 == 2 {
                         bus.cntp_cval = v;
+                        bus.arm_cntp_match();
                         if std::env::var("PI3_TIMERTRACE").is_ok() {
                             eprintln!("TMRMSR CNTP_CVAL=0x{:x} cntpct=0x{:x}", v, bus.cntpct);
                         }
@@ -8433,8 +8723,12 @@ impl Cpu {
                     // computed live. Old code computed ENABLE|ISTATUS
                     // only, so a guest-set IMASK read back clear.
                     let mut c = bus.cntp_ctl & 0x3;
-                    if bus.cntpct >= bus.cntp_cval {
+                    if bus.cntp_istatus {
                         c |= 1 << 2;
+                    }
+                    if std::env::var("PI3_TIMERTRACE").is_ok() {
+                        eprintln!("TMRMRS CNTP_CTL=0x{:x} stored=0x{:x} fired={} cval=0x{:x} cntpct=0x{:x} pc=0x{:x}",
+                            c, bus.cntp_ctl, bus.cntp_fired as u8, bus.cntp_cval, bus.cntpct, self.pc);
                     }
                     self.w(rd, c as u64, true);
                 }
@@ -11342,9 +11636,33 @@ pub fn load_linux(
     // left stale TLB hits across images.)
     bus.tlb_gen = bus.tlb_gen.wrapping_add(1);
     load_raw(bus, LINUX_KERNEL_PA, kernel, "kernel")?;
+    // TRIAGE (M117): the guest reserves only [_stert, _etext) — the boot
+    // log reports 11968K of "kernel code" — but the blob we load is
+    // 22.4 MB, so the tail past _etext is ordinary allocatable RAM that
+    // still holds kernel-file bytes. Those bytes then surface inside
+    // userspace pages (proved: 258 user pages mapped into the blob, and a
+    // heap slot carried 0x20000000000 with ZERO writes to that VA all
+    // run). PI3_KTAIL=<hex offset from the load address> zeroes the tail
+    // to test the hypothesis; the real fix is a /reserved-memory node.
+    if let Ok(v) = std::env::var("PI3_KTAIL") {
+        let off = u64::from_str_radix(&v, 16).unwrap_or(0);
+        let from = (LINUX_KERNEL_PA + off) as usize;
+        let to = (LINUX_KERNEL_PA + kernel.len() as u64) as usize;
+        if off > 0 && to <= bus.mem.len() && from < to {
+            for b in bus.mem[from..to].iter_mut() {
+                *b = 0;
+            }
+        }
+    }
     load_raw(bus, LINUX_DTB_PA, dtb, "dtb")?;
     load_raw(bus, LINUX_INITRD_PA, initrd, "initrd")?;
     patch_dtb_chosen(bus, initrd.len() as u64);
+    // Every blob we place in RAM must be reserved: the guest would
+    // otherwise hand those physical pages to userspace while they still
+    // hold our file bytes (M117).
+    dtb_reserve_region(bus, LINUX_KERNEL_PA as usize, kernel.len() as u64, "pi3-kernel");
+    dtb_reserve_region(bus, LINUX_DTB_PA as usize, dtb.len() as u64, "pi3-dtb");
+    dtb_reserve_region(bus, LINUX_INITRD_PA as usize, initrd.len() as u64, "pi3-rootfs");
     // SD backing for the Linux rootfs (M60 rootfs slice): the .data
     // initrd region is the qemu-oracle ext2 SD image (magic-proven at
     // +1080: 0x53EF), booted by the oracle via -drive if=sd with
@@ -11740,6 +12058,148 @@ fn patch_dtb_chosen(bus: &mut Bus, initrd_len: u64) {
     if base + new_totalsize > bus.mem.len() {
         return;
     }
+    bus.mem[base..base + new_totalsize].copy_from_slice(&out[..new_totalsize]);
+}
+
+/// M117: reserve the loaded kernel Image in the device tree.
+///
+/// The guest reserves only `[_stert, _etext)` — the boot log reports
+/// 11 968K of "kernel code" — but the `kernel8.img` blob we load is
+/// 22.4 MB, so ~10 MB past `_etext` is ordinary allocatable RAM that
+/// still holds kernel-file bytes. Execution proved both halves of the
+/// damage: 258 user pages mapped into that range (`BLOBCENSUS`), and a
+/// busybox heap slot at VA `0x1b62a678` read `0x20000000000` while a
+/// whole-boot VA write-watch recorded **zero** stores to it — the bytes
+/// were never written there, they were still the file's. The shell then
+/// dereferenced the wild pointer and died with SIGSEGV.
+///
+/// A DT `/reserved-memory` child is exactly how firmware describes
+/// "this RAM is not available", so the guest stops handing it out. The
+/// existing node already declares `#address-cells=1`, `#size-cells=1`,
+/// so `reg` is two 32-bit cells. Runs AFTER `patch_dtb_chosen` (which
+/// rewrites the struct block, so the header offsets must be re-read)
+/// and is a no-op if the node is absent.
+fn dtb_reserve_region(bus: &mut Bus, base: usize, len: u64, name: &str) {
+    const HDR: usize = 40;
+    if bus.mem.len() < base + HDR || be32(&bus.mem, base) != 0xd00dfeed {
+        return;
+    }
+    let off_struct = be32(&bus.mem, base + 8) as usize;
+    let off_strings = be32(&bus.mem, base + 12) as usize;
+    let size_strings = be32(&bus.mem, base + 32) as usize;
+    let size_struct = be32(&bus.mem, base + 36) as usize;
+    let sb = base + off_struct;
+    let se = sb + size_struct;
+    if se > bus.mem.len() || base + off_strings + size_strings > bus.mem.len() {
+        return;
+    }
+    // Locate the END_NODE token that closes the depth-1 node named
+    // "reserved-memory" (node names are inline; only PROPERTY names use
+    // string offsets).
+    let mut o = sb;
+    let mut depth = 0usize;
+    let mut insert_at = None;
+    while o + 4 <= se {
+        let t = be32(&bus.mem, o);
+        if t == 1 {
+            let mut i = o + 4;
+            while bus.mem[i] != 0 {
+                i += 1;
+            }
+            let name = &bus.mem[o + 4..i];
+            if depth == 1 && name == b"reserved-memory" {
+                // The NEXT token at this level is its END_NODE.
+                let mut j = i + 1;
+                j += (4 - ((j - sb) % 4)) % 4;
+                insert_at = Some(j);
+            }
+            depth += 1;
+            o = i + 1;
+            o += (4 - ((o - sb) % 4)) % 4;
+        } else if t == 2 {
+            depth -= 1;
+            o += 4;
+        } else if t == 3 {
+            let len = be32(&bus.mem, o + 4) as usize;
+            let hdr = 12 + len;
+            o += hdr + ((4 - (hdr % 4)) % 4);
+        } else if t == 4 {
+            o += 4;
+        } else {
+            break;
+        }
+    }
+    let insert_at = match insert_at {
+        Some(v) => v,
+        None => return, // no /reserved-memory in this DTB
+    };
+    // Reuse the existing "reg" string offset; add the node name.
+    let sstart = base + off_strings;
+    let sbytes = &bus.mem[sstart..sstart + size_strings];
+    let mut reg_off = None;
+    let mut k = 0usize;
+    while k < sbytes.len() {
+        if sbytes[k..].starts_with(b"reg\0") {
+            reg_off = Some(k);
+            break;
+        }
+        k += 1;
+    }
+    let reg_off = match reg_off {
+        Some(v) => v,
+        None => return,
+    };
+    let name_off = size_strings;
+    let mut sbytes2: Vec<u8> = sbytes.to_vec();
+    sbytes2.extend_from_slice(name.as_bytes());
+    sbytes2.push(0);
+    while sbytes2.len() % 4 != 0 {
+        sbytes2.push(0);
+    }
+    // Tokens: BEGIN_NODE <name>, PROP reg=<base,len>, END_NODE.
+    let mut myprop: Vec<u8> = Vec::new();
+    put32(&mut myprop, 1); // FDT_BEGIN_NODE
+    myprop.extend_from_slice(name.as_bytes());
+    myprop.push(0);
+    while myprop.len() % 4 != 0 {
+        myprop.push(0);
+    }
+    let mut regval: Vec<u8> = Vec::new();
+    put32(&mut regval, base as u32);
+    put32(&mut regval, len as u32);
+    put32(&mut myprop, 3); // FDT_PROP
+    put32(&mut myprop, regval.len() as u32);
+    put32(&mut myprop, reg_off as u32);
+    myprop.extend_from_slice(&regval);
+    while myprop.len() % 4 != 0 {
+        myprop.push(0);
+    }
+    put32(&mut myprop, 2); // FDT_END_NODE
+
+    let new_size_struct = size_struct + myprop.len();
+    let new_off_strings = off_strings + myprop.len();
+    let new_size_strings = sbytes2.len();
+    let mut new_totalsize = new_off_strings + new_size_strings;
+    new_totalsize = (new_totalsize + 7) & !7; // FDT_ALIGN
+    if base + new_totalsize > bus.mem.len() {
+        return;
+    }
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(&bus.mem[base..insert_at]);
+    out.extend_from_slice(&myprop);
+    out.extend_from_slice(&bus.mem[insert_at..sstart]);
+    out.extend_from_slice(&sbytes2);
+    out.resize(new_totalsize, 0);
+    let mut hdr = |o: usize, v: u32| {
+        out[o] = (v >> 24) as u8;
+        out[o + 1] = (v >> 16) as u8;
+        out[o + 2] = (v >> 8) as u8;
+        out[o + 3] = v as u8;
+    };
+    hdr(4, new_totalsize as u32);
+    hdr(12, new_off_strings as u32);
+    hdr(32, new_size_strings as u32);
+    hdr(36, new_size_struct as u32);
     bus.mem[base..base + new_totalsize].copy_from_slice(&out[..new_totalsize]);
 }
 
