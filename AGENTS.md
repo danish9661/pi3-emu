@@ -2630,6 +2630,45 @@ stores of that value found only kernel-side writes of a legitimate 2^41
 constant. Next: bisect `cpu/src/lib.rs` to the commit whose code addition
 moves the trajectory, then find what non-state input leaks in.
 
+### M118 — env-flag speedup (3.9x native) + the honest JIT verdict (DONE, committed)
+
+User request: "change strategy to jit so all demos run faster." Measured
+first, acted on the evidence.
+
+**The 10x bug, found by profiling, not by JIT.** The Linux path was at 6.6
+MIPS native, and the sampling profile was dominated by
+`Cpu::step -> std::env::_var -> getenv` — the `PI3_EL0TRACE` check was
+evaluating `std::env::var` on EVERY instruction. Fixed with the `flag()`
+helper: every env-gated trace flag is read ONCE into a `OnceLock<u64>`
+bitmask (`flags()` builds it on first use; each `flag()` call is one
+atomic load + a mask test, constant-folded for literal names). Result:
+**native 6.6 -> 26 MIPS (3.9x), wasm -> 24.3 MIPS** — a bigger, real
+speedup than any TB/JIT could deliver at this stage. Battery green
+(smoke 25/25, fuzzer 1173/1173, simd-diff 309/309, mmu-tlb 18/18,
+Linux 20M pin unchanged). The `static`-in-`flags()` pattern is the one to
+copy: a per-step `std::env::var` is never acceptable (M73 said the same
+for `WWATCH`; the lesson needed re-learning).
+
+**JIT verdict, honest and measured (not retried):**
+- `bb_len` census added to `Runner` (two u64 increments on the step loop):
+  the Linux boot's mean basic-block length is **7.75 instructions** — not
+  the <=2 ops M114 assumed. So a TB *would* amortize fetch+decode better
+  than M114 feared.
+- BUT a TB that executes predecoded ops loses the interpreter's
+  branch-predicted dispatch, and a TB that re-decodes per op saves
+  nothing (M114's own conclusion, and `#[inline]` on translate/fetch
+  measured 0.76s = neutral here). So TB-cache is still a measured loser
+  — do not retry it.
+- The only real JIT is **true codegen** (compile hot blocks to native or
+  wasm, no dispatch). For native that is a Cranelift integration; for the
+  browser it is a wasm-emitting backend (what the qemu-wasm oracle does).
+  Both are multi-week projects. The env-flag fix already delivered a
+  larger win, and the remaining cost is the diffuse decode+exec loop
+  (M106-M112 verdict: no single-component tweak moves it).
+- If codegen is ever attempted: the fetch TLB probe is the profiled hot
+  spot, `bb_len=7.75` says blocks are long enough to matter, and the
+  `steps`/`jumps` counters in `Runner` make the measurement reproducible.
+
 ### M115 — userspace corruption ROOT-CAUSED: TLB tag was non-injective + no PTE permission model (DONE, uncommitted)
 
 The Linux boot reached busybox init but init's child aborted with
@@ -2894,6 +2933,13 @@ rows come from `aarch64-none-elf-as`, never hand-hex.
   Linux-path rate is the default now, no `PI3_VTIPS` needed),
   `node test/upython-repl.mjs` (etc. — 9 suites via test/pi-sess.mjs +
   `cargo build --release --example sess`).
+- **Long Linux runs: call the RELEASE binary.** `test/linux-triage.mjs`
+  runs `target/debug/examples/triage`, which is 5-10x slower — a 3.4 B
+  instruction boot takes ~30 min debug vs ~4 min release. Use it for the
+  quick pins; for anything multi-billion, build
+  `cargo build --release --example triage` and run
+  `./target/release/examples/triage 32753 22505969 <budget> [slice]`
+  directly (same arguments `PI3_KEY` / `PI3_STUCK` / `PI3_SAMPLE_EVERY`).
 - **STALE-BINARY TRAP (bitten again in M117, twice):**
   `test/cpu-cases.mjs` runs `target/debug/examples/one` and
   `test/linux-triage.mjs` runs `target/debug/examples/triage`, but

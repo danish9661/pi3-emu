@@ -55,6 +55,9 @@ fn main() {
     // before it runs `/bin/sh`, so without this the boot stops at the
     // console prompt and the shell is never exercised.
     let key = std::env::var("PI3_KEY").ok().map(|k| k.as_bytes()[0]);
+    // PI3_STUCK=<chunks>: dump the register file + memory around
+    // x0/x1/x22 when the pc has been unchanged for that many chunks.
+    let stuck_k: Option<u64> = std::env::var("PI3_STUCK").ok().and_then(|v| v.parse().ok());
     // PI3_SAMPLE_EVERY=N: print n/pc/x0/x30 every N insns (trajectory to
     // find where progress stops; default 0 = only the final line).
     let every: u64 = std::env::var("PI3_SAMPLE_EVERY")
@@ -88,6 +91,50 @@ fn main() {
             }
         }
     }
+    // PI3_STUCK=<chunks>: while the chunked loop runs, report when the pc
+    // has not moved for N chunks — the "where is it spinning?" answer,
+    // with the register file and the bytes around x0/x1 so a string scan
+    // or a pointer walk can be judged by reading the dump.
+    if let (Some(k), true) = (stuck_k, key.is_some() || stuck_k.is_some()) {
+        let mut same = 0u64;
+        let mut last = cpu.pc >> 9;
+        while runner.n < budget && runner.fault_string().is_none() {
+            if runner.n % 20_000_000 < 4096 {
+                if let Some(kb) = key {
+                    bus.uart0_push(kb);
+                }
+            }
+            runner.run_to(&mut cpu, &mut bus, (runner.n + 4096).min(budget));
+            // Granularity matters: a tight loop cycles through several
+            // pcs, so compare the pc's 512-byte page, not the pc.
+            let here = cpu.pc >> 9;
+            if here == last {
+                same += 1;
+            } else {
+                same = 0;
+                last = here;
+            }
+            if same == k {
+                println!(
+                    "stuck\tn={} pc=0x{:x} x0=0x{:x} x1=0x{:x} x2=0x{:x} x3=0x{:x} sp=0x{:x} x19=0x{:x} x20=0x{:x} x21=0x{:x} x22=0x{:x} el={}",
+                    runner.n, cpu.pc, cpu.x[0], cpu.x[1], cpu.x[2], cpu.x[3], cpu.sp,
+                    cpu.x[19], cpu.x[20], cpu.x[21], cpu.x[22], cpu.cur_el
+                );
+                for (label, va) in [("x0", cpu.x[0]), ("x1", cpu.x[1]), ("x22", cpu.x[22])] {
+                    if va < (1 << 48) {
+                        if let Ok(pa) = bus.translate(va & !0xf) {
+                            let mut bytes = String::new();
+                            for i in 0..32u64 {
+                                bytes.push_str(&format!("{:02x}", bus.mem_u32_dbg(pa + i) as u8));
+                            }
+                            println!("stuckmem\t{}=0x{:x} pa=0x{:x} {}", label, va, pa, bytes);
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
     println!("triage\tn={} pc=0x{:x} x0=0x{:x} fault={} console={:?}",
         runner.n, cpu.pc, cpu.x[0],
         runner.fault_string().unwrap_or_else(|| "null".into()),
@@ -98,7 +145,7 @@ fn main() {
     // the last few lines with the per-second noise filtered out.
     {
         let c = String::from_utf8_lossy(&bus.console);
-        println!("markers\tbytes={}", c.len());
+        println!("markers\tbytes={} bb_len={:.2}", c.len(), runner.steps as f64 / runner.jumps.max(1) as f64);
         for m in [
             "Run /bin/init",
             "VFS: Mounted root",

@@ -58,6 +58,12 @@ pub struct Runner {
     saved_daif: u8,
     resume_armed: bool,
     vector_pending: Option<u64>,
+    /// M118 block-length census: a counter per instruction and one per pc
+    /// jump (branch/exception — where a TB must end). steps/jumps ≈ mean
+    /// basic-block length, which decides whether a TB/JIT can amortize
+    /// fetch+decode. Zero-cost (two u64 increments on the step loop).
+    pub steps: u64,
+    pub jumps: u64,
 }
 
 impl Runner {
@@ -82,6 +88,8 @@ impl Runner {
             saved_pc: None,
             saved_daif: 0,
             resume_armed: false,
+            steps: 0,
+            jumps: 0,
             vector_pending: None,
         }
     }
@@ -138,8 +146,15 @@ impl Runner {
             let m = core::cmp::min(self.slice, target - self.n);
             let m = core::cmp::min(m, self.budget - self.n);
             let mut done = 0u64;
+            let mut prev = cpu.pc;
             while done < m {
-                if let Err(f) = cpu.step(bus) {
+                let r = cpu.step(bus);
+                self.steps += 1;
+                if cpu.pc.wrapping_sub(prev) != 4 {
+                    self.jumps += 1;
+                }
+                prev = cpu.pc;
+                if let Err(f) = r {
                     // M93c DELIVERED-ABORT CONTINUATION: step() delivers
                     // sync data aborts to the guest vector itself and
                     // reports DataAbort(VA) — the guest handler (not the

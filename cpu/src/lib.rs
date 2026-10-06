@@ -12,6 +12,64 @@ pub mod runner;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
 
+
+/// M118: env-gated trace flags, read ONCE. A `std::env::var` call is a
+/// `getenv()` syscall-ish libc lookup; on the per-instruction step path
+/// the `PI3_EL0TRACE` check alone cost ~10x the whole interpreter
+/// (profiled: `Cpu::step -> std::env::_var -> getenv` dominated the
+/// sampling profile). Cache every flag at first use; the env is set
+/// before the process starts, so this is behavior-identical.
+/// The same flags as one bitmask (built on first use). Each `flag()`
+/// call is then one atomic load + a mask test — free enough for the
+/// per-instruction step path.
+fn flags() -> u64 {
+    use std::sync::OnceLock;
+    static MASK: OnceLock<u64> = OnceLock::new();
+    *MASK.get_or_init(|| {
+        let names = [
+            "DMATRACE", "ICTRACE", "MBOXTAG", "MBOXTRACE", "PERIPHTRACE",
+            "PI3_EL0TRACE", "PI3_EXCTRACE", "PI3_FAULTKIND", "PI3_HANDLERTRACE",
+            "PI3_KTAIL", "PI3_MMIOTRACE", "PI3_PERMTRACE", "PI3_SVCTRACE",
+            "PI3_THERMTRACE", "PI3_TIMERTRACE", "PI3_TLBAUDIT", "PI3_PTW",
+            "PI3_POISON", "SDTRACE", "USBTRACE", "WWATCH",
+        ];
+        let mut mask = 0u64;
+        for (i, k) in names.iter().enumerate() {
+            if std::env::var(k).is_ok() {
+                mask |= 1u64 << i;
+            }
+        }
+        mask
+    })
+}
+
+/// One flag as a bit position — see `flags()`.
+#[inline(always)]
+fn flag(name: &str) -> bool {
+    const NAMES: &[&str] = &[
+        "DMATRACE", "ICTRACE", "MBOXTAG", "MBOXTRACE", "PERIPHTRACE",
+        "PI3_EL0TRACE", "PI3_EXCTRACE", "PI3_FAULTKIND", "PI3_HANDLERTRACE",
+        "PI3_KTAIL", "PI3_MMIOTRACE", "PI3_PERMTRACE", "PI3_SVCTRACE",
+        "PI3_THERMTRACE", "PI3_TIMERTRACE", "PI3_TLBAUDIT", "PI3_PTW",
+        "PI3_POISON", "SDTRACE", "USBTRACE", "WWATCH",
+    ];
+    // Constant-folded when `name` is a literal: the compiler reduces the
+    // index loop at compile time, so the runtime cost is one atomic load.
+    let mut bit = usize::MAX;
+    let mut i = 0;
+    while i < NAMES.len() {
+        if NAMES[i] == name {
+            bit = i;
+            break;
+        }
+        i += 1;
+    }
+    if bit == usize::MAX {
+        return false;
+    }
+    flags() & (1u64 << bit) != 0
+}
+
 pub const RAM_SIZE: u64 = 0x400000;
 // M56 Linux track: 512 MB guest RAM (matches qemu raspi3ap `-m 512M`).
 // The 4 MB default cannot hold the 22 MB kernel8.img + DTB + initramfs.
@@ -813,7 +871,7 @@ impl Bus {
             wwatch_pa: 0,
             wwatch_len: 0,
             wwatch_hits: 0,
-            tlb_audit: std::env::var("PI3_TLBAUDIT").is_ok(),
+            tlb_audit: flag("PI3_TLBAUDIT"),
             tlb_audit_mismatch: 0,
             local_timer_ctl0: 0,
             local_mbox_ctl0: 0,
@@ -1171,7 +1229,7 @@ impl Bus {
         // M109: trace gated (was unconditional — every PIO command paid
         // a format + syscall even with no listener; the sd guest issues
         // dozens per boot).
-        if std::env::var("SDTRACE").is_ok() {
+        if flag("SDTRACE") {
             eprintln!("SDCMD {} arg={:#x}", index, arg);
         }
         const CID: [u32; 4] = [0x12345678, 0x9abcdef0, 0x13579bdf, 0x2468ace0];
@@ -1186,7 +1244,7 @@ impl Bus {
                 self.sd_resp0 = 0x900;
                 self.sd_stage = self.sd_read_sector(arg as usize);
                 // M109: gated (was unconditional; fires per sector read).
-                if std::env::var("SDTRACE").is_ok() {
+                if flag("SDTRACE") {
                     eprintln!("SD17 sec={} st0={:#x} disk00={:#x}", arg & 0xffff, self.sd_stage[0], self.sd_disk[0][0]);
                 }
                 self.sd_irpt |= (1 << 5) | (1 << 1); // READ_READY|XFER
@@ -1233,6 +1291,7 @@ impl Bus {
     /// user-visible behaviour depend on which code paths ran, because
     /// `perm_denied` re-derived its slot from the VA and read whatever
     /// the last fill had left there).
+    #[inline]
     pub fn translate_ap(&mut self, va: u64) -> Result<(u64, u8), Fault> {
         if (self.mmu_sctlr & 1) == 0 {
             return Ok((va, Self::AP_OPEN));
@@ -1277,6 +1336,7 @@ impl Bus {
     /// The data path uses `translate_ap` + `perm_denied` instead, so a
     /// translation can never be paired with another access's cached
     /// permission bits.
+    #[inline]
     pub fn translate(&mut self, va: u64) -> Result<u64, Fault> {
         self.translate_ap(va).map(|(pa, _)| pa)
     }
@@ -1313,7 +1373,7 @@ impl Bus {
             return true;
         }
         let writable = if af == 1 { dbm == 1 } else { ap2 == 0 };
-        if std::env::var("PI3_PERMTRACE").is_ok() {
+        if flag("PI3_PERMTRACE") {
             eprintln!("PERMCHK va=0x{:x} wr={} el={} packed={} af={} ap1={} ap2={} dbm={}",
                 va, is_write as u8, self.cpu_el, packed, af, ap1, ap2, dbm);
         }
@@ -1865,7 +1925,7 @@ impl Bus {
         // console virtual-time + probe samples).
         macro_rules! sdh_log {
             () => {
-                if std::env::var("SDTRACE").is_ok() {
+                if flag("SDTRACE") {
                     eprintln!(
                         "SDHCMD n={} idx={} arg=0x{:x} rsp0=0x{:08x}",
                         self.sdh_chunk_n, idx, arg, self.sdh_rsp[0]
@@ -2176,7 +2236,7 @@ impl Bus {
                         // (the shfull probe shows shadow/writebuf/RAM
                         // identical yet sec0 zeros — the commit must be
                         // writing the wrong sectors or not running).
-                        if std::env::var("SDTRACE").is_ok() {
+                        if flag("SDTRACE") {
                             eprintln!("SDHSTOPCOMMIT shsec={} shlen={} nsec={}",
                                 self.sdh_shadow_sec, self.sdh_shadow_len, nsec);
                         }
@@ -2982,7 +3042,7 @@ impl Bus {
                 self.usb_raise_gint(1 << 25); // HCHINT
             }
         }
-        if std::env::var("USBTRACE").is_ok() {
+        if flag("USBTRACE") {
             eprintln!(
                 "USBXFER ch={} dev={} ep={} {} xfer={} intr=0x{:x}",
                 ch, devaddr, epnum, if epdir_in { "IN" } else { "OUT" }, xfer, intr
@@ -3200,7 +3260,7 @@ impl Bus {
     /// Write a tag response (mirrors mboxProcess: status word + exactly
     /// tsize value bytes, zero-padded past the payload).
     fn mbox_tag_bytes(&mut self, addr: u64, off: usize, tsize: usize, out: &[u8]) {
-        if std::env::var("MBOXTAG").is_ok() {
+        if flag("MBOXTAG") {
             let id = self.mem_u32(addr + off as u64);
             eprintln!("MBOXTAG 0x{:08x} tsize={}", id, tsize);
         }
@@ -3306,7 +3366,7 @@ impl Bus {
         // size=0 reads were the bus-alias artifact above, now fixed);
         // answer success so the driver retries instead of wedging.
         let size = core::cmp::min(self.mem_u32(addr) & 0xffff, 1024) as usize;
-        if std::env::var("MBOXTAG").is_ok() {
+        if flag("MBOXTAG") {
             eprintln!("MBOXBUF addr=0x{:x} size={}", addr, size);
         }
         if size < 8 {
@@ -3716,7 +3776,7 @@ impl Bus {
         // per-CB read-cursor state around each chained transfer (the
         // 0x28 chain's cb1 dst re-serves sec0x28 bytes — the cursor the
         // second CB drains from must be proven, not assumed).
-        if self.dma_trace && std::env::var("DMATRACE").is_ok() && src == SDDATA {
+        if self.dma_trace && flag("DMATRACE") && src == SDDATA {
             eprintln!("DMACUR pre dst=0x{:x} len=0x{:x} rsec=0x{:x} roff={} datacnt={} fifo={} ract={}",
                 dst, len, self.sdh_read_sec, self.sdh_read_off, self.sdh_datacnt,
                 self.sdh_fifo_len, self.sdh_read_active as u8);
@@ -3761,7 +3821,7 @@ impl Bus {
                 self.sdh_read_sec += (read_bytes / 512) as usize;
                 self.sdh_read_off %= 512;
             }
-            if self.dma_trace && std::env::var("DMATRACE").is_ok() {
+            if self.dma_trace && flag("DMATRACE") {
                 eprintln!("DMACUR post dst=0x{:x} read_bytes={} rsec=0x{:x} roff={} datacnt={} fifo={}",
                     dst, read_bytes, self.sdh_read_sec, self.sdh_read_off,
                     self.sdh_datacnt, self.sdh_fifo_len);
@@ -4062,7 +4122,7 @@ impl Bus {
     }
 
     pub fn read(&mut self, mut addr: u64, size: u64) -> Result<u64, Fault> {
-        if std::env::var("PI3_MMIOTRACE").is_ok()
+        if flag("PI3_MMIOTRACE")
             && size == 4
             && addr != self.mio_last
             && !self.in_ram(addr, size)
@@ -4195,7 +4255,7 @@ impl Bus {
         if addr == SD_PRESENT && size <= 4 {
             return Ok(1 & mask(size));
         }
-        if addr == SD_PRESENT && std::env::var("MBOXTRACE").is_ok() {
+        if addr == SD_PRESENT && flag("MBOXTRACE") {
             eprintln!("SDPRESENT-READ");
         }
         // VideoCore mailbox regs (+0x880 in the MBOX page). MUST precede
@@ -4221,7 +4281,7 @@ impl Bus {
         // serve the kernel path. When fb/shell migrate to +0x20, drop
         // the +0x04/+0x14 legacy cells.
         if addr >= MBOX_BASE && addr + size <= MBOX_BASE + 0x40 {
-            if std::env::var("MBOXTAG").is_ok() && (addr - MBOX_BASE == 0x00 || addr - MBOX_BASE == 0x18 || addr - MBOX_BASE == 0x38) {
+            if flag("MBOXTAG") && (addr - MBOX_BASE == 0x00 || addr - MBOX_BASE == 0x18 || addr - MBOX_BASE == 0x38) {
                 eprintln!("MBOXRD off=0x{:x} pending={}", addr - MBOX_BASE, self.mbx_pending as u8);
             }
             // M61 STATUS bits (proven by the 2B handshake trace: the
@@ -4317,7 +4377,7 @@ impl Bus {
                     // Serve the live word; keep the pending-clear + line
                     // drop + STA-raise behavior unchanged.
                     let w = self.mbx_last_write as u64;
-                    if std::env::var("MBOXTAG").is_ok() && self.mbx_pending {
+                    if flag("MBOXTAG") && self.mbx_pending {
                         eprintln!("MBOXDRAIN rd=0x{:08x}", self.mbx_last_write);
                     }
                     self.mbx_pending = false;
@@ -4343,7 +4403,7 @@ impl Bus {
             // offset/size in all 11358 mailbox-visible windows, so the
             // GPU half genuinely never walks while the timer half is
             // pending; serve-or-complete decision goes to (a)).
-            if std::env::var("MBOXTAG").is_ok() {
+            if flag("MBOXTAG") {
                 // value computed below; log after (see ICVALW line).
             }
             // M61 BASIC snapshot trace (MBOXTAG=1): the VALUE the guest
@@ -4389,12 +4449,12 @@ impl Bus {
                 }
                 _ => 0, // ENABLE/DISABLE/RET read back 0
             };
-            if std::env::var("MBOXTAG").is_ok() {
+            if flag("MBOXTAG") {
                 eprintln!("ICRDW off=0x{:x} size={} val=0x{:x} mbox0={}", off, size, v & mask(size), self.mbox_pending0());
             }
             return Ok(v & mask(size));
         }
-        if Self::is_sd(addr, size) && std::env::var("SDTRACE").is_ok() {
+        if Self::is_sd(addr, size) && flag("SDTRACE") {
             eprintln!("SDRD {:#x} sz={}", addr, size);
         }
         if Self::is_sd(addr, size) {
@@ -4408,7 +4468,7 @@ impl Bus {
                     // Staging buffer (little-endian word reads).
                     // M109: gated (was unconditional; fires on every
                     // staging-buffer window read).
-                    if off == 0x100 && std::env::var("SDTRACE").is_ok() {
+                    if off == 0x100 && flag("SDTRACE") {
                         eprintln!("BLK0 {:02x}{:02x}{:02x}{:02x}...{:02x}{:02x}", self.sd_stage[0], self.sd_stage[1], self.sd_stage[2], self.sd_stage[3], self.sd_stage[510], self.sd_stage[511]);
                     }
                     let mut w = 0u64;
@@ -4416,7 +4476,7 @@ impl Bus {
                         w |= (self.sd_stage[(off as usize) - 0x100 + i as usize] as u64)
                             << (8 * i);
                     }
-                    if off == 0x100 && std::env::var("SDTRACE").is_ok() {
+                    if off == 0x100 && flag("SDTRACE") {
                         eprintln!("BLK0W {:#x}", w);
                     }
                     return Ok(w & mask(size));
@@ -4524,7 +4584,7 @@ impl Bus {
                 0x04 => 0x496, // VALID | 150 ADC counts (~59.8 C)
                 _ => 0,
             };
-            if std::env::var("PI3_THERMTRACE").is_ok() {
+            if flag("PI3_THERMTRACE") {
                 eprintln!("THERMRD n={} pa=0x{:x} off=0x{:x} val=0x{:x}", self.exc_n, addr, addr - THERMAL_BASE, v & mask(size));
             }
             return Ok(v & mask(size));
@@ -4568,7 +4628,7 @@ impl Bus {
             // serve shadow cells; GSNPSID reads 0x4f54294a (QEMU reset
             // value — periphs/debug accept it as a real DWC2 rev).
             let off = addr - USB_BASE;
-            if std::env::var("USBTRACE").is_ok() && (off < 0x70 || off == 0x100 || (0x400..0x444).contains(&off) || (0x500..0x600).contains(&off)) {
+            if flag("USBTRACE") && (off < 0x70 || off == 0x100 || (0x400..0x444).contains(&off) || (0x500..0x600).contains(&off)) {
                 eprintln!("USBRD off=0x{:x} size={}", off, size);
             }
             let v: u64 = if off < 0x70 && off % 4 == 0 {
@@ -4624,7 +4684,7 @@ impl Bus {
                 w |= (((cell >> (8 * (o % 4))) & 0xff) as u64) << (8 * i);
             }
             if self.dma_trace
-                && std::env::var("DMATRACE").is_ok()
+                && flag("DMATRACE")
                 && addr < DMA_ENABLE_PAGE
                 && (addr - base) % 0x100 <= 0x04 + size
             {
@@ -4657,7 +4717,7 @@ impl Bus {
         // sdhost read arm.)
         if self.linux_mode && Self::is_page(addr, size, SDHOST_BASE) {
             let off = addr - SDHOST_BASE;
-            if std::env::var("SDTRACE").is_ok() {
+            if flag("SDTRACE") {
                 eprintln!("SDHRD off=0x{:x} sz={}", off, size);
             }
             let v: u64 = match off {
@@ -4678,7 +4738,7 @@ impl Bus {
                     let i = ((off - 0x10) / 4) as usize;
                     // M76q valued RSP reads (SDTRACE-gated): proves
                     // WHAT the driver consumed (stale vs fresh).
-                    if std::env::var("SDTRACE").is_ok() {
+                    if flag("SDTRACE") {
                         eprintln!("SDRSPV off=0x{:x} val=0x{:08x}", off, self.sdh_rsp[i]);
                     }
                     self.sdh_rsp[i] as u64
@@ -4707,10 +4767,10 @@ impl Bus {
                     // intmask checks but never keeps the line live
                     // past the drain.
                     let live = if self.sdh_fifo_len > 0 { 0x01 } else { 0x00 };
-                    if std::env::var("SDTRACE").is_ok() {
+                    if flag("SDTRACE") {
                         eprintln!("SDHSTSV status=0x{:x} n={}", (self.sdh_status & !0x01) | live, self.sdh_chunk_n);
                     }
-                    if std::env::var("SDTRACE").is_ok() && (self.sdh_status & (0x40 | 0x80 | 0x20 | 0x10 | 0x08)) != 0 {
+                    if flag("SDTRACE") && (self.sdh_status & (0x40 | 0x80 | 0x20 | 0x10 | 0x08)) != 0 {
                         eprintln!("SDHSTS_ERR status=0x{:x} n={}", self.sdh_status, self.sdh_chunk_n);
                     }
                     ((self.sdh_status & !0x01) | live) as u64
@@ -4742,7 +4802,7 @@ impl Bus {
                     // M76q valued FIFO reads (SDTRACE-gated): proves
                     // WHAT the driver consumed (stale vs fresh).
                     let w = self.sdh_fifo_pop();
-                    if std::env::var("SDTRACE").is_ok() {
+                    if flag("SDTRACE") {
                         eprintln!("SDFIFOV val=0x{:08x} len={}", w as u32, self.sdh_fifo_len);
                     }
                     w
@@ -4826,7 +4886,7 @@ impl Bus {
                 if self.local_gpu_routing == 0 && self.legacy_line() {
                     v |= 1 << 8;
                 }
-                if std::env::var("MBOXTAG").is_ok() {
+                if flag("MBOXTAG") {
                     eprintln!("LOCALRD off=0x60 val=0x{:x} legacy={} cntp={}", v & mask(size), self.legacy_line() as u8, self.cntp_line() as u8);
                 }
                 return Ok(v & mask(size));
@@ -4855,7 +4915,7 @@ impl Bus {
         // PERIPH_LEN=0x300000 covering 0x3f202000; umbrella-after
         // modeled restores it).
         if Self::is_periph(addr, size) {
-            if std::env::var("PERIPHTRACE").is_ok() {
+            if flag("PERIPHTRACE") {
                 eprintln!("PERIPHRD {:#x} sz={}", addr, size);
             }
             return Ok(0);
@@ -4887,7 +4947,7 @@ impl Bus {
                             old |= (self.mem[a as usize] as u64) << (8 * i);
                         }
                     }
-                    if std::env::var("WWATCH").is_ok() {
+                    if flag("WWATCH") {
                         eprintln!(
                             "WWATCH pa=0x{:x} size={} val=0x{:x} old=0x{:x}",
                             addr, size, val & mask(size), old
@@ -4928,7 +4988,7 @@ impl Bus {
                             old |= (self.mem[a as usize] as u64) << (8 * i);
                         }
                     }
-                    if std::env::var("WWATCH").is_ok() {
+                    if flag("WWATCH") {
                         eprintln!(
                             "WWATCH pa=0x{:x} size={} val=0x{:x} old=0x{:x}",
                             addr, size, val & mask(size), old
@@ -4970,7 +5030,7 @@ impl Bus {
                 self.census_sd += 1;
             } else if Self::is_page(addr, size, LOCAL_BASE) {
                 self.census_local += 1;
-                if std::env::var("MBOXTAG").is_ok() {
+                if flag("MBOXTAG") {
                     eprintln!("LOCALWR off=0x{:x} val=0x{:x}", addr - LOCAL_BASE, val & mask(size));
                 }
             } else if Self::is_miniuart(addr, size) {
@@ -5071,7 +5131,7 @@ impl Bus {
                 let v = (val & mask(size)) as u32;
                 self.mbx_last_write = v;
                 self.mbx_addr = v;
-                if std::env::var("MBOXTAG").is_ok() {
+                if flag("MBOXTAG") {
                     eprintln!("MBOXWR off=0x{:x} val=0x{:08x} ch={}", addr - MBOX_BASE, v, v & 0xf);
                 }
                 if (v & 0xf) == 8 {
@@ -5084,7 +5144,7 @@ impl Bus {
                 // bank-0 bit 1 (see mbox_pending0) — the driver's real
                 // completion path. Other bits absorbed.
                 self.mbx_cnf_irqen = (val & 1) != 0;
-                if std::env::var("MBOXTAG").is_ok() {
+                if flag("MBOXTAG") {
                     eprintln!("MBOXCNF val=0x{:x} irqen={}", val & mask(size), self.mbx_cnf_irqen as u8);
                 }
             }
@@ -5093,7 +5153,7 @@ impl Bus {
         if Self::is_ic(addr, size) {
             let off = addr - IC_BASE;
             let v = (val & mask(size)) as u32;
-            if std::env::var("MBOXTAG").is_ok() && (off == 0x18 || off == 0x10 || off == 0x14 || off == 0x24 || off == 0x1c || off == 0x20 || off == 0x00) {
+            if flag("MBOXTAG") && (off == 0x18 || off == 0x10 || off == 0x14 || off == 0x24 || off == 0x1c || off == 0x20 || off == 0x00) {
                 eprintln!("ICWR off=0x{:x} val=0x{:08x}", off, v);
             }
             // M77 IC enable write log (ICTRACE-gated, zero-cost off):
@@ -5101,7 +5161,7 @@ impl Bus {
             // IRQ enable timing decides whether early PIO data wins
             // or times out — execution-proven: en2-bit24 lands ~6.8B
             // while the first DATA timeouts fire ~6.7B).
-            if std::env::var("ICTRACE").is_ok() && (off == 0x18 || off == 0x10 || off == 0x14 || off == 0x24 || off == 0x1c || off == 0x20) {
+            if flag("ICTRACE") && (off == 0x18 || off == 0x10 || off == 0x14 || off == 0x24 || off == 0x1c || off == 0x20) {
                 eprintln!("ICENW n={} off=0x{:x} val=0x{:08x}", self.sdh_chunk_n, off, v);
             }
             match off {
@@ -5125,7 +5185,7 @@ impl Bus {
             }
             return Ok(());
         }
-        if std::env::var("SDTRACE").is_ok() && Self::is_sd(addr, size) {
+        if flag("SDTRACE") && Self::is_sd(addr, size) {
             eprintln!("SDWR {:#x} sz={} val={:#x}", addr, size, val);
         }
         // M75 sdhost write path (linux_mode only; QEMU SDCMD/SDHSTS/
@@ -5134,7 +5194,7 @@ impl Bus {
         if self.linux_mode && Self::is_page(addr, size, SDHOST_BASE) {
             let off = addr - SDHOST_BASE;
             let v = (val & mask(size)) as u32;
-            if std::env::var("SDTRACE").is_ok() {
+            if flag("SDTRACE") {
                 eprintln!("SDHWR off=0x{:x} val={:#x}", off, v);
             }
             match off {
@@ -5189,7 +5249,7 @@ impl Bus {
                     // (the sector-0 CMD25 at 6.788B assembled woff=4096
                     // with ZERO SDDATA writes in the trace — the bytes
                     // came from the DMA path, not this arm).
-                    if std::env::var("SDTRACE").is_ok() {
+                    if flag("SDTRACE") {
                         eprintln!("SDHWDAT v=0x{:08x} wact={} wsec={} woff={} datacnt={}",
                             v, self.sdh_write_active as u8, self.sdh_write_sec,
                             self.sdh_write_off, self.sdh_datacnt);
@@ -5498,7 +5558,7 @@ impl Bus {
             if (off == 0xff0 || off == 0x54) && val != 0 {
                 self.usb_done = true;
             }
-            if std::env::var("USBTRACE").is_ok() && (off < 0x70 || off == 0x100 || (0x400..0x444).contains(&off) || (0x500..0x600).contains(&off)) {
+            if flag("USBTRACE") && (off < 0x70 || off == 0x100 || (0x400..0x444).contains(&off) || (0x500..0x600).contains(&off)) {
                 eprintln!("USBWR off=0x{:x} val=0x{:x}", off, val & mask(size));
             }
             let v = (val & mask(size)) as u32;
@@ -5702,7 +5762,7 @@ impl Bus {
                 }
             }
             if self.dma_trace
-                && std::env::var("DMATRACE").is_ok()
+                && flag("DMATRACE")
                 && (addr - base) % 0x100 <= 0x04 + size
                 && addr < DMA_ENABLE_PAGE
             {
@@ -5710,7 +5770,7 @@ impl Bus {
                 eprintln!("DMAWR ch={} off=0x{:x} val=0x{:x}", off / 0x100, off % 0x100, val & mask(size));
             }
             if self.dma_trace
-                && std::env::var("DMATRACE").is_ok()
+                && flag("DMATRACE")
                 && addr >= DMA_ENABLE_PAGE
                 && addr - DMA_ENABLE_PAGE < 0x60
             {
@@ -5730,7 +5790,7 @@ impl Bus {
             // M76: the real per-channel ENABLE register lives at
             // DMA_BASE+0xFF0 (not the facade page) — log it too.
             if self.dma_trace
-                && std::env::var("DMATRACE").is_ok()
+                && flag("DMATRACE")
                 && addr < DMA_ENABLE_PAGE
                 && addr - base >= 0xFF0
                 && addr - base < 0x1000
@@ -5823,7 +5883,7 @@ impl Bus {
         // fault): absorb. Same placement rule as the read side —
         // after every modeled window, only gaps land here.
         if Self::is_periph(addr, size) {
-            if std::env::var("PERIPHTRACE").is_ok() {
+            if flag("PERIPHTRACE") {
                 eprintln!("PERIPHWR {:#x} sz={} val={:#x}", addr, size, val & mask(size));
             }
             return Ok(());
@@ -6093,10 +6153,10 @@ impl Bus {
                         self.dma_ack_ch[ch] = false;
                     }
                     if (cs & 1) != 0 && (cs & 4) == 0 && conblk != 0 {
-                        if self.dma_trace && std::env::var("DMATRACE").is_ok() {
+                        if self.dma_trace && flag("DMATRACE") {
                             eprintln!("DMRUN ch={} cb=0x{:x}", ch, conblk);
                         }
-                        if self.dma_trace && std::env::var("DMATRACE").is_ok() {
+                        if self.dma_trace && flag("DMATRACE") {
                             // M77 CB dump (DMATRACE-gated): proves the
                             // chain's TI/src/dst/len at run time (the
                             // CMD25 DMDST=0 needs the CB's own words,
@@ -6130,7 +6190,7 @@ impl Bus {
                         // the FIFO/cursor state right after the chain
                         // ran (cb1's sec0x8-shape content must be
                         // explained by FIFO words, not cursor math).
-                        if self.dma_trace && std::env::var("DMATRACE").is_ok() {
+                        if self.dma_trace && flag("DMATRACE") {
                             eprintln!("DMDST {:08x} magic={:04x}", self.dma_last_dst_sample, self.dma_last_dst_magic);
                             eprintln!("DMAFIFO len={} pos={} rsec=0x{:x} roff={} datacnt={} w0=0x{:08x} w1=0x{:08x}",
                                 self.sdh_fifo_len, self.sdh_fifo_pos, self.sdh_read_sec, self.sdh_read_off,
@@ -6166,6 +6226,7 @@ impl Bus {
         self.update_cntp_istatus();
     }
 
+    #[inline]
     pub fn fetch(&mut self, pc: u64) -> Result<u32, Fault> {
         // M58 hot-path: MMU-off identity (goldens + kernel prologue).
         let pc = if (self.mmu_sctlr & 1) == 0 {
@@ -6947,7 +7008,7 @@ impl Cpu {
     pub fn step(&mut self, bus: &mut Bus) -> Result<(), Fault> {
         let pc = self.pc;
         // TRIAGE (PI3_EL0TRACE): trace every EL0 (userspace) pc.
-        if std::env::var("PI3_EL0TRACE").is_ok() && self.cur_el == 0 {
+        if flag("PI3_EL0TRACE") && self.cur_el == 0 {
             eprintln!("EL0 n={} pc=0x{:x} x0=0x{:x} x1=0x{:x} x2=0x{:x}", bus.exc_n, pc, self.x[0], self.x[1], self.x[2]);
         }
         // TRIAGE (PI3_HANDLERTRACE): trace the N instructions after a
@@ -7014,7 +7075,7 @@ impl Cpu {
                 // Bare-metal guests (linux_mode=false) keep the old
                 // hard-fault behavior (every golden pins it).
                 self.cur_el = 1;
-                if std::env::var("PI3_EXCTRACE").is_ok() {
+                if flag("PI3_EXCTRACE") {
                     eprintln!("EXC n={} FETCH ec=0x{:x} el0={} elr=0x{:x} vec=+0x{:x} sp=0x{:x} sp_el0=0x{:x}", bus.exc_n, if el0_origin { 0x20 } else { 0x21 }, el0_origin as u8, pc, vec_off, self.sp, self.sp_el0);
                 }
                 self.abort_pending = true;
@@ -7084,7 +7145,7 @@ impl Cpu {
                 let vbar = if self.vbar_el1 == 0 { 0x100000 } else { self.vbar_el1 };
                 self.pc = vbar + vec_off;
                 self.cur_el = 1;
-                if std::env::var("PI3_EXCTRACE").is_ok() {
+                if flag("PI3_EXCTRACE") {
                     eprintln!("EXC n={} PERM ec=0x{:x} el0={} elr=0x{:x} far=0x{:x} vec=+0x{:x}", bus.exc_n, ec, el0_origin as u8, pc, a, vec_off);
                 }
                 self.abort_pending = true;
@@ -7109,7 +7170,7 @@ impl Cpu {
                     Err(Fault::UnmappedData(_)) => "UNMAPPED",
                     _ => "OTHER",
                 };
-                if std::env::var("PI3_FAULTKIND").is_ok() {
+                if flag("PI3_FAULTKIND") {
                     let slot = ((a >> 12) & 255) as usize;
                     let hi = ((a >> 55) & 1) != 0;
                     let w = bus.translate_walk(a, hi);
@@ -7159,10 +7220,10 @@ impl Cpu {
                 let vbar = if self.vbar_el1 == 0 { 0x100000 } else { self.vbar_el1 };
                 self.pc = vbar + vec_off;
                 self.cur_el = 1;
-                if std::env::var("PI3_EXCTRACE").is_ok() {
+                if flag("PI3_EXCTRACE") {
                     eprintln!("EXC n={} DATA ec=0x{:x} el0={} elr=0x{:x} far=0x{:x} vec=+0x{:x} sp=0x{:x} sp_el0=0x{:x} esr=0x{:x} wnR={}", bus.exc_n, if el0_origin { 0x24 } else { 0x25 }, el0_origin as u8, pc, a, vec_off, self.sp, self.sp_el0, self.esr_el1, if Self::is_store_word(w) {1} else {0});
                 }
-                if std::env::var("PI3_HANDLERTRACE").is_ok() && a == self.hwatch {
+                if flag("PI3_HANDLERTRACE") && a == self.hwatch {
                     self.htrace = 40000;
                     self.hwatch = 0; // one-shot
                 }
@@ -7958,7 +8019,7 @@ impl Cpu {
             };
             if is_load {
                 let v = bus.read(addr, nbytes).map_err(|e| {
-                    if std::env::var("PI3_FAULTKIND").is_ok() {
+                    if flag("PI3_FAULTKIND") {
                         eprintln!("LOADFAIL pc=0x{:x} arg=0x{:x} size={} err={:?} in_ram_arg={} tlbhit={}",
                             _pc, addr, nbytes, e, bus.in_ram(addr, nbytes) as u8,
                             (bus.tlb_tag[((addr >> 12) & 255) as usize] == ((addr >> 12) ^ (((addr >> 55) & 1) << 56))) as u8);
@@ -8248,7 +8309,7 @@ impl Cpu {
         // ERET: exact word only (would otherwise decode as BR XZR -> pc=0).
         if w == 0xD69F03E0 {
             self.eret();
-            if std::env::var("PI3_EXCTRACE").is_ok() {
+            if flag("PI3_EXCTRACE") {
                 eprintln!("EXC n={} ERET from=0x{:x} spsr=0x{:x} elr=0x{:x} ->pc=0x{:x} el={} sp=0x{:x} sp_el0=0x{:x}", bus.exc_n, pc, self.spsr_el1, self.elr_el1, self.pc, self.cur_el, self.sp, self.sp_el0);
             }
             return Ok(());
@@ -8307,7 +8368,7 @@ impl Cpu {
                 let el0_origin = self.cur_el == 0;
                 let vec_off = if el0_origin { 0x400 } else { 0x200 };
                 self.esr_el1 = (0x15 << 26) | imm;
-                if std::env::var("PI3_SVCTRACE").is_ok() {
+                if flag("PI3_SVCTRACE") {
                     eprintln!("SVC n={} pc=0x{:x} nr={} a0=0x{:x} a1=0x{:x} a2=0x{:x} a3=0x{:x} sp_el0=0x{:x}",
                         bus.exc_n, pc, self.x[8], self.x[0], self.x[1], self.x[2], self.x[3], self.sp_el0);
                 }
@@ -8328,10 +8389,10 @@ impl Cpu {
                 let vbar = if self.vbar_el1 == 0 { 0x100000 } else { self.vbar_el1 };
                 self.pc = vbar + vec_off;
                 self.cur_el = 1;
-                if std::env::var("PI3_EXCTRACE").is_ok() {
+                if flag("PI3_EXCTRACE") {
                     eprintln!("EXC n={} SVC el0={} elr=0x{:x} vec=+0x{:x} sp=0x{:x} sp_el0=0x{:x}", bus.exc_n, el0_origin as u8, pc, vec_off, self.sp, self.sp_el0);
                 }
-                if std::env::var("PI3_SVCTRACE").is_ok() {
+                if flag("PI3_SVCTRACE") {
                     eprintln!("SVC n/a pc=0x{:x} imm={} el0={} ->vec=+0x{:x} esr=0x{:x}", pc, imm, el0_origin as u8, vec_off, self.esr_el1);
                 }
                 return Ok(());
@@ -8677,7 +8738,7 @@ impl Cpu {
                         // TVAL: CVAL = counter + value (32-bit offset).
                         bus.cntp_cval = bus.cntpct.wrapping_add(v & 0xffff_ffff);
                         bus.arm_cntp_match();
-                        if std::env::var("PI3_TIMERTRACE").is_ok() {
+                        if flag("PI3_TIMERTRACE") {
                             eprintln!("TMRMSR CNTP_TVAL=0x{:x} cval=0x{:x} cntpct=0x{:x}", v & 0xffff_ffff, bus.cntp_cval, bus.cntpct);
                         }
                     } else if op2 == 1 {
@@ -8706,13 +8767,13 @@ impl Cpu {
                             bus.cntp_istatus = false;
                         }
                         bus.update_cntp_istatus();
-                        if std::env::var("PI3_TIMERTRACE").is_ok() {
+                        if flag("PI3_TIMERTRACE") {
                             eprintln!("TMRMSR CNTP_CTL=0x{:x} istatus={} pc=0x{:x}", v & 0x7, bus.cntp_istatus as u8, self.pc);
                         }
                     } else if op2 == 2 {
                         bus.cntp_cval = v;
                         bus.arm_cntp_match();
-                        if std::env::var("PI3_TIMERTRACE").is_ok() {
+                        if flag("PI3_TIMERTRACE") {
                             eprintln!("TMRMSR CNTP_CVAL=0x{:x} cntpct=0x{:x}", v, bus.cntpct);
                         }
                     }
@@ -8726,7 +8787,7 @@ impl Cpu {
                     if bus.cntp_istatus {
                         c |= 1 << 2;
                     }
-                    if std::env::var("PI3_TIMERTRACE").is_ok() {
+                    if flag("PI3_TIMERTRACE") {
                         eprintln!("TMRMRS CNTP_CTL=0x{:x} stored=0x{:x} fired={} cval=0x{:x} cntpct=0x{:x} pc=0x{:x}",
                             c, bus.cntp_ctl, bus.cntp_fired as u8, bus.cntp_cval, bus.cntpct, self.pc);
                     }
@@ -8746,17 +8807,17 @@ impl Cpu {
                     let v = self.r(rd);
                     if op2 == 0 {
                         bus.cntv_cval = bus.cntpct.wrapping_add(v & 0xffff_ffff);
-                        if std::env::var("PI3_TIMERTRACE").is_ok() {
+                        if flag("PI3_TIMERTRACE") {
                             eprintln!("TMRMSR CNTV_TVAL=0x{:x} cval=0x{:x}", v & 0xffff_ffff, bus.cntv_cval);
                         }
                     } else if op2 == 1 {
                         bus.cntv_ctl = (v & 1) as u32;
-                        if std::env::var("PI3_TIMERTRACE").is_ok() {
+                        if flag("PI3_TIMERTRACE") {
                             eprintln!("TMRMSR CNTV_CTL=0x{:x}", v & 1);
                         }
                     } else if op2 == 2 {
                         bus.cntv_cval = v;
-                        if std::env::var("PI3_TIMERTRACE").is_ok() {
+                        if flag("PI3_TIMERTRACE") {
                             eprintln!("TMRMSR CNTV_CVAL=0x{:x}", v);
                         }
                     }
@@ -11516,7 +11577,7 @@ impl Cpu {
             let vbar = if self.vbar_el1 == 0 { 0x100000 } else { self.vbar_el1 };
             self.pc = vbar + 0x400;
             self.cur_el = 1;
-            if std::env::var("PI3_EXCTRACE").is_ok() {
+            if flag("PI3_EXCTRACE") {
                 eprintln!("EXC n={} EL0TRAP elr=0x{:x} w=0x{:08x} vec=+0x400 sp=0x{:x} sp_el0=0x{:x}", bus.exc_n, pc, w, self.sp, self.sp_el0);
             }
             self.abort_pending = true;
