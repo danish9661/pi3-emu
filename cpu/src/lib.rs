@@ -11,9 +11,10 @@
 pub mod runner;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod jit;
 
-
-/// M118: env-gated trace flags, read ONCE. A `std::env::var` call is a
+// M118: env-gated trace flags, read ONCE. A `std::env::var` call is a
 /// `getenv()` syscall-ish libc lookup; on the per-instruction step path
 /// the `PI3_EL0TRACE` check alone cost ~10x the whole interpreter
 /// (profiled: `Cpu::step -> std::env::_var -> getenv` dominated the
@@ -31,7 +32,7 @@ fn flags() -> u64 {
             "PI3_EL0TRACE", "PI3_EXCTRACE", "PI3_FAULTKIND", "PI3_HANDLERTRACE",
             "PI3_KTAIL", "PI3_MMIOTRACE", "PI3_PERMTRACE", "PI3_SVCTRACE",
             "PI3_THERMTRACE", "PI3_TIMERTRACE", "PI3_TLBAUDIT", "PI3_PTW",
-            "PI3_POISON", "SDTRACE", "USBTRACE", "WWATCH",
+            "PI3_POISON", "PI3_JITTRACE", "SDTRACE", "USBTRACE", "WWATCH",
         ];
         let mut mask = 0u64;
         for (i, k) in names.iter().enumerate() {
@@ -51,7 +52,7 @@ fn flag(name: &str) -> bool {
         "PI3_EL0TRACE", "PI3_EXCTRACE", "PI3_FAULTKIND", "PI3_HANDLERTRACE",
         "PI3_KTAIL", "PI3_MMIOTRACE", "PI3_PERMTRACE", "PI3_SVCTRACE",
         "PI3_THERMTRACE", "PI3_TIMERTRACE", "PI3_TLBAUDIT", "PI3_PTW",
-        "PI3_POISON", "SDTRACE", "USBTRACE", "WWATCH",
+        "PI3_POISON", "PI3_JITTRACE", "SDTRACE", "USBTRACE", "WWATCH",
     ];
     // Constant-folded when `name` is a literal: the compiler reduces the
     // index loop at compile time, so the runtime cost is one atomic load.

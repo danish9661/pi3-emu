@@ -1356,3 +1356,13 @@ dist/                 production bundle
   an inert branch to a hot path moves it) -- see AGENTS.md M117 for the
   instruments (whole-boot TLB audit: 0 stale hits; VA write-watch; wild
   value hunt) and the exact next step.
+- M118b — **Cranelift JIT spike (native, 2.5x on compute loops)**:
+  `cpu/src/jit.rs` compiles hot straight-line integer blocks to native
+  code (`cranelift-jit`, native-only; the wasm build is unaffected) and a
+  fib-style loop runs **2.5x faster than the interpreter** (89.5 vs 35.4
+  MIPS, identical result). Runner hook behind `PI3_JIT` (off by default),
+  with cached bails and Cranelift-panic guards. The arm subset is
+  differential-tested (`cpu/examples/jit-diff.rs`, 41/41 green), but the
+  full kernel boot with `PI3_JIT=1` is not yet safe (a case outside the
+  curated set hangs it) — productionizing it needs the full fuzzer pass.
+  The shipped speedup is M118's env-flag fix (3.9x native, ~4x wasm).

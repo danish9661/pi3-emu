@@ -64,6 +64,17 @@ pub struct Runner {
     /// fetch+decode. Zero-cost (two u64 increments on the step loop).
     pub steps: u64,
     pub jumps: u64,
+    /// M118b Cranelift JIT (native only, env `PI3_JIT`): hot backward-
+    /// branch blocks compiled to native code. Fallback to the interpreter
+    /// for unsupported blocks and on any boundary. Off by default.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub jit: Option<crate::jit::Jit>,
+    #[cfg(not(target_arch = "wasm32"))]
+    jit_nzcv: [u8; 4],
+    #[cfg(not(target_arch = "wasm32"))]
+    jit_on: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub jit_boundary: bool,
 }
 
 impl Runner {
@@ -91,6 +102,14 @@ impl Runner {
             steps: 0,
             jumps: 0,
             vector_pending: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            jit: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            jit_nzcv: [0; 4],
+            #[cfg(not(target_arch = "wasm32"))]
+            jit_on: std::env::var("PI3_JIT").is_ok(),
+            #[cfg(not(target_arch = "wasm32"))]
+            jit_boundary: false,
         }
     }
 
@@ -148,6 +167,26 @@ impl Runner {
             let mut done = 0u64;
             let mut prev = cpu.pc;
             while done < m {
+                // M118b: on a JUMP, try a compiled block for the target.
+                // Backward-branch targets (loops) are compiled on first
+                // sight — they are the hottest. Forward jumps are left to
+                // the interpreter (they run once). Everything is a no-op
+                // with PI3_JIT unset.
+                #[cfg(not(target_arch = "wasm32"))]
+                if self.jit_on && cpu.pc.wrapping_sub(prev) != 4 {
+                    let target = cpu.pc;
+                    if target <= prev {
+                        // backward branch (a loop entry): JIT-compile it.
+                        self.jit_run(bus, cpu, target);
+                        self.steps += 1;
+                        prev = cpu.pc;
+                        if self.jit_boundary {
+                            self.jit_boundary = false;
+                        } else {
+                            continue;
+                        }
+                    }
+                }
                 let r = cpu.step(bus);
                 self.steps += 1;
                 if cpu.pc.wrapping_sub(prev) != 4 {
@@ -326,6 +365,53 @@ impl Runner {
             }
         }
         self.n - start
+    }
+
+    /// M118b: run one compiled block for `target` (a loop entry).
+    /// Compiles on first sight; on a bail or a runtime boundary the caller
+    /// falls back to the interpreter for that instruction (jit_boundary).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn jit_run(&mut self, bus: &mut crate::Bus, cpu: &mut crate::Cpu, target: u64) {
+        use crate::Bus;
+        let mut words = [0u32; 16];
+        let mut n = 0usize;
+        for i in 0..16u64 {
+            match bus.read(target + i * 4, 4) {
+                Ok(v) => words[i as usize] = v as u32,
+                Err(_) => break,
+            }
+            n += 1;
+        }
+        if self.jit.is_none() {
+            self.jit = Some(crate::jit::Jit::new());
+        }
+        let f = match self.jit.as_mut().unwrap().compile(cpu, target, &words[..n]) {
+            Some(f) => f,
+            None => {
+                self.jit_boundary = true;
+                return;
+            }
+        };
+        // Seed the flag array from the CPU's actual NZCV — the compiled
+        // block reads them (a zeroed array would make every flag-dependent
+        // instruction see n=z=c=v=0, wrong whenever the block inherits a
+        // nonzero state).
+        let (n, z, c, v) = cpu.flags();
+        self.jit_nzcv = [n as u8, z as u8, c as u8, v as u8];
+        let next = unsafe {
+            f(bus as *mut Bus, cpu.x.as_mut_ptr(), &mut cpu.sp, self.jit_nzcv.as_mut_ptr())
+        };
+        if next < 0 {
+            // A memory fault or boundary: resume in the interpreter so it
+            // delivers the fault the same way.
+            self.jit_boundary = true;
+            return;
+        }
+        cpu.n = self.jit_nzcv[0] != 0;
+        cpu.z = self.jit_nzcv[1] != 0;
+        cpu.c = self.jit_nzcv[2] != 0;
+        cpu.v = self.jit_nzcv[3] != 0;
+        cpu.pc = next as u64;
     }
 
     /// Fault as a short string (wasm boundary + diff output).

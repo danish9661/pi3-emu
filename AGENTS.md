@@ -2669,6 +2669,49 @@ for `WWATCH`; the lesson needed re-learning).
   spot, `bb_len=7.75` says blocks are long enough to matter, and the
   `steps`/`jumps` counters in `Runner` make the measurement reproducible.
 
+### M118b — Cranelift JIT spike (native, 2.5x on compute loops; NOT kernel-safe yet) (DONE, committed)
+
+The user-asked JIT strategy, implemented and measured honestly.
+
+- **`cpu/src/jit.rs`** compiles hot straight-line integer blocks to native
+  code via Cranelift (`cranelift-jit 0.132`, native-only dep —
+  `cfg(not(wasm32))`, wasm build unaffected). A straight-line block of the
+  top integer arms (mov/movk/add/sub/and/orr/eor/bic, lsl/lsr/asr, cmp,
+  cbz/cbnz/tbz/tbnz/b.cond/b/bl/ret/br/blr, adrp/adr, ldr/str/ldrb/strb/
+  ldrh/strh/ldur/stur/ldp/stp, nop, csel/cset, mul/madd/msub/umulh/smulh/
+  udiv/sdiv) is compiled once and called thereafter — no fetch TLB probe,
+  no decode, no match dispatch per instruction. Memory accesses call back
+  into `Bus::read`/`Bus::write` (shared with the interpreter). Anything
+  outside the subset → boundary → interpreter.
+- **Measured: 2.5x on a real compute+memory loop** (`cpu/examples/
+  jit-bench.rs`: a fib-style sum loop, assembled with `aarch64-none-elf-as`):
+  **89.5 MIPS JIT vs 35.4 MIPS interpreter**, identical result.
+- **Hardened with a differential test** (`cpu/examples/jit-diff.rs`, 41
+  curated cases JIT-vs-interpreter, full state diff incl. NZCV): real bugs
+  found and fixed — branch-immediate sign extension (backward branches),
+  the `wr` callback signature (3 vs 4 args), the flag array seeded from
+  the CPU's actual NZCV (a zeroed array made every flag-dependent insn
+  see all-zero), the logical family's `n` bit for ORR/EOR (ORN/EON were
+  not inverted), `ands` must clear C/V, MADD/MSUB select bit is 15 not
+  21, UMULH/SMULH signed bit is 22, and the family masks must not include
+  the Ra/opcode fields (mul is madd with Ra=xzr). 41/41 green.
+- **Runner integration** (`PI3_JIT`, off by default): backward-branch
+  targets (loops) compile on first sight; forward jumps stay interpreted.
+  Bails are cached (no re-attempt spam), Cranelift's own panics are caught
+  with `catch_unwind` (a reused `FunctionBuilderContext` accumulated
+  sigs/import-refs until its own pass panicked "entry block unknown" —
+  fresh ctx AND fbc per block fixed it).
+- **NOT kernel-safe yet:** the full kernel boot with `PI3_JIT=1` still
+  hangs on a block outside the curated 41 (a subtle semantic case the
+  curated set misses). Productionizing it needs the FULL fuzzer pass
+  (`test/cpu-cases.mjs`'s 1173 snippets) run against the JIT — that is
+  the next milestone, not this one. Default path unaffected (battery
+  green: smoke 25/25, fuzzer 1173/1173, simd-diff 309/309, mmu-tlb 18/18,
+  Linux 20M pin unchanged).
+- The REAL shipped speedup is M118's env-flag fix (3.9x native, ~4x
+  wasm). This spike proves the codegen path works and is worth the fuzzer
+  pass; it does not yet help the demos.
+
 ### M115 — userspace corruption ROOT-CAUSED: TLB tag was non-injective + no PTE permission model (DONE, uncommitted)
 
 The Linux boot reached busybox init but init's child aborted with

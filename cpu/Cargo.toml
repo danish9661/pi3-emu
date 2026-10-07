@@ -9,3 +9,12 @@ crate-type = ["cdylib", "rlib"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
+
+# M118 JIT spike (native only): compile hot straight-line integer blocks
+# to machine code via Cranelift. Never linked into the wasm build.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cranelift-jit = "0.132.0"
+cranelift-module = "0.132.0"
+cranelift-frontend = "0.132.0"
+cranelift-codegen = "0.132.0"
+cranelift-native = "0.132.0"
