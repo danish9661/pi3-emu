@@ -75,6 +75,8 @@ pub struct Runner {
     jit_on: bool,
     #[cfg(not(target_arch = "wasm32"))]
     pub jit_boundary: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    jit_hits: [u8; 4096],
 }
 
 impl Runner {
@@ -110,6 +112,8 @@ impl Runner {
             jit_on: std::env::var("PI3_JIT").is_ok(),
             #[cfg(not(target_arch = "wasm32"))]
             jit_boundary: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            jit_hits: [0; 4096],
         }
     }
 
@@ -373,6 +377,16 @@ impl Runner {
     #[cfg(not(target_arch = "wasm32"))]
     fn jit_run(&mut self, bus: &mut crate::Bus, cpu: &mut crate::Cpu, target: u64) {
         use crate::Bus;
+        // Only compile HOT blocks. The kernel boot runs thousands of
+        // unique backward-branch blocks ONCE each (init code) — compiling
+        // them all dominates the boot (~1ms/block). A block must be hit
+        // 32 times (interpreted first) before it's worth the compile.
+        let slot = ((target >> 4) & 4095) as usize;
+        if self.jit_hits[slot] < 32 {
+            self.jit_hits[slot] = self.jit_hits[slot].wrapping_add(1);
+            self.jit_boundary = true;
+            return;
+        }
         let mut words = [0u32; 16];
         let mut n = 0usize;
         for i in 0..16u64 {

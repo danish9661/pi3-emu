@@ -1356,13 +1356,22 @@ dist/                 production bundle
   an inert branch to a hot path moves it) -- see AGENTS.md M117 for the
   instruments (whole-boot TLB audit: 0 stale hits; VA write-watch; wild
   value hunt) and the exact next step.
-- M118b — **Cranelift JIT spike (native, 2.5x on compute loops)**:
-  `cpu/src/jit.rs` compiles hot straight-line integer blocks to native
-  code (`cranelift-jit`, native-only; the wasm build is unaffected) and a
-  fib-style loop runs **2.5x faster than the interpreter** (89.5 vs 35.4
-  MIPS, identical result). Runner hook behind `PI3_JIT` (off by default),
-  with cached bails and Cranelift-panic guards. The arm subset is
-  differential-tested (`cpu/examples/jit-diff.rs`, 41/41 green), but the
-  full kernel boot with `PI3_JIT=1` is not yet safe (a case outside the
-  curated set hangs it) — productionizing it needs the full fuzzer pass.
-  The shipped speedup is M118's env-flag fix (3.9x native, ~4x wasm).
+- M118b/M119 — **Cranelift JIT (native, 2.5x on compute loops,
+  kernel-safe)**: `cpu/src/jit.rs` compiles hot straight-line integer
+  blocks to native code (`cranelift-jit`, native-only; the wasm build is
+  unaffected) and a fib-style loop runs **2.5x faster than the
+  interpreter** (89.5 vs 35.4 MIPS, identical result). Runner hook behind
+  `PI3_JIT` (off by default), with cached bails and Cranelift-panic
+  guards. The arm subset is now **fuzzer-clean**: `node
+  test/cpu-cases.mjs --jit` runs all 1173 snippets through
+  `cpu/examples/jit-one.rs` and diffs against the interpreter goldens
+  (signed loads, pair writeback, NZCV width, bitfield insert/extract
+  forms, the unscaled-STUR address — all fixed against assembler truth).
+  The kernel boot with `PI3_JIT=1` **completes** (hit-counted compile,
+  32 hits before JITing a block) but is honestly a net loss there
+  (~5–11s vs 0.91s interpreted — the kernel's hot code is
+  memory/IRQ-heavy, so the memory callbacks dominate and the
+  fetch/decode win never materializes). The interpreter stays the right
+  engine for the kernel boot; the JIT pays off for compute-dense loops.
+  The shipped speedup is M118's env-flag fix (3.9x native, ~4x wasm),
+  default on.

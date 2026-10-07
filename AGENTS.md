@@ -2669,7 +2669,7 @@ for `WWATCH`; the lesson needed re-learning).
   spot, `bb_len=7.75` says blocks are long enough to matter, and the
   `steps`/`jumps` counters in `Runner` make the measurement reproducible.
 
-### M118b — Cranelift JIT spike (native, 2.5x on compute loops; NOT kernel-safe yet) (DONE, committed)
+### M118b — Cranelift JIT spike (native, 2.5x on compute loops; kernel-safe, fuzzer-clean) (DONE, committed)
 
 The user-asked JIT strategy, implemented and measured honestly.
 
@@ -2701,16 +2701,41 @@ The user-asked JIT strategy, implemented and measured honestly.
   with `catch_unwind` (a reused `FunctionBuilderContext` accumulated
   sigs/import-refs until its own pass panicked "entry block unknown" —
   fresh ctx AND fbc per block fixed it).
-- **NOT kernel-safe yet:** the full kernel boot with `PI3_JIT=1` still
-  hangs on a block outside the curated 41 (a subtle semantic case the
-  curated set misses). Productionizing it needs the FULL fuzzer pass
-  (`test/cpu-cases.mjs`'s 1173 snippets) run against the JIT — that is
-  the next milestone, not this one. Default path unaffected (battery
-  green: smoke 25/25, fuzzer 1173/1173, simd-diff 309/309, mmu-tlb 18/18,
-  Linux 20M pin unchanged).
+- **Kernel-safe now (full fuzzer pass, M119):** a new `--jit` mode in
+  `test/cpu-cases.mjs` runs every fuzzer snippet through
+  `cpu/examples/jit-one.rs` (one.rs's exact argv/output interface, JIT
+  execution) and diffs against the interpreter goldens. It flushed out
+  and fixed the classes the curated 41 missed, all against
+  assembler-truth: signed loads (LDRSB/LDRSH/LDRSW), LDPSW bail,
+  FP-vs-integer LD/ST exclusion (bit 26), register-offset loads,
+  post/pre-index writeback, NZCV width (`set_nz` used bit 63 for a
+  32-bit N), 32-bit carry/overflow masking in `set_flags`, the LSL/LSR
+  swap in `shift()`, SBFIZ's sign-extend width (`d = (imms-immr) mod
+  width`, the interpreter's formula), UBFM's insert form (`ROR(src,R) &
+  ROR(tmask,R)` — mask must apply to the source, not after the shift),
+  the `b`/`bl` arm returning `Some(false)` after a terminator (the
+  fall-through then appended a second return to a filled block —
+  Cranelift "cannot add an instruction to a block already filled"),
+  and the unscaled STUR/LDUR access address using bare `base` instead
+  of `base+offset` (`jit_wr` saw `va=base`, proven by a PI3_JITTRACE
+  print in `jit_wr`). **1173/1173 green.**
+- **Kernel-boot verdict, measured and honest:** with the fuzzer clean,
+  `PI3_JIT=1` boot first still timed out at 300s — compiling every
+  backward-branch block on first sight dominated the boot (thousands
+  of one-shot init blocks × ~1ms compile each). Hit-counting (compile
+  only after 32 hits, `jit_hits[4096]` in the Runner) made the boot
+  COMPLETE (~5–11s vs 0.91s interpreted, threshold-insensitive
+  8–256): the kernel's hot code is memory/IRQ-heavy, so the JIT's
+  `bus.read`/`bus.write` callbacks dominate and the fetch/decode win
+  that made the fib loop 2.5x never materializes. **The interpreter
+  stays the right engine for the kernel boot; the JIT pays off only
+  for compute-dense loops.** It remains gated behind `PI3_JIT` (off
+  by default); the default path and all batteries are unaffected
+  (smoke 25/25, fuzzer 1173/1173 interp + JIT, simd-diff 309/309,
+  mmu-tlb 18/18, Linux 20M pin unchanged).
 - The REAL shipped speedup is M118's env-flag fix (3.9x native, ~4x
-  wasm). This spike proves the codegen path works and is worth the fuzzer
-  pass; it does not yet help the demos.
+  wasm), default on. The spike proves the codegen path works, is now
+  fuzzer-clean, and is honestly measured as a compute-loop win.
 
 ### M115 — userspace corruption ROOT-CAUSED: TLB tag was non-injective + no PTE permission model (DONE, uncommitted)
 

@@ -48,7 +48,11 @@ extern "C" fn jit_rd(bus: *mut Bus, va: u64, size: u64, out: *mut u64) -> i32 {
 }
 extern "C" fn jit_wr(bus: *mut Bus, va: u64, size: u64, val: u64) -> i32 {
     let bus = unsafe { &mut *bus };
-    match bus.write(va, size, val) {
+    let r = bus.write(va, size, val);
+    if crate::flag("PI3_JITTRACE") {
+        eprintln!("jit_wr va=0x{:x} size={} -> {:?}", va, size, r);
+    }
+    match r {
         Ok(()) => 0,
         Err(_) => -1,
     }
@@ -166,6 +170,7 @@ impl Jit {
         let spp = fb.block_params(entry)[2];
         let nzvp = fb.block_params(entry)[3];
 
+        let fault_exit = fb.create_block();
         let mut emitter = Emitter {
             fb: &mut fb,
             busp,
@@ -175,6 +180,8 @@ impl Jit {
             module: &mut self.module,
             rd_id: self.rd_id,
             wr_id: self.wr_id,
+            fault_exit,
+            cont: Vec::new(),
         };
 
         let mut cur = pc;
@@ -194,10 +201,17 @@ impl Jit {
             }
         }
         // Fall off the end: return the next pc (only if no branch ended it).
+        // This must come FIRST — switching to fault_exit asserts the entry
+        // block is filled, which is only true after this terminator.
         if !terminated {
             let ret = fb.ins().iconst(types::I64, cur as i64);
             fb.ins().return_(&[ret]);
         }
+        // Populate the shared fault-exit block (return -1).
+        fb.switch_to_block(fault_exit);
+        fb.seal_block(fault_exit);
+        let neg1 = fb.ins().iconst(types::I64, -1i64);
+        fb.ins().return_(&[neg1]);
         fb.seal_all_blocks();
         fb.finalize();
         // Cranelift's own passes can panic on pathological IR (e.g.
@@ -240,6 +254,8 @@ struct Emitter<'a, 'b> {
     module: &'b mut JITModule,
     rd_id: FuncId,
     wr_id: FuncId,
+    fault_exit: cranelift_codegen::ir::Block,
+    cont: Vec<cranelift_codegen::ir::Block>,
 }
 
 type V = cranelift_codegen::ir::Value;
@@ -305,7 +321,9 @@ impl<'a, 'b> Emitter<'a, 'b> {
             }
             let t = self.iconst(target);
             self.fb.ins().return_(&[t]);
-            return Some(false);
+            // A b/bl TERMINATES the block — returning false here let the
+            // fall-through append a second return to a filled block.
+            return Some(true);
         }
         if (w & 0xffff_fc1f) == 0xd65f_0000 {
             // ret
@@ -438,7 +456,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
             let v = if op == 0 { self.fb.ins().iadd(a, b) } else { self.fb.ins().isub(a, b) };
             let v = if sf == 0 { self.w32(v) } else { v };
             if s == 1 {
-                self.set_flags(a, b, v, op);
+                self.set_flags(a, b, v, op, sf);
             }
             if rd == 31 && s == 0 {
                 self.store_sp(v);
@@ -447,27 +465,40 @@ impl<'a, 'b> Emitter<'a, 'b> {
             }
             return Some(false);
         }
-        // add/sub (register, shifted)
-        if (w & 0x1f00_0000) == 0x1100_0000 && (w >> 21) & 1 == 1 {
-            // handled below in the data-processing section; unreachable
-        }
+        // ADD/SUB (shifted OR extended register). The interpreter's
+        // disambiguation (lib.rs, fuzzer-pinned): bit 21 selects EXTENDED
+        // (uxtw/uxtx/sxtb/sxth/sxtw/sxtx with option + imm3) vs SHIFTED
+        // (lsl/lsr/asr with imm6). The old code read option+imm3 as imm6,
+        // which is the extend-group DIFF set.
         if (w & 0x1f00_0000) == 0x0b00_0000 {
             let op = (w >> 30) & 1;
             let s = (w >> 29) & 1;
-            let sh = (w >> 22) & 3;
-            let imm6 = ((w >> 10) & 0x3f) as u32;
-            let a = if rn == 31 { self.load_sp() } else { self.load_x(rn) };
+            let extended = (w >> 21) & 1 == 1;
             let mut b = self.load_x(rm);
-            if sf == 0 {
-                b = self.w32(b);
+            if extended {
+                b = self.extend_reg(b, (w >> 13) & 7, ((w >> 10) & 7) as u32);
+            } else {
+                if sf == 0 {
+                    b = self.w32(b);
+                }
+                let imm6 = ((w >> 10) & 0x3f) as u32;
+                if imm6 != 0 {
+                    b = self.shift((w >> 22) & 3, b, imm6, sf);
+                }
             }
-            if imm6 != 0 {
-                b = self.shift(sh, b, imm6, sf);
-            }
+            // Rn==31: SP everywhere EXCEPT shifted-form SUB (S=0 or S=1),
+            // where it reads XZR (lib.rs's proven rule; `neg x1,x1`).
+            let a = if rn == 31 && !extended && op == 1 {
+                self.load_x(31) // XZR
+            } else if rn == 31 {
+                self.load_sp()
+            } else {
+                self.load_x(rn)
+            };
             let v = if op == 0 { self.fb.ins().iadd(a, b) } else { self.fb.ins().isub(a, b) };
             let v = if sf == 0 { self.w32(v) } else { v };
             if s == 1 {
-                self.set_flags(a, b, v, op);
+                self.set_flags(a, b, v, op, sf);
             }
             if rd == 31 && s == 0 {
                 self.store_sp(v);
@@ -506,7 +537,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
                 // ands: N/Z from the result; C/V = 0 (shift_carry = 0 for
                 // the non-rotate forms — rotate is rare and currently a
                 // documented gap).
-                self.set_nz(v);
+                self.set_nz(v, sf);
                 let zero = self.iconst(0);
                 self.store_flag(2, zero);
                 self.store_flag(3, zero);
@@ -535,7 +566,7 @@ impl<'a, 'b> Emitter<'a, 'b> {
             let v = if op == 0 { self.fb.ins().iadd(a, b) } else { self.fb.ins().isub(a, b) };
             let b_eff = if op == 0 { b } else { self.fb.ins().bnot(b) };
                 let vr = if sf == 0 { self.w32(v) } else { v };
-                self.set_flags(a, b_eff, vr, op);
+                self.set_flags(a, b_eff, vr, op, sf);
             return Some(false);
         }
         // mul/madd/msub
@@ -574,33 +605,80 @@ impl<'a, 'b> Emitter<'a, 'b> {
         // udiv/sdiv
         // UDIV/SDIV: 2-source class 0x1ac00000; opcode bits[15:10] = 1
         // selects SDIV (assembler-truth, sel.s).
+        // 2-source class 0x1ac00000: opcode bits[15:10] selects the op
+        // (assembler-truth, src2.s): 2 UDIV, 3 SDIV, 8 LSLV, 9 LSRV,
+        // 10 ASRV, 11 RORV. The old code treated every op as a div and
+        // crashed on the shift forms.
         if (w & 0x7fe0_d000) == 0x1ac0_0000 {
-            let o1 = (w >> 10) & 1;
+            let op = (w >> 10) & 0x3f;
             let a = self.load_x(rn);
             let b = self.load_x(rm);
-            let zero = self.iconst(0);
-            let q = if o1 == 0 {
-                self.fb.ins().udiv(a, b)
-            } else {
-                self.fb.ins().sdiv(a, b)
+            let v = match op {
+                2 | 3 => {
+                    let zero = self.iconst(0);
+                    let q = if op == 2 {
+                        self.fb.ins().udiv(a, b)
+                    } else {
+                        self.fb.ins().sdiv(a, b)
+                    };
+                    // div-by-zero -> 0 (ARM semantics)
+                    let bnz0 = self
+                        .fb
+                        .ins()
+                        .icmp_imm(cranelift_codegen::ir::condcodes::IntCC::NotEqual, b, 0);
+                    let bnz = self.bool64(bnz0);
+                    self.fb.ins().select(bnz, q, zero)
+                }
+                8 => self.fb.ins().ishl(a, b),
+                9 => self.fb.ins().ushr(a, b),
+                10 => self.fb.ins().sshr(a, b),
+                11 => {
+                    // ror = (a >> b) | (a << (width - b)); b==0 -> a.
+                    let l = self.fb.ins().ushr(a, b);
+                    let width = if sf == 0 { 32i64 } else { 64i64 };
+                    let comp = self.fb.ins().irsub_imm(b, width);
+                    let h = self.fb.ins().ishl(a, comp);
+                    self.fb.ins().bor(l, h)
+                }
+                _ => return None,
             };
-            // div-by-zero -> 0 (ARM semantics)
-            let bnz = self
-                .fb
-                .ins()
-                .icmp_imm(cranelift_codegen::ir::condcodes::IntCC::NotEqual, b, 0);
-            let v = self.fb.ins().select(bnz, q, zero);
             let v = if sf == 0 { self.w32(v) } else { v };
             self.store_x(rd, v);
             return Some(false);
         }
-        // ldr/str (unsigned offset)
-        if (w & 0x3b00_0000) == 0x3900_0000 {
+        // LDRSB/LDRSH/LDRSW (signed loads, unsigned offset): the 0x39
+        // class with opc(bits[23:22]) == 2 or 3. size(bits[31:30]) picks
+        // the element: 0 = byte, 1 = halfword, 2 = word; opc 2 = sign-extend
+        // to 64-bit, opc 3 = sign-extend to 32-bit (LDRSW is size 2 / opc 2).
+        if (w & 0x3b00_0000) == 0x3900_0000 && (w >> 26) & 1 == 0 && ((w >> 22) & 3) >= 2 {
+            let opc = (w >> 22) & 3;
+            let size = (w >> 30) & 3;
+            let imm12 = ((w >> 10) & 0xfff) as u64;
+            let off = imm12 << size;
+            let base = if rn == 31 { self.load_sp() } else { self.load_x(rn) };
+            let addr = self.fb.ins().iadd_imm(base, off as i64);
+            let bytes = 1u64 << size;
+            let v = self.mem_rd(addr, bytes)?;
+            let narrow = match size {
+                0 => self.fb.ins().ireduce(types::I8, v),
+                1 => self.fb.ins().ireduce(types::I16, v),
+                _ => self.fb.ins().ireduce(types::I32, v),
+            };
+            let out = self.fb.ins().sextend(types::I64, narrow);
+            // LDRSB/SH/SW to W (opc 3) zero the top 32 (X-result masked).
+            let out = if opc == 3 { self.w32(out) } else { out };
+            self.store_x(rd, out);
+            return Some(false);
+        }
+        // ldr/str (unsigned offset) — INTEGER only (bit 26 = V=0); the
+        // SIMD&FP forms (V=1, e.g. `ldr d1, [x8]`) are a different class
+        // the JIT bails to the interpreter for.
+        if (w & 0x3b00_0000) == 0x3900_0000 && (w >> 26) & 1 == 0 {
             let is_load = (w >> 22) & 1;
             let size = (w >> 30) & 3;
             let imm12 = ((w >> 10) & 0xfff) as u64;
             let off = imm12 << size;
-            let base = self.load_x(rn);
+            let base = if rn == 31 { self.load_sp() } else { self.load_x(rn) };
             let addr = self.fb.ins().iadd_imm(base, off as i64);
             let bytes = 1u64 << size;
             if is_load == 1 {
@@ -612,34 +690,103 @@ impl<'a, 'b> Emitter<'a, 'b> {
             }
             return Some(false);
         }
-        // ldur/stur (unscaled, signed 9-bit)
-        if (w & 0x3b00_0000) == 0x3800_0000 {
+        // ldur/stur + post/pre-index (signed 9-bit) — INTEGER only. Addressing mode per
+        // (bit11, bit10): 00 unscaled (no writeback), 01 post-index, 11
+        // pre-index — the interpreter's proven rule (lib.rs). The old code
+        // only did unscaled, so `ldr x0,[x1],#8` (post) never wrote x1 back.
+        if (w & 0x3b00_0000) == 0x3800_0000 && (w >> 26) & 1 == 0 {
             let is_load = (w >> 22) & 1;
             let size = (w >> 30) & 3;
-            let imm9 = (((w >> 12) & 0x1ff) as i32) << 23 >> 23; // sign-extend 9
-            let base = self.load_x(rn);
-            let addr = self.fb.ins().iadd_imm(base, imm9 as i64);
+            if (w >> 21) & 1 == 1 {
+                // REGISTER OFFSET (the interpreter's proven rule, lib.rs):
+                // option = bits[15:13], S = bit12, amount = if S { size }
+                // else 0 (LSL #esz-log2). Then off = extend_reg(rm, option,
+                // amount), addr = base + off.
+                let option = (w >> 13) & 7;
+                let s = (w >> 12) & 1;
+                let amount = if s == 1 { size } else { 0 };
+                let base = if rn == 31 { self.load_sp() } else { self.load_x(rn) };
+                let rmv = self.load_x(rm);
+                let off = self.extend_reg(rmv, option, amount as u32);
+                let addr = self.fb.ins().iadd(base, off);
+                let bytes = 1u64 << size;
+                if is_load == 1 {
+                    let v = self.mem_rd(addr, bytes)?;
+                    self.store_x(rd, v);
+                } else {
+                    let v = if rd == 31 { self.iconst(0) } else { self.load_x(rd) };
+                    self.mem_wr(addr, bytes, v)?;
+                }
+                return Some(false);
+            }
+            // Sign-extend the 9-bit immediate with the PROVEN sext helper
+            // (same one the branches use — the i32 shift form mis-shifted
+            // and left the offset at 0, so jit_wr saw va=base).
+            let imm9 = Self::sext(((w >> 12) & 0x1ff) as u64, 9);
+            let mode = ((w >> 11) & 1) << 1 | ((w >> 10) & 1);
+            let base = if rn == 31 { self.load_sp() } else { self.load_x(rn) };
+            // Use iadd(base, iconst(imm9)) so a NEGATIVE offset is applied
+            // — iadd_imm with a negative immediate silently dropped the
+            // offset (jit_wr saw va=base, never base+off, proven by the
+            // stur #-256 trace).
+            let offv = self.iconst((imm9 as i64) as u64);
+            let addr = self.fb.ins().iadd(base, offv);
             let bytes = 1u64 << size;
+            // The access address: UNSCALED and POST use base+offset
+            // (unscaled IS base+offset; post accesses base and writes the
+            // offset back AFTER); only PRE also uses base+offset. The old
+            // code used bare `base` for unscaled/post, so stur/ldur wrote
+            // the base with NO offset (jit_wr saw va=base).
+            let acc = if mode == 0b01 { base } else { addr };
             if is_load == 1 {
-                let v = self.mem_rd(addr, bytes)?;
+                let v = self.mem_rd(acc, bytes)?;
                 self.store_x(rd, v);
             } else {
                 let v = if rd == 31 { self.iconst(0) } else { self.load_x(rd) };
-                self.mem_wr(addr, bytes, v)?;
+                self.mem_wr(acc, bytes, v)?;
+            }
+            // Writeback: both post and pre land the base at base+offset
+            // (= addr); SP gets store_sp.
+            if mode != 0b00 {
+                if rn == 31 {
+                    self.store_sp(addr);
+                } else {
+                    self.store_x(rn, addr);
+                }
             }
             return Some(false);
         }
-        // ldp/stp (offset, signed 7-bit scaled)
-        if (w & 0x3a00_0000) == 0x2800_0000 || (w & 0x3a00_0000) == 0x2900_0000 || (w & 0x3a00_0000) == 0x2c00_0000 || (w & 0x3a00_0000) == 0x2d00_0000 {
+        // ldp/stp (signed offset + post/pre-index, signed 7-bit scaled).
+        // Addressing mode bits[24:23]: 00/10 offset (addr = base+off, no
+        // writeback), 11 pre (addr = base+off, wb = addr), 01 post
+        // (addr = base, wb = base+off FIRST) — the interpreter's rule.
+        if ((w & 0x3a00_0000) == 0x2800_0000 || (w & 0x3a00_0000) == 0x2900_0000 || (w & 0x3a00_0000) == 0x2c00_0000 || (w & 0x3a00_0000) == 0x2d00_0000) && (w >> 26) & 1 == 0 {
             let is_load = (w >> 22) & 1;
             let size_class = (w >> 30) & 3; // 0=32-bit, 2=64-bit
+            if size_class == 1 {
+                // LDPSW (signed-word pair) is a different instruction —
+                // not in the integer subset.
+                return None;
+            }
             let rt = rd;
             let rt2 = (w >> 10) & 31;
             let scale = if size_class == 0 { 2 } else { 3 };
             let imm7 = ((((w >> 15) & 0x7f) as i32) << 25 >> 25) as i64;
             let off = imm7 << scale;
+            let mode = (w >> 23) & 3;
             let base = if rn == 31 { self.load_sp() } else { self.load_x(rn) };
-            let addr = self.fb.ins().iadd_imm(base, off);
+            let baseoff = self.fb.ins().iadd_imm(base, off);
+            // Pre (11) accesses at base+off; offset (00/10) at base+off;
+            // post (01) at base (writeback is base+off, applied FIRST).
+            let addr = if mode == 0b01 { base } else { baseoff };
+            if mode == 0b01 || mode == 0b11 {
+                let wb = baseoff;
+                if rn == 31 {
+                    self.store_sp(wb);
+                } else {
+                    self.store_x(rn, wb);
+                }
+            }
             let bytes = 1u64 << scale;
             if is_load == 1 {
                 let a = self.mem_rd(addr, bytes)?;
@@ -688,61 +835,116 @@ impl<'a, 'b> Emitter<'a, 'b> {
         None
     }
 
-    fn shift(&mut self, sh: u32, v: V, amount: u32, sf: u32) -> V {
-        let a = amount as i32;
-        match sh {
-            0 => self.fb.ins().ushr_imm(v, a as i64),
-            1 => self.fb.ins().ishl_imm(v, a as i64),
-            2 => self.fb.ins().sshr_imm(v, a as i64),
-            _ => {
-                // ror
-                let l = self.fb.ins().ushr_imm(v, a as i64);
-                let h = self.fb.ins().ishl_imm(v, (64 - a) as i64);
-                self.fb.ins().bor(l, h)
+    /// extend_reg (mirrors lib.rs): zero/sign-extend the low bits of `v`
+    /// per `option` (0 uxtb, 1 uxth, 2 uxtw, 3 uxtx, 4 sxtb, 5 sxth,
+    /// 6 sxtw, 7 sxtx) and shift left by `amount`.
+    fn extend_reg(&mut self, v: V, option: u32, amount: u32) -> V {
+        let masked = match option & 7 {
+            0 => self.fb.ins().band_imm(v, 0xff),
+            1 => self.fb.ins().band_imm(v, 0xffff),
+            2 => self.fb.ins().band_imm(v, 0xffff_ffff),
+            4 => {
+                let b = self.fb.ins().ireduce(types::I8, v);
+                self.fb.ins().sextend(types::I64, b)
             }
+            5 => {
+                let h = self.fb.ins().ireduce(types::I16, v);
+                self.fb.ins().sextend(types::I64, h)
+            }
+            6 => {
+                let w = self.fb.ins().ireduce(types::I32, v);
+                self.fb.ins().sextend(types::I64, w)
+            }
+            _ => v,
+        };
+        if amount == 0 {
+            masked
+        } else {
+            self.fb.ins().ishl_imm(masked, amount as i64)
+        }
+    }
+
+    fn shift(&mut self, sh: u32, v: V, amount: u32, sf: u32) -> V {
+        // ARM shift types (bits[23:22]): 0 LSL, 1 LSR, 2 ASR, 3 ROR. The
+        // old mapping had LSL/LSR swapped.
+        let a = amount as i64;
+        match sh {
+            0 => self.fb.ins().ishl_imm(v, a),      // LSL
+            1 => self.fb.ins().ushr_imm(v, a),      // LSR
+            2 => self.fb.ins().sshr_imm(v, a),      // ASR
+            _ => self.ror_imm(v, a, if sf == 0 { 32 } else { 64 }),
         }
     }
 
     fn ubfm(&mut self, a: V, opc: u32, _n: u32, immr: u32, imms: u32, sf: u32) -> Option<V> {
-        // opc: 0 SBFM(asr), 1 BFM(bfi), 2 UBFM(lsr/lsl)
+        // opc: 0 SBFM, 1 BFM(bfi), 2 UBFM. Correct field semantics (the
+        // fuzzer's bitfield group): with R=immr, S=imms, width = 32/64:
+        //   S >= R -> extract bits [S:R] (UBFX/SBFX), else insert at
+        //   (width - R) (UBFIZ/SBFIZ). The old code shifted by (R - S)
+        //   which is only the degenerate LSL alias's shape.
         let w = if sf == 0 { 32 } else { 64 };
         if opc == 1 {
             return None; // BFM rare in hot loops; boundary
         }
-        let r = immr;
-        let s = imms;
-        if opc == 0 {
-            // SBFM: sign-extend from bit s, shift right by r
-            let v = self.fb.ins().sshr_imm(a, r as i64);
-            if s < w - 1 {
-                let sh = (w - 1 - s) as i64;
-                let l = self.fb.ins().ishl_imm(v, sh);
-                let v = self.fb.ins().sshr_imm(l, sh);
-                return Some(v);
+        let r = immr as i64;
+        let sm = imms as i64;
+        if sm >= r {
+            // extract [S:R] = (src >> R) & ((1 << (S - R + 1)) - 1)
+            let field = self.fb.ins().ushr_imm(a, r);
+            let bits = sm - r + 1;
+            let mask = if bits >= 64 { -1i64 } else { (1i64 << bits) - 1 };
+            let v = self.fb.ins().band_imm(field, mask);
+            if opc == 0 {
+                // SBFX: sign-extend from bit `bits`.
+                if bits < 64 {
+                    let l = self.fb.ins().ishl_imm(v, 64 - bits);
+                    return Some(self.fb.ins().sshr_imm(l, 64 - bits));
+                }
             }
             return Some(v);
         }
-        // UBFM
-        if s >= r {
-            // lsr
-            let v = self.fb.ins().ushr_imm(a, (r) as i64);
-            let bits = (s - r + 1) as i64;
-            let mask = if bits >= 64 { -1i64 } else { (1i64 << bits) - 1 };
-            return Some(self.fb.ins().band_imm(v, mask));
+        // INSERT (S < R), the ROR form: dst = ROR(src, R) & ROR(tmask, R)
+        // where tmask = (1 << (S + 1)) - 1. (The old code masked AFTER the
+        // left shift, which keeps the field but also the bits ABOVE it.)
+        let width = w;
+        let tmask_val = if sm + 1 >= 64 { u64::MAX } else { (1u64 << (sm + 1)) - 1 };
+        let tmask = self.iconst(tmask_val);
+        let rotated_src = self.ror_imm(a, r, width);
+        let rotated_tmask = self.ror_imm(tmask, r, width);
+        let v = self.fb.ins().band(rotated_src, rotated_tmask);
+        if opc == 0 {
+            // SBFIZ: sign-extend from bit `d + 1` where `d = (S - R) mod
+            // width` — the interpreter's proven formula (lib.rs SBFM
+            // general case). The old code used `S + 1`, which is only right
+            // for the extract form and mis-sign-extends inserts.
+            let d = ((sm - r).rem_euclid(w)) as i64;
+            let bits = d + 1;
+            if bits < 64 {
+                let l = self.fb.ins().ishl_imm(v, 64 - bits);
+                return Some(self.fb.ins().sshr_imm(l, 64 - bits));
+            }
         }
-        // lsl
-        let v = self.fb.ins().ishl_imm(a, (r - s) as i64);
-        let bits = (s + 1) as i64;
-        let mask = if bits >= 64 { -1i64 } else { (1i64 << bits) - 1 };
-        Some(self.fb.ins().band_imm(v, mask))
+        Some(v)
+    }
+
+    /// ROR `v` by `amount` over `width` bits: (v >> a) | (v << (w - a)).
+    fn ror_imm(&mut self, v: V, amount: i64, width: i64) -> V {
+        let a = ((amount % width) + width) % width;
+        if a == 0 {
+            return v;
+        }
+        let l = self.fb.ins().ushr_imm(v, a);
+        let h = self.fb.ins().ishl_imm(v, width - a);
+        self.fb.ins().bor(l, h)
     }
 
     /// NZCV in nzcv[0..4] as packed n|z|c|v bits (layout matches Cpu).
-    fn set_nz(&mut self, v: V) {
-        // n = sign(v), z = v==0; c/v left as-is is WRONG for ands, but
-        // ands only changes N/Z — C/V are preserved by ARM. So we only
-        // write N and Z.
-        let n = self.fb.ins().sshr_imm(v, 63);
+    fn set_nz(&mut self, v: V, sf: u32) {
+        // N = the RESULT's sign bit — bit 31 for a 32-bit op, bit 63 for a
+        // 64-bit one (the old code used 63 always, so every 32-bit S op
+        // reported N=0).
+        let sh = if sf == 0 { 31 } else { 63 };
+        let n = self.fb.ins().sshr_imm(v, sh);
         let z0 = self
             .fb
             .ins()
@@ -754,8 +956,12 @@ impl<'a, 'b> Emitter<'a, 'b> {
 
     /// ARM flag semantics for `adds/subs/cmp/cmn a, b` producing result
     /// `v` (adds use `b` as-is; subs pass `b` too — the op distinguishes).
-    fn set_flags(&mut self, a: V, b: V, v: V, op: u32) {
-        self.set_nz(v);
+    /// For a 32-bit op the CARRY and OVERFLOW are computed on the 32-bit
+    /// operands, so mask them first.
+    fn set_flags(&mut self, a: V, b: V, v: V, op: u32, sf: u32) {
+        let a = if sf == 0 { self.w32(a) } else { a };
+        let b = if sf == 0 { self.w32(b) } else { b };
+        self.set_nz(v, sf);
         let sa = self.fb.ins().sshr_imm(a, 63);
         let sb = self.fb.ins().sshr_imm(b, 63);
         let sv = self.fb.ins().sshr_imm(v, 63);
@@ -897,19 +1103,22 @@ impl<'a, 'b> Emitter<'a, 'b> {
             .ins()
             .call(rd_ref, &[self.busp, addr, bsz, out_addr]);
         let status = self.fb.inst_results(call)[0];
-        // if status != 0: boundary -> return a status
-        let ok = self
+        // On fault, branch to the shared fault-exit block (return -1)
+        // INSTEAD of continuing with a poisoned register — the
+        // interpreter stops at the faulting instruction, and so must we.
+        let bad = self
             .fb
             .ins()
-            .icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, status, 0);
+            .icmp_imm(cranelift_codegen::ir::condcodes::IntCC::NotEqual, status, 0);
+        let cont = self.fb.create_block();
+        self.fb.ins().brif(bad, self.fault_exit, &[], cont, &[]);
+        self.fb.switch_to_block(cont);
+        self.fb.seal_block(cont);
         let good = self
             .fb
             .ins()
             .load(types::I64, MemFlags::trusted(), out_addr, 0);
-        // Boundary path: return -1 (caller resumes in the interpreter).
-        let neg1 = self.iconst((-1i64) as u64);
-        let sel = self.fb.ins().select(ok, good, neg1);
-        Some(sel)
+        Some(good)
     }
 
     fn mem_wr(&mut self, addr: V, bytes: u64, val: V) -> Option<()> {
@@ -921,7 +1130,15 @@ impl<'a, 'b> Emitter<'a, 'b> {
             .fb
             .ins()
             .call(wr_ref, &[self.busp, addr, bsz, val]);
-        let _status = self.fb.inst_results(call)[0];
+        let status = self.fb.inst_results(call)[0];
+        let bad = self
+            .fb
+            .ins()
+            .icmp_imm(cranelift_codegen::ir::condcodes::IntCC::NotEqual, status, 0);
+        let cont = self.fb.create_block();
+        self.fb.ins().brif(bad, self.fault_exit, &[], cont, &[]);
+        self.fb.switch_to_block(cont);
+        self.fb.seal_block(cont);
         Some(())
     }
 }

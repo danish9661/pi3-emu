@@ -251,6 +251,11 @@ const VECTORS = [
 const filter = (process.argv[2] && !process.argv[2].startsWith('--')) ? process.argv[2] : '';
 const snipfilter = (process.argv[3] && !process.argv[3].startsWith('--')) ? process.argv[3] : '';
 const REGEN = process.argv.includes('--regen');
+// M118b: `--jit` runs each case through target/debug/examples/jit-one
+// (the Cranelift JIT oracle) and diffs against the interpreter goldens —
+// the full-fuzzer hardening pass for kernel safety. `status bail` means
+// "not compilable" (interpreter fallback, OK); anything else must match.
+const JIT = process.argv.includes('--jit');
 // assemble all snippets in one file
 let asm = '.text\n';
 const names = [];
@@ -303,6 +308,24 @@ function runOne(word, regs, fds, sp, nzcv) {
   };
 }
 
+function runJitOne(word, regs, fds, sp, nzcv) {
+  const args = ['0x' + word.toString(16),
+    ...regs.map((x) => '0x' + x.toString(16)), sp, nzcv,
+    ...fds.map((x) => '0x' + x.toString(16))];
+  const out = execFileSync(ROOT + '/target/debug/examples/jit-one', args, { maxBuffer: 8 * 1024 * 1024 }).toString();
+  const L = Object.fromEntries(out.trim().split('\n').map((l) => {
+    const j = l.indexOf(' ');
+    return [l.slice(0, j), l.slice(j + 1)];
+  }));
+  if (L['status'] === 'bail') return { bail: true };
+  return {
+    bail: false,
+    fault: L['status'] !== 'ok',
+    r: L.regs.split(' '), fp: L.fpregs.split(' '), q: L.qregs.split(' '),
+    sp: L.sp.split(' ')[0], pc: L.sp.split(' ')[2], nzcv: L.nzcv, mem: L.mem.split(' '),
+  };
+}
+
 let pass = 0, fail = 0;
 const fails = [];
 const goldens = (REGEN || !existsSync(GOLD)) ? {} : JSON.parse(readFileSync(GOLD, 'utf8'));
@@ -319,8 +342,21 @@ for (let n = 0; n < names.length; n++) {
     for (let k = 0; k < 32; k++) fds.push(BigInt(V.fd(k)));
     let got;
     try {
-      got = runOne(word, regs, fds, BigInt(V.sp), V.nzcv);
+      got = JIT ? runJitOne(word, regs, fds, BigInt(V.sp), V.nzcv) : runOne(word, regs, fds, BigInt(V.sp), V.nzcv);
     } catch (e) { got = { fault: 'CRASH' }; }
+    if (JIT && got && got.bail) {
+      // Not compilable: the interpreter fallback covers it — count as
+      // pass (this is the supported fallback, not a bug).
+      pass++;
+      continue;
+    }
+    if (JIT && got && got.fault === 'CRASH') {
+      // The JIT oracle itself crashed on this case — that IS a JIT bug.
+      fail++;
+      if (fails.length < 15) fails.push(`${g} ${src} [V${v}] word=${words[`${g}_${i}`]}
+  JIT-ORACLE CRASH`);
+      continue;
+    }
     if (REGEN) {
       if (got.fault !== 'CRASH') regenOut[key] = got;
       pass++;
