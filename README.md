@@ -1356,6 +1356,22 @@ dist/                 production bundle
   an inert branch to a hot path moves it) -- see AGENTS.md M117 for the
   instruments (whole-boot TLB audit: 0 stale hits; VA write-watch; wild
   value hunt) and the exact next step.
+- M120 — **USERSPACE SHELL: the real kernel8.img boots to a busybox
+  `~ #` prompt on pi-cpu, zero segfaults.** Two SIMD decoder bugs,
+  each found by execution: (1) SIMD *pair* pre-index writeback was
+  applied on only one store path, so `ldp q1,q2,[x1,#32]!` never
+  advanced `x1` and busybox's NEON `strlen` looped forever (init
+  stalled before the askfirst prompt); (2) `str b`'s unsigned offset
+  was scaled ×16 instead of ×1, so `str b0,[x20,#16]` stored a byte
+  240 bytes past its target — planting `0x02<<40 = 0x20000000000`
+  into ash's `trap[]` array, the wild pointer that segfaulted the
+  shell. Fixes pinned with 45 new fuzzer cases (1218 total, green on
+  interpreter + JIT). Forensics: PA write-watch + whole-boot value
+  hunt + per-step PA poll triangulated the exact writer pc; the
+  `flag()` NAMES-list bug that silently disabled new trace flags was
+  found and fixed along the way. Result at 7B instructions:
+  `Run /bin/init` 1, `VFS: Mounted root` 1, `Please press Enter` 1,
+  `~ #` 231, `Segmentation fault` 0, `Kernel panic` 0.
 - M118b/M119 — **Cranelift JIT (native, 2.5x on compute loops,
   kernel-safe)**: `cpu/src/jit.rs` compiles hot straight-line integer
   blocks to native code (`cranelift-jit`, native-only; the wasm build is

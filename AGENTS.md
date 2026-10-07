@@ -2669,6 +2669,76 @@ for `WWATCH`; the lesson needed re-learning).
   spot, `bb_len=7.75` says blocks are long enough to matter, and the
   `steps`/`jumps` counters in `Runner` make the measurement reproducible.
 
+### M120 — userspace shell: two SIMD store bugs fixed, `~ #` boots with zero segfaults (DONE, committed)
+
+The M117 open item ("init runs but never reaches the prompt") is CLOSED.
+With `PI3_KEY=\n ./target/release/examples/triage 32753 22505969
+7000000000 4096`: `Run /bin/init` 1, `VFS: Mounted root` 1, `Please
+press Enter` 1, **`~ #` 231** (the shell prompting per injected
+keystroke), **`Segmentation fault` 0, `Kernel panic` 0, `malloc` 0,
+`err -110` 0** — the real kernel8.img boots to an interactive busybox
+shell on pi-cpu. Two decoder bugs, each found by execution (never by
+reading), each with a fuzzer pin (1218 cases now):
+
+1. **SIMD pair pre-index writeback applied on ONE path only.** In the
+   `0x16` pair arm, the writeback `wb` was consumed inside the esz-4/8
+   *store* branch only, so **LDP S/D/Q pre-index and STP-Q pre-index
+   never wrote back the base**. busybox init's NEON `strlen` does
+   `ldp q1, q2, [x1, #32]!` — with `x1` never advancing, strlen scanned
+   the same 32 bytes forever: the guest ran 560M+ instructions of pure
+   userspace with zero syscalls (the M117 "init stuck after openat"
+   state). Hoisted the writeback to the end of the arm (post-access,
+   every path). Effect: `Please press Enter` now prints.
+2. **`str b` unsigned-offset scaled ×16 instead of ×1.** The B/Q case
+   of the SIMD single LD/ST arm computed `off = imm12 * 16` (the Q
+   scale) unconditionally; the H/S/D arms already used the element
+   size. `str b0, [x20, #16]` (busybox's struct init) stored its byte
+   at **+256 instead of +16**, landing byte `0x02` 240 bytes past its
+   target — at offset +5 of an 8-byte slot in ash's `trap[]` array,
+   which ash then read as a pointer: `0x02 << 40 = 0x20000000000`
+   (bit 41), the M117 "kernel bitmap" phantom that segfaulted the
+   shell at `pc=0x51f8ac ldrb w1,[x0]`. Fix: `off = imm12 <<
+   esz.trailing_zeros()`. Effect: zero segfaults, `~ #` prompt.
+
+**The forensic trail (why it took a full day):** the phantom slot's
+PA is deterministic per-boot (nokaslr), so a PA write-watch
+(`WWATCH`, now prints `n=` + `pc=` via a new `bus.cpu_pc`) plus a
+whole-boot value hunt (`PI3_VALWATCH`) plus a per-step PA poll
+(`PI3_SCANSTEP` in `Cpu::step`) triangulated the writer to busybox
+`str b0, [x20, #16]` at pc 0x529d0c — after ruling out DMA
+(`PI3_DMAWATCH`: 418 card-reads, none near the page), mailbox,
+USB, atomics (all go through `Bus::write`), and the stale-page
+theory (the page's SLUB-fill → `dc zva` → memset history is fully
+watched). **Process bug found and fixed: `flag()`'s `NAMES` lookup
+list stopped at `"WWATCH"` — any flag added to `flags()` but not to
+`flag()` silently NEVER FIRES** (three of my new watches reported
+"zero hits" for hours before this was noticed; the lists are now in
+sync and must stay that way — the M118 lesson, third time).
+
+**Kept infra (all env-gated, zero-cost off):** WWATCH `n=`/`pc=`
+columns + `PI3_PAWATCH=0x<base>,<len>` arming, `PI3_VAWATCH`
+(pre-translation VA range watch), `PI3_DMAWATCH` (card-read DMA
+destinations), the FAULTKIND wild-pointer dump extended with the
+array-base slots, and `PI3_SCANPA` in the triage (poll any PA per
+chunk). **Removed (one-off probes):** the hardcoded-PA `phantom_wr`
+helper + its 6 call sites, `PI3_CPTRACE`, `PI3_SCANSTEP`,
+`PI3_VALWATCH`'s hardcoded value. Fuzzer: 1173 → **1218** (new pins:
+`str/ldr b/h/s/d/q` unsigned-offset + `ldp/stp s/d/q` pre-index
+writeback). Battery: smoke 25/25, fuzzer 1218/1218 (interpreter +
+JIT), simd-diff 309/309, mmu-tlb 18/18, Linux 20M pin unchanged
+(`pc=0xffffffc008fadee4 x0=0x4b400 fault=null`).
+
+**Methodology that paid:** the PA write-watch proved the slot was
+last *written* as 0 yet *read* as the phantom (ruling out every
+store path); the copy_page trace (`x16=0 x17=0x20000000000
+mem=[0x0 0x20000000000]`) proved the value was genuinely in memory
+(read-side clean); the per-step poll named the exact writer pc.
+**Do NOT retry the dead theories:** DMA scribble (watch: clean),
+mailbox/USB/atomics (all `Bus::write`-routed), stale TLB
+(`PI3_TLBAUDIT` 0 mismatches), unzeroed page (`dc zva` stores
+visible), SIMD pair pre-index (fixed, pinned), `str b` scale (fixed,
+pinned).
+
 ### M118b — Cranelift JIT spike (native, 2.5x on compute loops; kernel-safe, fuzzer-clean) (DONE, committed)
 
 The user-asked JIT strategy, implemented and measured honestly.

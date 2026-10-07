@@ -68,11 +68,24 @@ fn main() {
         // With a key schedule the loop must stay chunked so the byte is
         // pushed while init is actually waiting at the console.
         if key.is_some() {
+            // PI3_SCANPA=<hex>: poll a PA every chunk and log when it
+            // changes, with the pc — catches writes that bypass every
+            // instrumented path (the ash trap[] phantom at 0x13ce678).
+            let scanpa: u64 = std::env::var("PI3_SCANPA").ok()
+                .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(0);
+            let mut scan_last = if scanpa != 0 { bus.mem_u64_dbg_pub(scanpa) } else { 0 };
             while runner.n < budget && runner.fault_string().is_none() {
                 if runner.n % 20_000_000 < 4096 {
                     bus.uart0_push(key.unwrap());
                 }
                 runner.run_to(&mut cpu, &mut bus, (runner.n + 4096).min(budget));
+                if scanpa != 0 {
+                    let cur = bus.mem_u64_dbg_pub(scanpa);
+                    if cur != scan_last {
+                        eprintln!("SCANPA pa=0x{:x} 0x{:x} -> 0x{:x} n={} pc=0x{:x}", scanpa, scan_last, cur, runner.n, cpu.pc);
+                        scan_last = cur;
+                    }
+                }
             }
         } else {
             runner.run_to(&mut cpu, &mut bus, budget);

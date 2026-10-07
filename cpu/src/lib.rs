@@ -32,7 +32,7 @@ fn flags() -> u64 {
             "PI3_EL0TRACE", "PI3_EXCTRACE", "PI3_FAULTKIND", "PI3_HANDLERTRACE",
             "PI3_KTAIL", "PI3_MMIOTRACE", "PI3_PERMTRACE", "PI3_SVCTRACE",
             "PI3_THERMTRACE", "PI3_TIMERTRACE", "PI3_TLBAUDIT", "PI3_PTW",
-            "PI3_POISON", "PI3_JITTRACE", "SDTRACE", "USBTRACE", "WWATCH",
+            "PI3_POISON", "PI3_JITTRACE", "SDTRACE", "USBTRACE", "WWATCH", "PI3_VAWATCH", "PI3_DMAWATCH",
         ];
         let mut mask = 0u64;
         for (i, k) in names.iter().enumerate() {
@@ -46,6 +46,17 @@ fn flags() -> u64 {
 
 /// One flag as a bit position — see `flags()`.
 #[inline(always)]
+fn vawatch_range() -> (u64, u64) {
+    static R: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *R.get_or_init(|| {
+        let v = std::env::var("PI3_VAWATCH").unwrap_or_default();
+        let mut it = v.split(',');
+        let b = u64::from_str_radix(it.next().unwrap_or("0").trim_start_matches("0x"), 16).unwrap_or(0);
+        let l = u64::from_str_radix(it.next().unwrap_or("0").trim_start_matches("0x"), 16).unwrap_or(0);
+        (b, l)
+    })
+}
+
 fn flag(name: &str) -> bool {
     const NAMES: &[&str] = &[
         "DMATRACE", "ICTRACE", "MBOXTAG", "MBOXTRACE", "PERIPHTRACE",
@@ -53,6 +64,7 @@ fn flag(name: &str) -> bool {
         "PI3_KTAIL", "PI3_MMIOTRACE", "PI3_PERMTRACE", "PI3_SVCTRACE",
         "PI3_THERMTRACE", "PI3_TIMERTRACE", "PI3_TLBAUDIT", "PI3_PTW",
         "PI3_POISON", "PI3_JITTRACE", "SDTRACE", "USBTRACE", "WWATCH",
+        "PI3_VAWATCH", "PI3_DMAWATCH",
     ];
     // Constant-folded when `name` is a literal: the compiler reduces the
     // index loop at compile time, so the runtime cost is one atomic load.
@@ -734,6 +746,7 @@ pub struct Bus {
     /// global insn count without a step()-hotRunner backref. Zero-cost
     /// when PI3_EXCTRACE is unset (one u64 store per chunk).
     pub exc_n: u64,
+    pub cpu_pc: u64,
     // PWM (0x3F20C000 — mirrors pwm.js FIFO mode): CTL latch + FIFO
     // queue drained 64/chunk into a sample ring (browser audio reads
     // it via pwm_take). STA/FULL/EMPT published at sync_out.
@@ -934,6 +947,7 @@ impl Bus {
             sdh_chunk_n: 0,
             sdh_chunk_pc: 0,
             exc_n: 0,
+            cpu_pc: 0,
             pwm_back: [0; 32],
             pwm_ctl: 0,
             pwm_last_ctl: 0,
@@ -3223,6 +3237,7 @@ impl Bus {
         }
     }
 
+
     /// Guest-RAM u32 load for the mailbox walker (out-of-range reads 0).
     /// Public for the M61 triage probe (mailbox buffer dump). Takes a
     /// physical address (mailbox buffers are bus->PA masked before the
@@ -3783,6 +3798,12 @@ impl Bus {
                 self.sdh_fifo_len, self.sdh_read_active as u8);
         }
         if src == SDDATA && self.in_ram(dst, rem) {
+            // PI3_DMAWATCH: log every card-read DMA destination page —
+            // the ash trap[] phantom (0x20000000000 at PA 0x13ce678) is
+            // rootfs content; prove the DMA writes it there.
+            if flag("PI3_DMAWATCH") {
+                eprintln!("DMAWATCH dst=0x{:x} len=0x{:x} n={}", dst, rem, self.exc_n);
+            }
             // Card read: FIFO -> RAM.
             // M89 RE-ARM (execution-proven 2026-09-27: with the
             // datacnt gate restored (fault-null to 6.95B, con=100715)
@@ -4937,6 +4958,14 @@ impl Bus {
                 // M63 write-watch (zero-cost unless armed): log any RAM
                 // store overlapping the watched PA range BEFORE applying
                 // it (old bytes still in place). Caller appends the pc.
+                if !self.wwatch_on {
+                    if let Ok(v) = std::env::var("PI3_PAWATCH") {
+                        let mut it = v.split(',');
+                        let b = u64::from_str_radix(it.next().unwrap_or("0").trim_start_matches("0x"), 16).unwrap_or(0);
+                        let l = u64::from_str_radix(it.next().unwrap_or("0").trim_start_matches("0x"), 16).unwrap_or(0);
+                        if b != 0 { self.wwatch_pa = b; self.wwatch_len = l; self.wwatch_on = true; }
+                    }
+                }
                 if self.wwatch_on
                     && addr < self.wwatch_pa + self.wwatch_len
                     && addr + size > self.wwatch_pa
@@ -4950,8 +4979,8 @@ impl Bus {
                     }
                     if flag("WWATCH") {
                         eprintln!(
-                            "WWATCH pa=0x{:x} size={} val=0x{:x} old=0x{:x}",
-                            addr, size, val & mask(size), old
+                            "WWATCH pa=0x{:x} size={} val=0x{:x} old=0x{:x} n={} pc=0x{:x}",
+                            addr, size, val & mask(size), old, self.exc_n, self.cpu_pc
                         );
                     }
                     self.wwatch_hits += 1;
@@ -4970,6 +4999,16 @@ impl Bus {
             }
         } else {
             let va = addr;
+            // PI3_VAWATCH=0x<base>,<len>: log every store into the VA
+            // range (pre-translation) with the insn counter — the ash
+            // trap[] phantom-slot hunt (M117): does ANY store ever touch
+            // the array page?
+            if flag("PI3_VAWATCH") {
+                let (base, len) = vawatch_range();
+                if va + size > base && va < base + len {
+                    eprintln!("VAWATCH va=0x{:x} size={} val=0x{:x} n={}", va, size, val & mask(size), self.exc_n);
+                }
+            }
             let (pa, ap) = self.translate_ap(va)?;
             addr = pa;
             if self.perm_denied(va, true, ap) {
@@ -4978,6 +5017,14 @@ impl Bus {
             if self.in_ram(addr, size) {
                 // M63 write-watch (MMU-on path): same as above, on the
                 // translated PA.
+                if !self.wwatch_on {
+                    if let Ok(v) = std::env::var("PI3_PAWATCH") {
+                        let mut it = v.split(',');
+                        let b = u64::from_str_radix(it.next().unwrap_or("0").trim_start_matches("0x"), 16).unwrap_or(0);
+                        let l = u64::from_str_radix(it.next().unwrap_or("0").trim_start_matches("0x"), 16).unwrap_or(0);
+                        if b != 0 { self.wwatch_pa = b; self.wwatch_len = l; self.wwatch_on = true; }
+                    }
+                }
                 if self.wwatch_on
                     && addr < self.wwatch_pa + self.wwatch_len
                     && addr + size > self.wwatch_pa
@@ -4991,8 +5038,8 @@ impl Bus {
                     }
                     if flag("WWATCH") {
                         eprintln!(
-                            "WWATCH pa=0x{:x} size={} val=0x{:x} old=0x{:x}",
-                            addr, size, val & mask(size), old
+                            "WWATCH pa=0x{:x} size={} val=0x{:x} old=0x{:x} n={} pc=0x{:x}",
+                            addr, size, val & mask(size), old, self.exc_n, self.cpu_pc
                         );
                     }
                     self.wwatch_hits += 1;
@@ -7021,6 +7068,9 @@ impl Cpu {
         // M113-TRUE: publish the exception level so Bus::read/write can
         // apply the EL0-only half of the descriptor AP rules.
         bus.cpu_el = self.cur_el as u8;
+        // Debug: the current pc, so WWATCH/VALWATCH lines can name the
+        // storing instruction directly.
+        bus.cpu_pc = self.pc;
         // M99 EXCEPTION TRACE (env-gated, zero-cost off): logs every
         // exception entry/exit with the runner's insn count (passed via
         // bus.exc_n, set once per chunk) + EL + stacks. Proves the
@@ -7180,15 +7230,31 @@ impl Cpu {
                     // ash's signal-table scan (pc 0x51f8ac), so x22
                     // points at the offending entry.
                     let slotinfo = if el0_origin && a > 0x0010_0000_0000 {
+                        // x22 = scan cursor, x26 = array base, x24 = the
+                        // globals pointer the handler compares against.
+                        let base = match bus.translate(self.x[26] & !7) {
+                            Ok(bp) => {
+                                // Dump 64 slots either side of the base so
+                                // the phantom's neighbourhood is visible.
+                                let mut t = format!(" x26=0x{:x} basepa=0x{:x} slots:", self.x[26], bp);
+                                for i in 0..16u64 {
+                                    t.push_str(&format!(" 0x{:016x}", bus.mem_u64_dbg_pub(bp + i * 8)));
+                                }
+                                t
+                            }
+                            Err(_) => format!(" x26=0x{:x} (unmapped)", self.x[26]),
+                        };
                         match bus.translate(self.x[22] & !7) {
                             Ok(sp) => format!(
-                                " x22=0x{:x} slotpa=0x{:x} w0=0x{:016x} w1=0x{:016x}",
+                                " x22=0x{:x} slotpa=0x{:x} w0=0x{:016x} w1=0x{:016x} x24=0x{:x}{}",
                                 self.x[22],
                                 sp,
                                 bus.mem_u64_dbg_pub(sp),
-                                bus.mem_u64_dbg_pub(sp + 8)
+                                bus.mem_u64_dbg_pub(sp + 8),
+                                self.x[24],
+                                base
                             ),
-                            Err(_) => String::new(),
+                            Err(_) => base,
                         }
                     } else {
                         String::new()
@@ -9085,9 +9151,14 @@ impl Cpu {
                 bus.write(addr, esz, self.fr(rd) & m).map_err(|_| Fault::UnmappedData(addr))?;
                 let a2 = addr.wrapping_add(esz);
                 bus.write(a2, esz, self.fr(rt2) & m).map_err(|_| Fault::UnmappedData(a2))?;
-                if let Some(b) = wb {
-                    self.wsp(rn, b, true);
-                }
+            }
+            // Pre-index writeback applies AFTER a successful access on
+            // EVERY path (was inside the esz-4/8 store branch only, so
+            // LDP S/D/Q pre-index and STP-Q pre-index never wrote back —
+            // busybox's NEON strlen `ldp q1,q2,[x1,#32]!` never advanced
+            // x1 and scanned the same 32 bytes forever = the boot stall).
+            if let Some(b) = wb {
+                self.wsp(rn, b, true);
             }
             return Ok(());
         }
@@ -9117,7 +9188,11 @@ impl Cpu {
                     }
                     let is_load = opc & 1 == 1;
             let (addr, wb) = if bits(w, 24, 24) == 1 {
-                let off = (bits(w, 21, 10) as u64) * 16;
+                // Unsigned offset = imm12 << log2(esz). Was hardcoded *16
+                // (the Q scale) — so `str b0, [x20, #16]` stored at +256
+                // instead of +16, planting byte 0x02 240 bytes past its
+                // target (the ash trap[] phantom 0x20000000000).
+                let off = (bits(w, 21, 10) as u64) << esz.trailing_zeros();
                 (self.rsp(rn).wrapping_add(off), None)
             } else if bits(w, 21, 21) == 1 {
                 // Register offset: Rm, scaled by log2(esz) when bit12 is

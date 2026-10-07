@@ -216,6 +216,19 @@ const GROUPS = {
     'bic v0.2s, #0x20, lsl #8',
     'ushr d0, d0, #1', 'ushr d0, d0, #63', 'ushr d0, d0, #64',
     'ushr v0.2d, v0.2d, #1', 'ushr v0.2d, v0.2d, #64',
+    // M120 SIMD single LD/ST unsigned-offset scale (imm12 << log2(esz)
+    // — `str b` was hardcoded *16 and stored 240B past its target, the
+    // Linux ash trap[] phantom; every word from strb.s).
+    'str b0, [x8, #16]', 'ldr b0, [x8, #16]',
+    'str h0, [x8, #16]', 'str s0, [x8, #16]', 'str d0, [x8, #16]',
+    'str q0, [x8, #16]', 'ldr q0, [x8, #16]',
+    'str b1, [x9, #5]', 'ldr b1, [x9, #5]',
+    // M120 SIMD pair pre-index writeback (was applied only on the
+    // esz-4/8 store path — LDP S/D/Q and STP-Q pre never wrote back;
+    // busybox's NEON strlen `ldp q1,q2,[x1,#32]!` looped forever).
+    'ldp q0, q1, [x8, #32]!', 'stp q0, q1, [x8, #32]!',
+    'ldp d0, d1, [x8, #16]!', 'stp d0, d1, [x8, #16]!',
+    'ldp s0, s1, [x8, #8]!', 'ldp q2, q3, [x9, #-32]!',
   ],
 };
 
