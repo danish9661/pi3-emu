@@ -74,9 +74,22 @@ fn main() {
             let scanpa: u64 = std::env::var("PI3_SCANPA").ok()
                 .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(0);
             let mut scan_last = if scanpa != 0 { bus.mem_u64_dbg_pub(scanpa) } else { 0 };
+            // PI3_KEYS=<string>: push the string's bytes into the PL011
+            // RX FIFO, one byte per 20M-insn boundary (sequential —
+            // the shell reads them as a typed command). Overrides the
+            // repeated single byte of PI3_KEY when both are set.
+            let keys: Vec<u8> = std::env::var("PI3_KEYS").ok()
+                .map(|s| s.into_bytes())
+                .unwrap_or_else(|| vec![key.unwrap()]);
+            // PI3_KEYAT=<n>: start the key schedule at insn n (0 = from
+            // boot). Lets a command land whole at the shell prompt
+            // instead of being scattered across the boot.
+            let keyat: u64 = std::env::var("PI3_KEYAT").ok()
+                .and_then(|v| v.parse().ok()).unwrap_or(0);
             while runner.n < budget && runner.fault_string().is_none() {
-                if runner.n % 20_000_000 < 4096 {
-                    bus.uart0_push(key.unwrap());
+                let kidx = runner.n.saturating_sub(keyat) / 20_000_000;
+                if runner.n >= keyat && runner.n % 20_000_000 < 4096 && (kidx as usize) < keys.len() {
+                    bus.uart0_push(keys[kidx as usize]);
                 }
                 runner.run_to(&mut cpu, &mut bus, (runner.n + 4096).min(budget));
                 if scanpa != 0 {

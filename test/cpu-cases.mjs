@@ -280,6 +280,9 @@ for (const [g, list] of Object.entries(GROUPS)) {
     names.push([g, i, s]);
   });
 }
+// The scratch dir is wiped periodically on this box — create it (and
+// the archive oracle's, which shares it) instead of failing with ENOENT.
+mkdirSync('/tmp/opencode', { recursive: true });
 writeFileSync('/tmp/opencode/cases.s', asm);
 execSync(`${TC}/aarch64-none-elf-as /tmp/opencode/cases.s -o /tmp/opencode/cases.o`);
 const dis = execSync(`${TC}/aarch64-none-elf-objdump -d /tmp/opencode/cases.o`).toString();
